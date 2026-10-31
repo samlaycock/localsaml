@@ -252,6 +252,13 @@ fn issuer_of(el: &Element) -> Option<String> {
 /// Parse a message a service provider sent to the SSO or SLO endpoint.
 pub fn parse_message(xml: &str) -> Result<(Message, Element), String> {
     let root = parse(xml)?;
+    let message = parse_element(&root)?;
+    Ok((message, root))
+}
+
+/// Read a protocol message from an already parsed element (e.g. the Body of a SOAP envelope).
+pub fn parse_element(root: &Element) -> Result<Message, String> {
+    let root = root.clone();
     if root.ns.as_deref() != Some(NS_PROTOCOL) {
         return Err(format!("<{}> is not a SAML 2.0 protocol message", root.qname()));
     }
@@ -313,7 +320,7 @@ pub fn parse_message(xml: &str) -> Result<(Message, Element), String> {
         }),
         other => return Err(format!("unexpected message <{other}>")),
     };
-    Ok((message, root))
+    Ok(message)
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +727,18 @@ pub fn logout_response(
     status: &Status,
     now: i64,
 ) -> (Element, String) {
+    logout_response_to(style, issuer, Some(destination), in_response_to, status, now)
+}
+
+/// A LogoutResponse and its ID; SOAP responses have no `Destination`.
+pub fn logout_response_to(
+    style: &Style,
+    issuer: &str,
+    destination: Option<&str>,
+    in_response_to: Option<&str>,
+    status: &Status,
+    now: i64,
+) -> (Element, String) {
     let id = style.id_style.generate();
     let a = |local: &str| Element::new(NS_ASSERTION, style.assertion_prefix, local);
     let p = |local: &str| Element::new(NS_PROTOCOL, style.protocol_prefix, local);
@@ -727,7 +746,7 @@ pub fn logout_response(
         .attr("ID", &id)
         .attr("Version", "2.0")
         .attr("IssueInstant", iso8601(now))
-        .attr("Destination", destination)
+        .attr_opt("Destination", destination)
         .attr_opt("InResponseTo", in_response_to)
         .declare(style.protocol_prefix, NS_PROTOCOL)
         .child(a("Issuer").attr_opt("Format", style.issuer_format.then_some(nameid::ENTITY)).text(issuer))

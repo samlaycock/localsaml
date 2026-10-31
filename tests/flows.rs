@@ -1308,3 +1308,125 @@ async fn logout_messages_can_be_required_signed() {
     let status = Status::from_element(to_a.find(P, "Status"));
     assert_eq!(status.short(), "PartialLogout");
 }
+
+// ---------------------------------------------------------------------------
+// Back-channel (SOAP) logout
+// ---------------------------------------------------------------------------
+
+/// A service provider with a SOAP SingleLogoutService on a real port: it records each
+/// LogoutRequest it gets and answers Success (or `status`).
+async fn soap_sp(name: &str, status: &'static str) -> (ServiceProvider, Arc<std::sync::Mutex<Vec<Element>>>) {
+    use axum::routing::post;
+    let received: Arc<std::sync::Mutex<Vec<Element>>> = Arc::default();
+    let log = received.clone();
+    let entity = format!("http://{name}.test/sp");
+    let issuer = entity.clone();
+    let app = Router::new().route(
+        "/soap",
+        post(move |body: String| {
+            let log = log.clone();
+            let issuer = issuer.clone();
+            async move {
+                let (envelope, message) = localsaml::soap::unwrap(&body).unwrap();
+                log.lock().unwrap().push(envelope);
+                let id = message.get_attr("ID").unwrap().to_string();
+                let style = &localsaml::presets::generic().style;
+                let st = Status::parse(status, None).unwrap();
+                let (resp, _) = saml::logout_response_to(style, &issuer, None, Some(&id), &st, wall_clock());
+                ([(header::CONTENT_TYPE, "text/xml")], localsaml::soap::envelope(resp))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/soap", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let sp = ServiceProvider {
+        entity_id: entity,
+        acs_urls: vec![format!("http://{name}.test/acs")],
+        slo_soap_url: Some(url),
+        ..Default::default()
+    };
+    (sp, received)
+}
+
+#[tokio::test]
+async fn back_channel_logout_over_soap() {
+    let (one, one_got) = soap_sp("one", "Success").await;
+    let (two, two_got) = soap_sp("two", "Success").await;
+    let (app, state) = app_with(with_sps(vec![one, two, slo_sp("front")]));
+    let sid = |app: Router| async move {
+        get(&app, "/dev/api/sessions").await.json()[0]["sid"].as_str().unwrap().to_string()
+    };
+
+    // Ending a session over the API logs the SOAP service providers out back-channel.
+    let mut jar = Jar::default();
+    let p = quick_login(&app, "", "http://one.test/sp", &mut jar, "").await;
+    let r = delete(&app, &format!("/dev/api/sessions/{}", sid(app.clone()).await)).await.json();
+    assert_eq!(r["deliveries"][0]["sp"], "http://one.test/sp");
+    assert_eq!(r["deliveries"][0]["ok"], true, "{r}");
+    let envelope = one_got.lock().unwrap().pop().expect("a LogoutRequest");
+    let (_, request) =
+        (envelope.clone(), envelope.find(localsaml::soap::NS_SOAP, "Body").unwrap().elements().next().unwrap().clone());
+    assert_eq!(request.find(A, "NameID").unwrap().value(), p.name_id().0);
+    dsig::verify(&envelope, request.get_attr("ID").unwrap(), &state.keys.public_keys()).unwrap();
+    // The inspector shows the call localsaml made.
+    let entries = get(&app, "/dev/api/requests").await.json();
+    assert!(
+        entries["entries"].as_array().unwrap().iter().any(|e| e["outgoing"] == true && e["sp"] == "http://one.test/sp")
+    );
+
+    // A front-channel logout reaches an SP with only a SOAP endpoint back-channel.
+    let mut jar = Jar::default();
+    let front = quick_login(&app, "", "http://front.test/sp", &mut jar, "").await;
+    quick_login(&app, "", "http://one.test/sp", &mut jar, "").await;
+    let r = get_jar(
+        &app,
+        &redirect(
+            "/slo",
+            "SAMLRequest",
+            &logout_request("_bc1", "http://front.test/sp", &front.name_id().0),
+            None,
+            None,
+        ),
+        &mut jar,
+    )
+    .await;
+    let (_, to_front) = redirected(&r, "SAMLResponse");
+    assert!(Status::from_element(to_front.find(P, "Status")).is_success());
+    assert_eq!(one_got.lock().unwrap().len(), 1);
+
+    // A SOAP LogoutRequest from one SP ends the session and logs the others out back-channel.
+    let mut jar = Jar::default();
+    let p = quick_login(&app, "", "http://one.test/sp", &mut jar, "").await;
+    quick_login(&app, "", "http://two.test/sp", &mut jar, "").await;
+    let request = parse(&logout_request("_bc2", "http://one.test/sp", &p.name_id().0)).unwrap();
+    let r = post_body(&app, Method::POST, "/slo", "text/xml", &localsaml::soap::envelope(request)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let (envelope, answer) = localsaml::soap::unwrap(&r.body).unwrap();
+    assert!(answer.is(P, "LogoutResponse") && answer.get_attr("InResponseTo") == Some("_bc2"));
+    assert!(Status::from_element(answer.find(P, "Status")).is_success());
+    dsig::verify(&envelope, answer.get_attr("ID").unwrap(), &state.keys.public_keys()).unwrap();
+    assert_eq!(two_got.lock().unwrap().len(), 1);
+    assert!(get(&app, "/dev/api/sessions").await.json().as_array().unwrap().is_empty());
+
+    // A failing SP makes it a partial logout.
+    let (bad, _) = soap_sp("bad", "Responder").await;
+    let (app, _) = app_with(with_sps(vec![bad, slo_sp("front")]));
+    let mut jar = Jar::default();
+    let front = quick_login(&app, "", "http://front.test/sp", &mut jar, "").await;
+    quick_login(&app, "", "http://bad.test/sp", &mut jar, "").await;
+    let r = get_jar(
+        &app,
+        &redirect(
+            "/slo",
+            "SAMLRequest",
+            &logout_request("_bc3", "http://front.test/sp", &front.name_id().0),
+            None,
+            None,
+        ),
+        &mut jar,
+    )
+    .await;
+    let (_, to_front) = redirected(&r, "SAMLResponse");
+    assert_eq!(Status::from_element(to_front.find(P, "Status")).short(), "PartialLogout");
+}

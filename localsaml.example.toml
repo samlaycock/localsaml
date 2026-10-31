@@ -24,6 +24,7 @@ entity_id = "http://localhost:3000/saml/metadata"
 name = "My App"
 acs_urls = ["http://localhost:3000/saml/acs"]
 slo_url = "http://localhost:3000/saml/slo"
+# slo_soap_url = "http://localhost:3000/saml/slo/soap"  # back-channel logout (SOAP binding)
 # slo_binding = "redirect"           # redirect | post
 # certificate = "-----BEGIN CERTIFICATE-----..."   # verifies signed AuthnRequests
 # want_authn_requests_signed = false

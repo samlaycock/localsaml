@@ -9,7 +9,7 @@ use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 
 use crate::keys::{PublicKey, SigAlg, cert_public_key, cert_verifying_key, parse_cert};
-use crate::saml::{BINDING_POST, BINDING_REDIRECT, NS_MD};
+use crate::saml::{BINDING_POST, BINDING_REDIRECT, BINDING_SOAP, NS_MD};
 use crate::xml::{Element, parse};
 use crate::xmlenc::EncAlg;
 
@@ -31,6 +31,9 @@ pub struct ServiceProvider {
     pub slo_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slo_response_url: Option<String>,
+    /// A SOAP SingleLogoutService: logout reaches this SP back-channel, without the browser.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slo_soap_url: Option<String>,
     /// `redirect` (default) or `post`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slo_binding: Option<String>,
@@ -111,7 +114,7 @@ impl ServiceProvider {
             }
             anyhow::bail!("entity_id is required (or metadata to read it from)");
         }
-        for url in self.acs_urls.iter().chain(&self.slo_url).chain(&self.slo_response_url) {
+        for url in self.acs_urls.iter().chain(&self.slo_url).chain(&self.slo_response_url).chain(&self.slo_soap_url) {
             if !crate::util::is_web_url(url) {
                 anyhow::bail!("'{url}' is not an absolute http(s) URL");
             }
@@ -173,6 +176,7 @@ impl ServiceProvider {
         self.slo_url = self.slo_url.take().or(m.slo_url);
         self.slo_response_url = self.slo_response_url.take().or(m.slo_response_url);
         self.slo_binding = self.slo_binding.take().or(m.slo_binding);
+        self.slo_soap_url = self.slo_soap_url.take().or(m.slo_soap_url);
         self.certificate = self.certificate.take().or(m.certificate);
         self.encryption_certificate = self.encryption_certificate.take().or(m.encryption_certificate);
         self.want_authn_requests_signed |= m.want_authn_requests_signed;
@@ -251,6 +255,7 @@ pub fn from_metadata(xml: &str, entity_id: Option<&str>) -> Result<ServiceProvid
             )
         })
     };
+    let slo_soap_url = slo(BINDING_SOAP).map(|s| s.0);
     let (slo, slo_binding) = match (slo(BINDING_REDIRECT), slo(BINDING_POST)) {
         (Some(r), _) => (Some(r), None),
         (None, Some(p)) => (Some(p), Some("post".to_string())),
@@ -279,6 +284,7 @@ pub fn from_metadata(xml: &str, entity_id: Option<&str>) -> Result<ServiceProvid
         slo_url: slo.as_ref().map(|s| s.0.clone()),
         slo_response_url: slo.and_then(|s| s.1),
         slo_binding,
+        slo_soap_url,
         certificate: cert("signing"),
         encryption_certificate: cert("encryption"),
         want_authn_requests_signed: sp.get_attr("AuthnRequestsSigned").map(str::trim) == Some("true"),

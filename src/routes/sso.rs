@@ -131,7 +131,8 @@ pub fn check_signature(sp: &ServiceProvider, root: &Element, id: &str, query_sig
             None => SigCheck::Unverified(how),
         };
     }
-    if dsig::signature_of(root).is_some() {
+    // The message may be the document, or inside one (a SOAP envelope).
+    if root.find_by_id(id).and_then(dsig::signature_of).is_some() {
         return match key {
             Some(k) => match dsig::verify(root, id, &[k]) {
                 Ok(v) => SigCheck::Verified(format!("XML signature ({})", v.alg.name())),
@@ -167,6 +168,9 @@ pub async fn endpoint(
     RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Response {
+    if crate::soap::is_soap(&headers, &body) {
+        return crate::routes::backchannel::dispatch(&state, &tenant, &body).await;
+    }
     let query = query.unwrap_or_default();
     if let Some(param) = dsig::duplicate_param(&query) {
         return saml_error_page(

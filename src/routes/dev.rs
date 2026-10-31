@@ -603,21 +603,24 @@ pub async fn api_sessions(State(state): State<AppState>, tenant: Tenant) -> Resp
     (no_store(), Json(sessions)).into_response()
 }
 
-/// End a session without telling its service providers (single logout needs a browser: send it
-/// to the session's `logout_url` for that).
+/// End a session as if the user logged out elsewhere: service providers with a SOAP
+/// SingleLogoutService are logged out back-channel; others can only be reached through the
+/// browser (send it to the session's `logout_url` for that).
 pub async fn api_sessions_end(State(state): State<AppState>, Path(params): Path<HashMap<String, String>>) -> Response {
     let sid = params.get("sid").cloned().unwrap_or_default();
-    match state.store.take::<Session>(Table::Sessions, &sid) {
-        Some(s) => (
-            no_store(),
-            Json(json!({
-                "sid": sid,
-                "not_notified": s.participants.iter().map(|p| &p.entity_id).collect::<Vec<_>>(),
-            })),
-        )
-            .into_response(),
-        None => api_error(StatusCode::NOT_FOUND, "not_found", format!("no active session '{sid}'")),
-    }
+    let Some(session) = state.store.take::<Session>(Table::Sessions, &sid) else {
+        return api_error(StatusCode::NOT_FOUND, "not_found", format!("no active session '{sid}'"));
+    };
+    let tenant = Tenant::new(&state.config.base_url, presets::get(&session.tenant), &state.config);
+    let results = crate::routes::slo::back_channel_all(&state, &tenant, &session, None).await;
+    let deliveries: Vec<Value> = results
+        .iter()
+        .filter(|(_, outcome)| !outcome.starts_with("not notified"))
+        .map(|(sp, outcome)| json!({ "sp": sp, "outcome": outcome, "ok": outcome.starts_with("logged out") }))
+        .collect();
+    let not_notified: Vec<&String> =
+        results.iter().filter(|(_, outcome)| outcome.starts_with("not notified")).map(|(sp, _)| sp).collect();
+    (no_store(), Json(json!({ "sid": sid, "deliveries": deliveries, "not_notified": not_notified }))).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -658,7 +661,7 @@ fn session_list(state: &AppState, tenant: &Tenant) -> String {
                 crate::dsig::urlencode(&format!("{}#sessions", tenant.path("/dev")))
             );
             format!(
-                r#"<li><span><b>{who}</b> · {preset} · {sps}<br><small class="muted">SessionIndex <code>{index}</code> · {issuer}</small></span><span class="row-actions"><a class="btn small" href="{logout}">Single logout</a><button class="btn small ghost" type="button" data-session="{sid}" title="End it without telling the service providers">Forget</button></span></li>"#,
+                r#"<li><span><b>{who}</b> · {preset} · {sps}<br><small class="muted">SessionIndex <code>{index}</code> · {issuer}</small></span><span class="row-actions"><a class="btn small" href="{logout}">Single logout</a><button class="btn small ghost" type="button" data-session="{sid}" title="End it now: SPs with a SOAP SingleLogoutService are logged out back-channel, others aren't told">End (back-channel)</button></span></li>"#,
                 who = esc(&s.identity.describe()),
                 preset = esc(&s.identity.preset),
                 index = esc(&s.session_index),
@@ -849,7 +852,7 @@ pub async fn page_handler(State(state): State<AppState>, tenant: Tenant, headers
 </section>
 <section class="card" id="sessions">
   <div class="eyebrow">Sessions</div>
-  <p class="muted">Browser sessions on every issuer. <b>Single logout</b> ends one in this browser and sends a LogoutRequest to each service provider that used it, one after another. <b>Forget</b> ends it without telling them. Scripts can use <code>GET {sessions_api}</code>.</p>
+  <p class="muted">Browser sessions on every issuer. <b>Single logout</b> ends one in this browser and sends a LogoutRequest to each service provider that used it, one after another. <b>End (back-channel)</b> ends it as if the user logged out elsewhere: service providers with a SOAP SingleLogoutService get a LogoutRequest back-channel, the others aren't told. Scripts can use <code>GET {sessions_api}</code>.</p>
   {session_list}
 </section>
 </div>

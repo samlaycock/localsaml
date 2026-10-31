@@ -94,7 +94,7 @@ To make localsaml look like a specific identity provider, use that template's is
 |---|---|
 | Metadata | `/metadata` (`?signed=true` for signed metadata) |
 | Single sign-on (HTTP-Redirect, HTTP-POST) | `/sso` |
-| Single logout (HTTP-Redirect, HTTP-POST) | `/slo` |
+| Single logout (HTTP-Redirect, HTTP-POST, SOAP) | `/slo` |
 | IdP-initiated SSO (non-standard) | `/sso/initiate?sp=<entity ID>[&RelayState=…][&acs=…]` |
 | IdP-initiated logout (non-standard) | `/slo/initiate[?sid=…][&return_to=…]` |
 | Signing certificate | `/certificate.pem` |
@@ -125,7 +125,7 @@ Every template issuer serves the same endpoints under `/p/<template>`, plus that
 - **IdP-initiated SSO:** unsolicited Responses (no `InResponseTo`) to a service provider's default ACS URL, with a `RelayState`. The template aliases work too, e.g. Shibboleth's `/idp/profile/SAML2/Unsolicited/SSO?providerId=…` and PingFederate's `/idp/startSSO.ping?PartnerSpId=…`.
 - **[Single logout](#single-logout):** SP-initiated and IdP-initiated. Every other service provider in the session is sent a signed LogoutRequest in turn, then the initiator gets a LogoutResponse (`PartialLogout` if some didn't answer `Success`).
 
-**Not implemented:** the HTTP-Artifact binding and artifact resolution, SOAP (back-channel) logout, ECP/PAOS, encrypted NameIDs and attributes, `Scoping`/IdP proxying, and attribute queries. A request asking for the Artifact binding gets an HTTP-POST Response, with a warning.
+**Not implemented:** the HTTP-Artifact binding and artifact resolution, ECP/PAOS, encrypted NameIDs and attributes, `Scoping`/IdP proxying, and attribute queries. A request asking for the Artifact binding gets an HTTP-POST Response, with a warning.
 
 ## Identity provider templates
 
@@ -303,7 +303,9 @@ curl -s -X DELETE http://localhost:9401/dev/api/faults   # remove them all
 - **SP-initiated:** a service provider sends a LogoutRequest to `/slo` (or the template's path). localsaml ends the session, then sends a signed LogoutRequest to every other service provider that got an assertion during it. These go one at a time over front-channel redirects (or POSTs), each with the NameID and SessionIndex that service provider received. When they've all answered, the initiator gets its LogoutResponse: `Success`, with a `PartialLogout` second-level status if some didn't log out.
 - **IdP-initiated:** `/slo/initiate` logs out the browser's session (or `?sid=…`), notifies every service provider the same way, and shows who was logged out (or redirects to `return_to`). The `/dev` page lists sessions with a **Single logout** button.
 - Service providers need an SLO URL to be notified, either declared (`slo_url`, `slo_binding`) or from their metadata. Others are skipped and listed as "not notified". An undeclared service provider that starts a logout has no SLO URL to answer to either, so its logout ends on an error page after the session is ended; declare it to get a LogoutResponse.
-- `DELETE /dev/api/sessions/{sid}` (**Forget** on `/dev`) ends a session without telling anyone, as if it had expired.
+- **Back-channel (SOAP binding):** service providers with a SOAP SingleLogoutService (`slo_soap_url`, or from their metadata) and no front-channel one are logged out with a signed LogoutRequest POSTed to them while the browser waits. Service providers can also send localsaml a LogoutRequest over SOAP (POST a SOAP envelope to `/slo`): it ends the session that SessionIndex or NameID names, logs the other service providers out back-channel, and answers with a signed LogoutResponse.
+- `DELETE /dev/api/sessions/{sid}` (**End (back-channel)** on `/dev`) ends a session as if the user had logged out elsewhere: service providers with a SOAP endpoint get a LogoutRequest, like localoidc's back-channel logout, and the answer lists each delivery. The others can't be told without the browser.
+- Back-channel calls show up in the [request inspector](#inspecting-requests) as outgoing requests, with what was sent and answered.
 - A LogoutRequest for a session that's already gone still gets `Success`. The Google Workspace template doesn't do single logout, like the real one.
 
 ## Inspecting requests
@@ -339,6 +341,7 @@ Undeclared service providers are accepted with whatever their AuthnRequest says,
 entity_id = "http://localhost:3000/saml/metadata"
 acs_urls = ["http://localhost:3000/saml/acs"]   # enforced; the first is the default
 slo_url = "http://localhost:3000/saml/slo"      # notified on single logout
+slo_soap_url = "http://localhost:3000/saml/soap" # or back-channel, over SOAP
 certificate = """-----BEGIN CERTIFICATE-----
 …
 -----END CERTIFICATE-----"""                     # verifies signed requests, encrypts assertions

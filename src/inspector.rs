@@ -143,6 +143,9 @@ pub struct Entry {
     /// Where a redirect or form post went (without its parameters).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redirect: Option<String>,
+    /// A request localsaml made (a back-channel SOAP call), rather than one it received.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub outgoing: bool,
 }
 
 impl Entry {
@@ -199,6 +202,48 @@ impl Inspector {
     /// The id of the newest entry ever recorded (0 if none); clearing doesn't reset it.
     pub fn latest_id(&self) -> u64 {
         self.inner.lock().unwrap().next_id
+    }
+
+    /// Record a back-channel call localsaml made: the message sent and the answer (or failure).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_outgoing(
+        &self,
+        issuer: &str,
+        url: &str,
+        sp: &str,
+        sent: Message,
+        received: Option<Message>,
+        status: u16,
+        error: Option<(String, String)>,
+        outcome: String,
+        started: Instant,
+    ) {
+        self.record(Entry {
+            id: 0,
+            at: now_ms(),
+            duration_ms: started.elapsed().as_millis() as u64,
+            method: "POST".into(),
+            path: url.into(),
+            issuer: issuer.into(),
+            endpoint: strip_query(url),
+            category: "flow",
+            sp: Some(sp.into()),
+            params: BTreeMap::new(),
+            messages: [Some(sent), received]
+                .into_iter()
+                .flatten()
+                .map(|mut m| {
+                    m.xml = truncate_xml(m.xml);
+                    m
+                })
+                .collect(),
+            status,
+            error_description: error.as_ref().map(|(_, d)| d.clone()),
+            error: error.map(|(e, _)| e),
+            outcome,
+            redirect: None,
+            outgoing: true,
+        });
     }
 
     pub fn clear(&self) {
@@ -330,6 +375,8 @@ pub async fn record(State(state): State<AppState>, request: Request, next: Next)
     };
     let query_params = parse_form(query.as_bytes());
     let raw_params = request_params(&query, &request_type, &body);
+    let soap_body = (crate::soap::is_soap(&parts.headers, &body) && body.len() <= MAX_RECORDED_BODY)
+        .then(|| String::from_utf8_lossy(&body).into_owned());
     let response = next.run(Request::from_parts(parts, Body::from(body))).await;
 
     let (parts, body) = response.into_parts();
@@ -364,6 +411,31 @@ pub async fn record(State(state): State<AppState>, request: Request, next: Next)
                 status: status.map(|s| s.short()),
                 xml: truncate_xml(xml),
             });
+        }
+    }
+    if let Some(xml) = soap_body {
+        match crate::soap::unwrap(&xml) {
+            Ok((_, message)) => {
+                if !endpoint.starts_with("/sp") {
+                    sp = sp.or_else(|| message.find(NS_ASSERTION, "Issuer").map(|i| i.value()));
+                }
+                messages.push(Message {
+                    direction: "received",
+                    kind: message.local.clone(),
+                    binding: "soap",
+                    destination: None,
+                    status: None,
+                    xml: truncate_xml(crate::xml::pretty(&xml)),
+                });
+            }
+            Err(_) => messages.push(Message {
+                direction: "received",
+                kind: "(not a SOAP envelope)".into(),
+                binding: "soap",
+                destination: None,
+                status: None,
+                xml: truncate_xml(xml),
+            }),
         }
     }
     let note = parts.extensions.get::<SamlNote>().cloned().unwrap_or_default();
@@ -424,6 +496,7 @@ pub async fn record(State(state): State<AppState>, request: Request, next: Next)
         error: error.map(|(code, _)| code),
         outcome,
         redirect,
+        outgoing: false,
     });
     Response::from_parts(parts, body)
 }
@@ -466,6 +539,7 @@ mod tests {
             error_description: None,
             outcome: String::new(),
             redirect: None,
+            outgoing: false,
         }
     }
 

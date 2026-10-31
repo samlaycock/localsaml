@@ -1,3 +1,4 @@
+pub mod backchannel;
 pub mod dev;
 pub mod metadata;
 pub mod pages;

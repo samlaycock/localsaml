@@ -9,6 +9,7 @@ pub mod keys;
 pub mod presets;
 pub mod routes;
 pub mod saml;
+pub mod soap;
 pub mod sp;
 pub mod state;
 pub mod store;

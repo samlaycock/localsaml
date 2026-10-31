@@ -554,7 +554,11 @@ document.addEventListener('click', async (e) => {
     // Sessions: "Forget" ends one without telling its service providers.
     document.querySelectorAll('[data-session]').forEach((btn) => btn.addEventListener('click', () => {
       btn.disabled = true;
-      request('DELETE', `${data.sessionsApi}/${encodeURIComponent(btn.dataset.session)}`).then(thenReload('sessions'), fail('Ending the session'));
+      request('DELETE', `${data.sessionsApi}/${encodeURIComponent(btn.dataset.session)}`).then((json) => {
+        const failed = json.deliveries.filter((d) => !d.ok);
+        if (failed.length) alert(`Session ended, but ${failed.length} back-channel ${failed.length === 1 ? 'logout' : 'logouts'} failed:\n${failed.map((d) => `${d.sp}: ${d.outcome}`).join('\n')}`);
+        thenReload('sessions')();
+      }, fail('Ending the session'));
     }));
 
     // Service providers: register from a metadata URL or pasted metadata XML.
@@ -709,7 +713,8 @@ document.addEventListener('click', async (e) => {
     const tr = h('tr', { class: `req-row${bad ? ' failed' : ''}${expanded.has(e.id) ? ' open' : ''}`, onclick: toggle },
       h('td', { class: 'mono' }, time(e.at)),
       h('td', {}, e.method),
-      h('td', { class: 'mono' }, e.issuer !== 'root' ? h('span', { class: 'req-issuer' }, e.issuer) : null, e.endpoint),
+      h('td', { class: 'mono' }, e.outgoing ? h('span', { class: 'req-issuer', title: 'Sent by localsaml' }, '→ out') : null,
+        e.issuer !== 'root' ? h('span', { class: 'req-issuer' }, e.issuer) : null, e.endpoint),
       h('td', { class: 'mono' }, e.sp || '–'),
       h('td', {}, kinds ? h('small', { class: 'muted' }, kinds, ' · ') : null, bad && e.error ? h('span', { class: 'req-error' }, e.error) : e.outcome),
       h('td', {}, h('span', { class: `chip ${bad ? 'bad' : 'ok'}` }, String(e.status))),

@@ -1,6 +1,8 @@
 //! Single logout. A LogoutRequest from one service provider (or `/slo/initiate`) ends the session,
 //! then every other service provider that got an assertion during it is sent a LogoutRequest in
-//! turn, over front-channel redirects, before the initiator gets its LogoutResponse.
+//! turn, over front-channel redirects, before the initiator gets its LogoutResponse. Service
+//! providers with only a SOAP SingleLogoutService are logged out back-channel along the way, and
+//! SOAP LogoutRequests (and `DELETE /dev/api/sessions/{sid}`) log everyone out back-channel.
 
 use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -8,7 +10,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 
 use crate::faults::{self, Endpoint};
 use crate::html::{esc, page, saml_error_page, saml_post};
-use crate::inspector::SamlNote;
+use crate::inspector::{Message, SamlNote};
 use crate::presets::{Preset, Style};
 use crate::routes::sso::{
     Arrival, SigCheck, check_signature, clear_session_cookie, current_session, find_sp, resolve_sp, set_cookie,
@@ -174,7 +176,12 @@ async fn advance(state: &AppState, tenant: &Tenant, mut logout: Logout) -> Respo
             continue;
         };
         let Some(location) = sp.slo_url.clone() else {
-            logout.results.push((participant.entity_id, "not notified: no SingleLogoutService".into()));
+            // No front-channel endpoint: a SOAP one is called from here, while the browser waits.
+            let outcome = match &sp.slo_soap_url {
+                Some(url) => back_channel(state, tenant, &sp, url, &participant, &logout.session_index).await,
+                None => "not notified: no SingleLogoutService".into(),
+            };
+            logout.results.push((participant.entity_id, outcome));
             continue;
         };
         let style = &preset(state, tenant).style;
@@ -201,7 +208,7 @@ async fn advance(state: &AppState, tenant: &Tenant, mut logout: Logout) -> Respo
 
 async fn finish(state: &AppState, tenant: &Tenant, logout: Logout) -> Response {
     state.store.remove(Table::Logouts, &logout.id);
-    let partial = logout.results.iter().any(|(_, r)| r != "logged out");
+    let partial = logout.results.iter().any(|(_, r)| !r.starts_with("logged out"));
     if let Some(initiator) = &logout.initiator {
         let sp = find_sp(state, tenant, &initiator.entity_id)
             .await
@@ -353,4 +360,173 @@ pub fn describe(sid: &str, session: &Session, exp: Option<i64>) -> serde_json::V
         "expires_at": exp,
         "service_providers": session.participants.iter().map(|p: &Participant| &p.entity_id).collect::<Vec<_>>(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Back-channel (SOAP binding)
+// ---------------------------------------------------------------------------
+
+/// Log one service provider out over the SOAP binding: a signed LogoutRequest, and its
+/// LogoutResponse checked like a front-channel one. Returns the outcome, `logged out (SOAP)` on
+/// success.
+pub async fn back_channel(
+    state: &AppState,
+    tenant: &Tenant,
+    sp: &ServiceProvider,
+    url: &str,
+    participant: &Participant,
+    session_index: &str,
+) -> String {
+    let started = std::time::Instant::now();
+    let style = &preset(state, tenant).style;
+    let (mut message, id) = saml::logout_request(&LogoutRequestSpec {
+        style,
+        issuer: &tenant.entity_id,
+        destination: url,
+        name_id: &participant.name_id,
+        name_id_format: &participant.name_id_format,
+        sp_name_qualifier: participant.sp_name_qualifier.as_deref(),
+        session_index: if participant.session_index.is_empty() { session_index } else { &participant.session_index },
+        now: state.now(),
+    });
+    let alg = sp.signature_algorithm.unwrap_or(state.config.signature_algorithm);
+    if let Err(e) = state.keys.with_current(|key| saml::sign_message(&mut message, &id, key, style, alg)) {
+        return format!("failed: signing the LogoutRequest: {e}");
+    }
+    let sent = Message {
+        direction: "sent",
+        kind: "LogoutRequest".into(),
+        binding: "soap",
+        destination: Some(url.into()),
+        status: None,
+        xml: message.to_pretty(),
+    };
+    let (outcome, received, error) = match crate::soap::call(url, message).await {
+        Err(e) => (format!("failed: {e}"), None, Some(("back-channel logout failed".to_string(), e))),
+        Ok((envelope, answer)) => {
+            let received = Message {
+                direction: "received",
+                kind: answer.local.clone(),
+                binding: "soap",
+                destination: None,
+                status: None,
+                xml: envelope.to_pretty(),
+            };
+            let outcome = match saml::parse_element(&answer) {
+                Ok(saml::Message::LogoutResponse(resp)) => {
+                    let signature = check_signature(sp, &envelope, &resp.id, None);
+                    if resp.in_response_to.as_deref() != Some(&id) {
+                        "failed: InResponseTo doesn't match the LogoutRequest".to_string()
+                    } else if let SigCheck::Invalid(e) = signature {
+                        format!("failed: invalid signature ({e})")
+                    } else if matches!(signature, SigCheck::Unsigned) && sp.want_logout_signed {
+                        "failed: unsigned, and want_logout_signed is on".into()
+                    } else if resp.status.is_success() {
+                        "logged out (SOAP)".into()
+                    } else {
+                        format!("failed: {}", resp.status.short())
+                    }
+                }
+                Ok(other) => format!("failed: expected a LogoutResponse, got {}", other.kind()),
+                Err(e) => format!("failed: {e}"),
+            };
+            let error =
+                outcome.strip_prefix("failed: ").map(|e| ("back-channel logout failed".to_string(), e.to_string()));
+            (outcome, Some(received), error)
+        }
+    };
+    state.inspector.record_outgoing(
+        tenant.key(),
+        url,
+        &sp.entity_id,
+        sent,
+        received,
+        if error.is_some() { 500 } else { 200 },
+        error,
+        format!("LogoutRequest → {url}: {outcome}"),
+        started,
+    );
+    outcome
+}
+
+/// Log a session's service providers out back-channel, except `skip`. Returns (entity ID,
+/// outcome) for each; ones without a SOAP endpoint are `not notified`.
+pub async fn back_channel_all(
+    state: &AppState,
+    tenant: &Tenant,
+    session: &Session,
+    skip: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut results = vec![];
+    for participant in session.participants.iter().filter(|p| Some(p.entity_id.as_str()) != skip) {
+        let outcome = match find_sp(state, tenant, &participant.entity_id).await {
+            Some(sp) => match &sp.slo_soap_url {
+                Some(url) => back_channel(state, tenant, &sp, url, participant, &session.session_index).await,
+                None => "not notified: no SOAP SingleLogoutService".into(),
+            },
+            None => "not notified: no longer registered".into(),
+        };
+        results.push((participant.entity_id.clone(), outcome));
+    }
+    results
+}
+
+/// A LogoutRequest over the SOAP binding: end the session it names and log the other service
+/// providers out back-channel (the browser isn't there to redirect).
+pub async fn soap_logout_request(
+    state: &AppState,
+    tenant: &Tenant,
+    envelope: &Element,
+    req: LogoutRequest,
+) -> Response {
+    let fault = crate::soap::fault;
+    let p = preset(state, tenant);
+    if !p.single_logout {
+        return fault(true, &format!("{} doesn't do SAML single logout", p.name));
+    }
+    let Some(issuer) = req.issuer.clone() else {
+        return fault(true, "the LogoutRequest has no Issuer");
+    };
+    let sp = match resolve_sp(state, tenant, &issuer).await {
+        Ok(sp) => sp,
+        Err(e) => return fault(true, &e),
+    };
+    match check_signature(&sp, envelope, &req.id, None) {
+        SigCheck::Invalid(e) => return fault(true, &format!("invalid LogoutRequest signature: {e}")),
+        SigCheck::Unsigned if sp.want_logout_signed => {
+            return fault(true, &format!("{} must sign its logout messages (want_logout_signed)", sp.label()));
+        }
+        _ => {}
+    }
+    // No cookie on a back-channel request: find the session by SessionIndex, else by the NameID
+    // this SP was given.
+    let session = state.store.entries::<Session>(Table::Sessions).into_iter().find(|(_, s, _)| {
+        s.tenant == tenant.key()
+            && (req.session_indexes.contains(&s.session_index)
+                || s.participants.iter().any(|p| {
+                    p.entity_id == sp.entity_id
+                        && (req.session_indexes.contains(&p.session_index)
+                            || (req.session_indexes.is_empty() && Some(&p.name_id) == req.name_id.as_ref()))
+                }))
+    });
+    let mut status = Status::success();
+    if let Some((sid, session, _)) = session {
+        state.store.remove(Table::Sessions, &sid);
+        let results = back_channel_all(state, tenant, &session, Some(&sp.entity_id)).await;
+        if results.iter().any(|(_, r)| !r.starts_with("logged out")) {
+            status =
+                Status::parse("PartialLogout", Some("some service providers couldn't be logged out".into())).unwrap();
+        }
+    }
+    let style = &p.style;
+    let (mut message, id) =
+        saml::logout_response_to(style, &tenant.entity_id, None, Some(&req.id), &status, state.now());
+    let alg = sp.signature_algorithm.unwrap_or(state.config.signature_algorithm);
+    if let Err(e) = state.keys.with_current(|key| saml::sign_message(&mut message, &id, key, style, alg)) {
+        return fault(false, &e);
+    }
+    let pretty = message.to_pretty();
+    let mut resp = crate::soap::reply(message);
+    SamlNote::sent(&sp.entity_id, "LogoutResponse", "soap", "(SOAP response)", pretty, Some(&status)).attach(&mut resp);
+    resp
 }

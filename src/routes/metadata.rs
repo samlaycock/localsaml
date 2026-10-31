@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 
 use crate::dsig::{NS_DS, SignOpts};
 use crate::presets::nameid;
-use crate::saml::{BINDING_POST, BINDING_REDIRECT, NS_MD, NS_PROTOCOL};
+use crate::saml::{BINDING_POST, BINDING_REDIRECT, BINDING_SOAP, NS_MD, NS_PROTOCOL};
 use crate::state::AppState;
 use crate::tenant::Tenant;
 use crate::xml::Element;
@@ -26,7 +26,7 @@ pub fn document(state: &AppState, tenant: &Tenant, signed: bool) -> Result<Strin
         )));
     }
     if let Some(slo) = tenant.slo_url() {
-        for binding in [BINDING_REDIRECT, BINDING_POST] {
+        for binding in [BINDING_REDIRECT, BINDING_POST, BINDING_SOAP] {
             idp = idp.child(md("SingleLogoutService").attr("Binding", binding).attr("Location", &slo));
         }
     }
