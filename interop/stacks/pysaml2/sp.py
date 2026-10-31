@@ -14,7 +14,9 @@ import tempfile
 import traceback
 from html import unescape
 
-from saml2 import BINDING_HTTP_POST, BINDING_HTTP_REDIRECT
+from saml2 import BINDING_HTTP_POST, BINDING_HTTP_REDIRECT, BINDING_SOAP
+from saml2.pack import make_soap_enveloped_saml_thingy
+from saml2.response import AttributeResponse
 from saml2.client import Saml2Client
 from saml2.config import SPConfig
 from saml2.saml import NameID
@@ -120,6 +122,34 @@ def run(c):
         )
         info = sp.apply_binding(BINDING_HTTP_REDIRECT, str(request), destination, c.get("relay_state", ""), sign=True, sigalg=SIG_RSA_SHA256)
         return {"id": req_id, "url": location(info)}
+    if op == "attribute_query":
+        # A signed AttributeQuery in a SOAP envelope, for the harness to POST to the AttributeService.
+        destination = sp.metadata.attribute_service(idp, BINDING_SOAP)[0]["location"]
+        attributes = {n: None for n in c.get("attributes") or []}
+        req_id, request = sp.create_attribute_query(
+            destination, name_id=NameID(text=c["name_id"], format=c.get("name_id_format")),
+            attribute=attributes or None, sign=True, sign_alg=SIG_RSA_SHA256, digest_alg=DIGEST_SHA256,
+        )
+        return {"id": req_id, "destination": destination, "envelope": make_soap_enveloped_saml_thingy(request)}
+    if op == "parse_attribute_response":
+        # pysaml2's SOAP unwrapping re-serializes the Response with its own prefixes (ns0:…),
+        # which breaks any Exclusive C14N signature made with other prefixes. The harness passes
+        # the Response exactly as it was in the envelope (base64, as the POST binding carries it).
+        # This is parse_attribute_query_response with its SOAP-binding settings (asynchop=False:
+        # InResponseTo is checked below) but the POST binding's unravelling.
+        resp = sp._parse_response(
+            c["saml_response"], AttributeResponse, "attribute_consuming_service", BINDING_HTTP_POST,
+            entity_id=sp.config.entityid, attribute_converters=sp.config.attribute_converters, asynchop=False,
+        )
+        if resp is None or resp.assertion is None:
+            raise Exception("pysaml2 accepted no assertion from the attribute query Response")
+        if resp.in_response_to != c["id"]:
+            raise Exception(f"InResponseTo {resp.in_response_to}, expected {c['id']}")
+        attrs = {}
+        for statement in resp.assertion.attribute_statement:
+            for a in statement.attribute:
+                attrs.setdefault(a.name, []).extend(v.text or "" for v in a.attribute_value)
+        return {"name_id": resp.assertion.subject.name_id.text, "attributes": attrs}
     if op == "parse_logout_response":
         resp = sp.parse_logout_request_response(c["saml_response"], BINDING_HTTP_REDIRECT)
         if resp is None:

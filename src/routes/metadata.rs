@@ -39,12 +39,26 @@ pub fn document(state: &AppState, tenant: &Tenant, signed: bool) -> Result<Strin
     }
     let mut formats = vec![preset.name_id_format];
     formats.extend(nameid::ALL.iter().filter(|f| **f != preset.name_id_format && **f != nameid::ENTITY));
-    for f in formats {
-        idp = idp.child(md("NameIDFormat").text(f));
+    for f in &formats {
+        idp = idp.child(md("NameIDFormat").text(*f));
     }
     let sso = tenant.sso_url();
     for binding in [BINDING_REDIRECT, BINDING_POST] {
         idp = idp.child(md("SingleSignOnService").attr("Binding", binding).attr("Location", &sso));
+    }
+    // The attribute authority: AttributeQuery over SOAP.
+    let mut authority = md("AttributeAuthorityDescriptor").attr("protocolSupportEnumeration", NS_PROTOCOL);
+    for cert in state.keys.certs_b64() {
+        authority = authority.child(md("KeyDescriptor").attr("use", "signing").child(
+            Element::new(NS_DS, "ds", "KeyInfo").child(
+                Element::new(NS_DS, "ds", "X509Data").child(Element::new(NS_DS, "ds", "X509Certificate").text(cert)),
+            ),
+        ));
+    }
+    authority = authority
+        .child(md("AttributeService").attr("Binding", BINDING_SOAP).attr("Location", tenant.url("/attribute")));
+    for f in &formats {
+        authority = authority.child(md("NameIDFormat").text(*f));
     }
     let id = crate::util::saml_id("_");
     let mut entity = md("EntityDescriptor")
@@ -52,7 +66,8 @@ pub fn document(state: &AppState, tenant: &Tenant, signed: bool) -> Result<Strin
         .attr("entityID", &tenant.entity_id)
         .declare("md", NS_MD)
         .declare("ds", NS_DS)
-        .child(idp);
+        .child(idp)
+        .child(authority);
     entity.declare_namespaces();
     if signed {
         let opts = SignOpts { alg: state.config.signature_algorithm, ..Default::default() };

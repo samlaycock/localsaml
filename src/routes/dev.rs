@@ -218,6 +218,7 @@ pub async fn mint(state: &AppState, tenant: &Tenant, req: MintRequest) -> Result
         sp_name_qualifier: None,
         status,
         tampers: req.tamper.clone(),
+        attribute_query: false,
     };
     let artifact = match req.binding.as_deref() {
         None | Some("post") => false,

@@ -225,10 +225,10 @@ pub async fn endpoint(
         Message::LogoutResponse(resp) => {
             crate::routes::slo::logout_response(&state, &tenant, resp, &root, arrival).await
         }
-        Message::ArtifactResolve(_) => saml_error_page(
+        Message::ArtifactResolve(_) | Message::AttributeQuery(_) => saml_error_page(
             &tenant,
-            "ArtifactResolve over the wrong binding",
-            "Resolve artifacts with the SOAP binding: POST a SOAP envelope to the ArtifactResolutionService.",
+            &format!("{} over the wrong binding", message.kind()),
+            "Send it with the SOAP binding: POST a SOAP envelope to the ArtifactResolutionService or AttributeService.",
         ),
     }
 }
@@ -693,6 +693,7 @@ pub fn respond_status(
         sp_name_qualifier: None,
         status: Some(status.clone()),
         tampers: vec![],
+        attribute_query: false,
     };
     let issued = match state.keys.with_current(|key| saml::build_response(key, &spec)) {
         Ok(i) => i,
@@ -804,6 +805,7 @@ pub fn complete(
                 sp_name_qualifier: pending.sp_name_qualifier.clone(),
                 status: None,
                 tampers: pending.tampers.clone(),
+                attribute_query: false,
             };
             match state.keys.with_current(|key| saml::build_response(key, &spec)) {
                 Ok(issued) => (issued.xml, issued.pretty),

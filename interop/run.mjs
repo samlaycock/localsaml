@@ -258,7 +258,9 @@ async function json(url, init) {
 
 async function metadataOf(base) {
   const xml = await (await fetch(`${base}/metadata`)).text();
-  const certs = [...xml.matchAll(/<ds:X509Certificate>([^<]+)<\/ds:X509Certificate>/g)].map((m) => m[1]);
+  // The IdP role's signing certificates (the attribute authority lists the same ones).
+  const idp = (xml.match(/<md:IDPSSODescriptor[\s\S]*<\/md:IDPSSODescriptor>/) || [xml])[0];
+  const certs = [...idp.matchAll(/<ds:X509Certificate>([^<]+)<\/ds:X509Certificate>/g)].map((m) => m[1]);
   const location = (kind, binding) => (xml.match(new RegExp(`<md:${kind} Binding="urn:oasis:names:tc:SAML:2.0:bindings:${binding}" Location="([^"]+)"`)) || [])[1];
   return {
     xml,
@@ -996,6 +998,34 @@ async function runHelperStack(stack, helper, issuer, keys) {
     return 'accepted';
   });
   // node-saml, samlify and crewjam accept an EncryptedID but don't decrypt it (no NameID).
+  if (stack === 'pysaml2') {
+    // pysaml2 builds and signs the AttributeQuery and validates the answer; the harness carries
+    // the SOAP request (the container can't reach localsaml on its own) and unwraps the answer
+    // (pysaml2's own unwrapping breaks signatures; see sp.py).
+    const attributeQuery = async (attributes) => {
+      const q = await helper.call(base(sp, { op: 'attribute_query', name_id: 'alice@example.com', name_id_format: EMAIL, attributes }));
+      assert(q.destination === `${issuer.base}/attribute`, `AttributeService ${q.destination}`);
+      const res = await fetch(q.destination, { method: 'POST', headers: { 'content-type': 'text/xml', soapaction: 'http://www.oasis-open.org/committees/security' }, body: q.envelope });
+      const envelope = await res.text();
+      assert(res.ok, `HTTP ${res.status}: ${envelope.slice(0, 300)}`);
+      // The Response as it is in the SOAP Body (it declares its own namespaces).
+      const response = (envelope.match(/<(\w+:)?Response\b[\s\S]*<\/\1?Response>/) || [])[0];
+      assert(response, `no Response in ${envelope.slice(0, 300)}`);
+      return helper.call(base(sp, { op: 'parse_attribute_response', id: q.id, saml_response: Buffer.from(response).toString('base64') }));
+    };
+    await check(name, stack, 'AttributeQuery (SOAP) for a declared user', async () => {
+      const r = await attributeQuery([]);
+      assert(r.name_id === 'alice@example.com', `NameID ${r.name_id}`);
+      assert(first(r.attributes.department) === 'QA', `department ${JSON.stringify(r.attributes.department)}`);
+      assert((r.attributes.interopRoles || []).join() === 'admin,auditor', `interopRoles ${JSON.stringify(r.attributes.interopRoles)}`);
+      return `${Object.keys(r.attributes).length} attributes`;
+    });
+    await check(name, stack, 'AttributeQuery (SOAP) for named attributes', async () => {
+      const r = await attributeQuery(['department']);
+      assert(Object.keys(r.attributes).join() === 'department', `attributes ${Object.keys(r.attributes)}`);
+      return 'department only';
+    });
+  }
   if (stack === 'pysaml2') await check(name, stack, 'encrypted NameID (EncryptedID) decrypted', async () => {
     const m = await minted('&encrypt_name_id=true');
     assert(m.name_id_encrypted === true, 'the NameID is not encrypted');

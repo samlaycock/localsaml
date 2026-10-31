@@ -828,7 +828,10 @@ async fn clock_offset_shifts_timestamps() {
 async fn key_rotation_keeps_the_old_certificate_in_metadata() {
     let state = AppState::new(Config::default(), Arc::new(Keys::generate().unwrap())).unwrap();
     let app = router(state.clone());
-    let count = |body: &str| body.matches("X509Certificate>").count() / 2;
+    let count = |body: &str| {
+        let md = parse(body).unwrap();
+        md.find(saml::NS_MD, "IDPSSODescriptor").unwrap().find_all(saml::NS_MD, "KeyDescriptor").count()
+    };
     let before = get(&app, "/metadata").await.body;
     assert_eq!(count(&before), 1);
     let old = state.keys.kid();
@@ -1609,4 +1612,116 @@ async fn encrypted_name_ids() {
             .await
             .json();
     assert_eq!(minted["name_id_encrypted"], false);
+}
+
+// ---------------------------------------------------------------------------
+// Attribute queries
+// ---------------------------------------------------------------------------
+
+/// Send an AttributeQuery over SOAP; the Response that answers it.
+async fn query(app: &Router, query: Element) -> Element {
+    let r = post_body(app, Method::POST, "/attribute", "text/xml", &localsaml::soap::envelope(query)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let (_, response) = localsaml::soap::unwrap(&r.body).unwrap();
+    assert!(response.is(P, "Response"), "{}", r.body);
+    response
+}
+
+#[tokio::test]
+async fn attribute_queries() {
+    let aq =
+        ServiceProvider { certificate: Some(sp_key().cert_b64()), ..sp("http://aq.test/sp", "http://aq.test/acs") };
+    let config = Config { users: vec![alice()], ..with_sps(vec![aq]) };
+    let (app, state) = app_with(config);
+    let md = parse(&get(&app, "/metadata").await.body).unwrap();
+    let service = md.path(&[(saml::NS_MD, "AttributeAuthorityDescriptor"), (saml::NS_MD, "AttributeService")]).unwrap();
+    assert_eq!(service.get_attr("Location"), Some(format!("{BASE}/attribute").as_str()));
+
+    // A subject from a session: the attributes it was given, about the NameID asked for.
+    let mut jar = Jar::default();
+    let attrs = enc(r#"{"email":"sam@example.com","groups":["a","b","c"]}"#);
+    let uri =
+        format!("/sso/initiate?sp={}&dev_name_id=sam%40example.com&dev_attributes={attrs}", enc("http://aq.test/sp"));
+    let p = posted(&get_jar(&app, &uri, &mut jar).await);
+    let (name_id, format) = p.name_id();
+    let email = p.attribute("email");
+    assert!(!email.is_empty());
+    let signed = |q: (Element, String)| {
+        let (mut el, id) = q;
+        saml::sign_message(&mut el, &id, sp_key(), &localsaml::presets::generic().style, SigAlg::RsaSha256).unwrap();
+        (el, id)
+    };
+    let (q, id) = signed(saml::attribute_query(
+        "http://aq.test/sp",
+        &format!("{BASE}/attribute"),
+        &name_id,
+        &format,
+        &[],
+        wall_clock(),
+    ));
+    let response = query(&app, q).await;
+    assert_eq!(response.get_attr("InResponseTo"), Some(id.as_str()));
+    assert!(response.get_attr("Destination").is_none());
+    assert!(Status::from_element(response.find(P, "Status")).is_success());
+    let assertion = response.find(A, "Assertion").unwrap();
+    verify(&state, &response, assertion.get_attr("ID").unwrap());
+    assert_eq!(assertion.path(&[(A, "Subject"), (A, "NameID")]).unwrap().value(), name_id);
+    let confirmation = assertion.path(&[(A, "Subject"), (A, "SubjectConfirmation")]).unwrap();
+    assert_eq!(confirmation.get_attr("Method"), Some(saml::CM_SENDER_VOUCHES));
+    assert!(assertion.find(A, "AuthnStatement").is_none());
+    assert_eq!(attr_values(assertion, "email"), email);
+    assert_eq!(attr_values(assertion, "groups"), ["a", "b", "c"]);
+
+    // Only the attributes (and values) asked for.
+    let (mut q, _) =
+        saml::attribute_query("http://aq.test/sp", "x", &name_id, &format, &["email", "groups"], wall_clock());
+    let groups = p.attribute("groups");
+    q.elements_mut()
+        .find(|e| e.get_attr("Name") == Some("groups"))
+        .unwrap()
+        .children
+        .push(localsaml::xml::Node::Element(Element::new(A, "saml", "AttributeValue").text(&groups[0])));
+    q.declare_namespaces();
+    let assertion = query(&app, q).await.find(A, "Assertion").unwrap().clone();
+    let names: Vec<_> = assertion
+        .find(A, "AttributeStatement")
+        .unwrap()
+        .find_all(A, "Attribute")
+        .map(|a| a.get_attr("Name").unwrap().to_string())
+        .collect();
+    assert_eq!(names, ["email", "groups"]);
+    assert_eq!(attr_values(&assertion, "groups"), [groups[0].clone()]);
+    assert_eq!(groups.len(), 3);
+
+    // A declared user without a session.
+    let (q, _) = saml::attribute_query("http://aq.test/sp", "x", "alice@acme.dev", nameid::EMAIL, &[], wall_clock());
+    let assertion = query(&app, q).await.find(A, "Assertion").unwrap().clone();
+    assert_eq!(attr_values(&assertion, "groups"), ["admins"]);
+
+    // Nobody: UnknownPrincipal, in a signed Response.
+    let (q, _) = saml::attribute_query("http://aq.test/sp", "x", "nobody", nameid::UNSPECIFIED, &[], wall_clock());
+    let response = query(&app, q).await;
+    assert_eq!(Status::from_element(response.find(P, "Status")).short(), "UnknownPrincipal");
+    verify(&state, &response, response.get_attr("ID").unwrap());
+
+    // A query signed by the wrong key is refused.
+    let (mut q, id) = saml::attribute_query("http://aq.test/sp", "x", &name_id, &format, &[], wall_clock());
+    state
+        .keys
+        .with_current(|k| saml::sign_message(&mut q, &id, k, &localsaml::presets::generic().style, SigAlg::RsaSha256))
+        .unwrap();
+    let r = post_body(&app, Method::POST, "/attribute", "text/xml", &localsaml::soap::envelope(q)).await;
+    assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(r.body.contains("invalid AttributeQuery signature"), "{}", r.body);
+
+    // The test SP queries for its signed-in user.
+    let mut sp_jar = Jar::default();
+    let p = quick_login(&app, "", &format!("{BASE}/sp"), &mut sp_jar, "").await;
+    let b64 = b64_std(p.doc.to_xml());
+    assert_eq!(
+        post_form(&app, "/sp/acs", &[("SAMLResponse", &b64)], &mut sp_jar).await.title(),
+        "Test SP: signed in · localsaml"
+    );
+    let r = post_form(&app, "/sp/attributes", &[], &mut sp_jar).await;
+    assert_eq!(r.title(), "Test SP: attributes · localsaml", "{}", r.body);
 }

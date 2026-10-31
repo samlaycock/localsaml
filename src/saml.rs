@@ -27,6 +27,8 @@ pub const BINDING_POST: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
 pub const BINDING_ARTIFACT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact";
 pub const BINDING_SOAP: &str = "urn:oasis:names:tc:SAML:2.0:bindings:SOAP";
 pub const CM_BEARER: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
+/// The identity provider vouches for the subject (attribute query answers, sent back-channel).
+pub const CM_SENDER_VOUCHES: &str = "urn:oasis:names:tc:SAML:2.0:cm:sender-vouches";
 
 pub mod status {
     pub const PREFIX: &str = "urn:oasis:names:tc:SAML:2.0:status:";
@@ -229,6 +231,29 @@ pub enum Message {
     LogoutRequest(LogoutRequest),
     LogoutResponse(LogoutResponse),
     ArtifactResolve(ArtifactResolve),
+    AttributeQuery(AttributeQuery),
+}
+
+/// A service provider asking for a subject's attributes (SOAP binding).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttributeQuery {
+    pub id: String,
+    pub issuer: Option<String>,
+    pub destination: Option<String>,
+    /// Empty when the subject is an `EncryptedID` that hasn't been decrypted yet.
+    pub name_id: Option<String>,
+    pub name_id_format: Option<String>,
+    pub name_id_encrypted: bool,
+    /// The attributes asked for; none means all of them.
+    pub attributes: Vec<RequestedAttribute>,
+    pub signed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestedAttribute {
+    pub name: String,
+    /// Only these values (none: every value).
+    pub values: Vec<String>,
 }
 
 /// A service provider asking for the message behind an artifact (SOAP binding).
@@ -247,6 +272,7 @@ impl Message {
             Message::LogoutRequest(_) => "LogoutRequest",
             Message::LogoutResponse(_) => "LogoutResponse",
             Message::ArtifactResolve(_) => "ArtifactResolve",
+            Message::AttributeQuery(_) => "AttributeQuery",
         }
     }
 }
@@ -342,6 +368,37 @@ pub fn parse_element(root: &Element) -> Result<Message, String> {
                 .ok_or("ArtifactResolve has no Artifact")?,
             signed,
         }),
+        "AttributeQuery" => {
+            let subject = root.find(NS_ASSERTION, "Subject").ok_or("AttributeQuery has no Subject")?;
+            let name_id = subject.find(NS_ASSERTION, "NameID");
+            let name_id_encrypted = subject.find(NS_ASSERTION, "EncryptedID").is_some();
+            if name_id.is_none() && !name_id_encrypted {
+                return Err("the AttributeQuery's Subject has no NameID or EncryptedID".into());
+            }
+            Message::AttributeQuery(AttributeQuery {
+                id,
+                issuer: issuer_of(&root),
+                destination: opt(&root, "Destination"),
+                name_id: name_id.map(Element::value),
+                name_id_format: name_id.and_then(|n| opt(n, "Format")),
+                name_id_encrypted,
+                attributes: root
+                    .find_all(NS_ASSERTION, "Attribute")
+                    .filter_map(|a| {
+                        Some(RequestedAttribute {
+                            name: opt(a, "Name")?,
+                            // An empty AttributeValue asks for any value (pysaml2 sends one).
+                            values: a
+                                .find_all(NS_ASSERTION, "AttributeValue")
+                                .map(Element::text_content)
+                                .filter(|v| !v.is_empty())
+                                .collect(),
+                        })
+                    })
+                    .collect(),
+                signed,
+            })
+        }
         other => return Err(format!("unexpected message <{other}>")),
     };
     Ok(message)
@@ -452,6 +509,9 @@ pub struct ResponseSpec<'a> {
     /// A non-success status: the Response carries no assertion.
     pub status: Option<Status>,
     pub tampers: Vec<Tamper>,
+    /// Answering an AttributeQuery: sender-vouches confirmation (for the audience) instead of
+    /// bearer, no AuthnStatement, and (with an empty `destination`) no Destination.
+    pub attribute_query: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -496,7 +556,7 @@ pub fn build_response(key: &KeyPair, spec: &ResponseSpec) -> Result<Issued, Stri
         .attr("ID", &response_id)
         .attr("Version", "2.0")
         .attr("IssueInstant", iso8601(now))
-        .attr("Destination", &destination)
+        .attr_opt("Destination", Some(&destination).filter(|d| !d.is_empty()))
         .attr_opt("InResponseTo", in_response_to.clone())
         .declare(style.protocol_prefix, NS_PROTOCOL);
     if !style.assertion_prefix.is_empty() {
@@ -674,19 +734,22 @@ fn build_assertion(
         }
         None => (name_id, None),
     };
-    let subject = a("Subject").child(name_id).child(
-        a("SubjectConfirmation").attr("Method", CM_BEARER).child(
-            a("SubjectConfirmationData")
-                .attr_opt("InResponseTo", in_response_to)
-                .attr(
-                    "NotOnOrAfter",
-                    // An explicit lifetime applies to both; otherwise some templates confirm for
-                    // less (or longer) than the assertion is valid.
-                    iso8601(now + spec.lifetime.or(spec.preset.confirmation_lifetime).unwrap_or(lifetime)),
-                )
-                .attr("Recipient", recipient),
-        ),
+    // A query's answer goes back over SOAP: the identity provider vouches for the subject to the
+    // service provider (the Recipient), rather than a browser bearing it to an ACS.
+    let (method, recipient) =
+        if spec.attribute_query { (CM_SENDER_VOUCHES, audience.clone()) } else { (CM_BEARER, recipient) };
+    let confirmation = a("SubjectConfirmation").attr("Method", method).child(
+        a("SubjectConfirmationData")
+            .attr_opt("InResponseTo", in_response_to)
+            .attr(
+                "NotOnOrAfter",
+                // An explicit lifetime applies to both; otherwise some templates confirm for
+                // less (or longer) than the assertion is valid.
+                iso8601(now + spec.lifetime.or(spec.preset.confirmation_lifetime).unwrap_or(lifetime)),
+            )
+            .attr("Recipient", recipient),
     );
+    let subject = a("Subject").child(name_id).child(confirmation);
     let conditions = a("Conditions")
         .attr("NotBefore", iso8601(now - spec.preset.not_before_skew))
         .attr("NotOnOrAfter", iso8601(now + lifetime))
@@ -696,7 +759,8 @@ fn build_assertion(
         .attr("SessionIndex", &spec.session_index)
         .attr_opt("SessionNotOnOrAfter", spec.preset.session_lifetime.map(|s| iso8601(spec.auth_time + s)))
         .child(a("AuthnContext").child(a("AuthnContextClassRef").text(&spec.authn_context)));
-    let attributes = attribute_statement(spec.preset, spec.identity);
+    // An attribute authority answers with the values it has (no template's empty attributes).
+    let attributes = attribute_statement(spec.preset, spec.identity, !spec.attribute_query);
 
     let mut assertion = a("Assertion")
         .attr("ID", id)
@@ -705,7 +769,9 @@ fn build_assertion(
         .child(issuer.clone())
         .child(subject)
         .child(conditions);
-    if style.attributes_first {
+    if spec.attribute_query {
+        assertion = assertion.child_opt(attributes);
+    } else if style.attributes_first {
         assertion = assertion.child_opt(attributes).child(authn);
     } else {
         assertion = assertion.child(authn).child_opt(attributes);
@@ -713,19 +779,20 @@ fn build_assertion(
     Ok((assertion, plain))
 }
 
-fn attribute_statement(preset: &Preset, identity: &Identity) -> Option<Element> {
+fn attribute_statement(preset: &Preset, identity: &Identity, empty_attributes: bool) -> Option<Element> {
     let style = &preset.style;
+    let send_empty = preset.send_empty_attributes && empty_attributes;
     let a = |local: &str| Element::new(NS_ASSERTION, style.assertion_prefix, local);
     let mut statement = a("AttributeStatement");
     // The template's attributes in its order, then any others.
     let known = preset.attributes.iter().map(|a| a.name).filter(|n| identity.attributes.contains_key(*n));
     let others = identity.attributes.keys().map(String::as_str).filter(|n| preset.attribute(n).is_none());
     let known: Vec<&str> =
-        if preset.send_empty_attributes { preset.attributes.iter().map(|a| a.name).collect() } else { known.collect() };
+        if send_empty { preset.attributes.iter().map(|a| a.name).collect() } else { known.collect() };
     for name in known.into_iter().chain(others) {
         let mut values = identity.values(name);
         if values.is_empty() {
-            if !preset.send_empty_attributes || preset.attribute(name).is_none() {
+            if !send_empty || preset.attribute(name).is_none() {
                 continue;
             }
             values.push(String::new());
@@ -870,6 +937,7 @@ mod tests {
             sp_name_qualifier: None,
             status: None,
             tampers: vec![],
+            attribute_query: false,
         }
     }
 
@@ -1029,6 +1097,34 @@ pub fn artifact_response(
         .child(a("Issuer").attr_opt("Format", style.issuer_format.then_some(nameid::ENTITY)).text(issuer))
         .child(Status::success().element(style))
         .child_opt(message);
+    el.declare_namespaces();
+    (el, id)
+}
+
+/// An AttributeQuery (what a service provider sends) for a NameID, asking for `attributes` (all
+/// of them when empty), and its ID.
+pub fn attribute_query(
+    issuer: &str,
+    destination: &str,
+    name_id: &str,
+    name_id_format: &str,
+    attributes: &[&str],
+    now: i64,
+) -> (Element, String) {
+    let id = crate::util::saml_id("_");
+    let a = |local: &str| Element::new(NS_ASSERTION, "saml", local);
+    let mut el = Element::new(NS_PROTOCOL, "samlp", "AttributeQuery")
+        .attr("ID", &id)
+        .attr("Version", "2.0")
+        .attr("IssueInstant", iso8601(now))
+        .attr("Destination", destination)
+        .declare("samlp", NS_PROTOCOL)
+        .declare("saml", NS_ASSERTION)
+        .child(a("Issuer").text(issuer))
+        .child(a("Subject").child(a("NameID").attr("Format", name_id_format).text(name_id)));
+    for name in attributes {
+        el = el.child(a("Attribute").attr("Name", *name));
+    }
     el.declare_namespaces();
     (el, id)
 }

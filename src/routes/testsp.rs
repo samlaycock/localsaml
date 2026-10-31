@@ -99,11 +99,12 @@ pub async fn home(tenant: Tenant, headers: HeaderMap) -> Response {
         Some(s) => format!(
             r#"<section class="card"><div class="eyebrow">Signed in</div><h2>As <span class="accent">{}</span></h2>
 <p class="muted">NameID format <code>{}</code>{}</p>
-<form method="post" action="{}" class="actions"><button class="btn" type="submit">Sign out (SP-initiated logout)</button></form></section>"#,
+<div class="actions"><form method="post" action="{}"><button class="btn" type="submit">Sign out (SP-initiated logout)</button></form><form method="post" action="{}"><button class="btn ghost" type="submit">Query attributes (AttributeQuery)</button></form></div></section>"#,
             esc(&s.name_id),
             esc(&s.format),
             s.session_index.as_ref().map(|i| format!(", SessionIndex <code>{}</code>", esc(i))).unwrap_or_default(),
             esc(&tenant.path("/sp/logout")),
+            esc(&tenant.path("/sp/attributes")),
         ),
         None => String::new(),
     };
@@ -276,7 +277,9 @@ struct Outcome {
     name_id_encrypted: bool,
 }
 
-fn validate(state: &AppState, tenant: &Tenant, xml: &str, expected_request: Option<&str>) -> Outcome {
+/// Check a Response like a strict service provider. `query`: it answers an AttributeQuery (sent
+/// over SOAP, so no bearer confirmation is expected).
+fn validate(state: &AppState, tenant: &Tenant, xml: &str, expected_request: Option<&str>, query: bool) -> Outcome {
     let mut checks = Checks::default();
     let mut out = Outcome {
         checks: Checks::default(),
@@ -318,12 +321,13 @@ fn validate(state: &AppState, tenant: &Tenant, xml: &str, expected_request: Opti
             got == want,
             "InResponseTo",
             if got == want {
-                format!("{got} matches our AuthnRequest")
+                format!("{got} matches our {}", if query { "AttributeQuery" } else { "AuthnRequest" })
             } else {
                 format!("{got}, but our AuthnRequest was {want}")
             },
         ),
         (Some(got), None) => checks.fail("InResponseTo", format!("{got}, but we didn't send an AuthnRequest")),
+        (None, Some(want)) if query => checks.fail("InResponseTo", format!("none, but our AttributeQuery was {want}")),
         (None, _) => checks.info("InResponseTo", "none: an unsolicited (IdP-initiated) Response"),
     }
     let issuer = doc.find(NS_ASSERTION, "Issuer").map(Element::value);
@@ -458,6 +462,7 @@ fn validate(state: &AppState, tenant: &Tenant, xml: &str, expected_request: Opti
                 checks.check(irt == want, "Confirmation InResponseTo", irt.to_string());
             }
         }
+        None if query => checks.info("SubjectConfirmation", "not bearer (an attribute query answer)"),
         None => checks.fail("SubjectConfirmation", "no bearer SubjectConfirmationData"),
     }
     let conditions = assertion.find(NS_ASSERTION, "Conditions");
@@ -506,6 +511,52 @@ fn validate(state: &AppState, tenant: &Tenant, xml: &str, expected_request: Opti
     }
     out.checks = checks;
     out
+}
+
+/// Ask the identity provider for the signed-in user's attributes, the way a service provider
+/// would: a signed AttributeQuery over SOAP to its AttributeService (handled in-process here).
+pub async fn attributes(State(state): State<AppState>, tenant: Tenant, headers: HeaderMap) -> Response {
+    let Some(session) = sp_session(&tenant, &headers) else {
+        return Redirect::to(&tenant.path("/sp")).into_response();
+    };
+    let style = &tenant.default_preset(&state.config).style;
+    let (mut query, id) = saml::attribute_query(
+        &entity_id(&tenant),
+        &tenant.url("/attribute"),
+        &session.name_id,
+        &session.format,
+        &[],
+        wall_clock(),
+    );
+    let alg = state.config.signature_algorithm;
+    if let Err(e) = state.keys.with_current(|k| saml::sign_message(&mut query, &id, k, style, alg)) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    let sent = query.to_pretty();
+    let resp = crate::routes::backchannel::dispatch(&state, &tenant, &Bytes::from(crate::soap::envelope(query))).await;
+    let answer = match axum::body::to_bytes(resp.into_body(), 4 << 20).await {
+        Ok(b) => crate::soap::unwrap(&String::from_utf8_lossy(&b)),
+        Err(e) => Err(e.to_string()),
+    };
+    let mut outcome = match answer {
+        Ok((_, response)) => validate(&state, &tenant, &response.to_xml(), Some(&id), true),
+        Err(e) => {
+            return crate::html::error_page(&tenant, StatusCode::BAD_GATEWAY, "The attribute query failed", &e);
+        }
+    };
+    outcome
+        .checks
+        .0
+        .insert(0, Check { ok: None, label: "AttributeQuery".into(), detail: format!("{id}, sent over SOAP") });
+    let extra = xml_block("AttributeQuery", &sent);
+    outcome_page(
+        &tenant,
+        &outcome,
+        &extra,
+        ["Test SP · attribute query answered", "Test SP · attribute query rejected"],
+        ["Attributes from the attribute authority", "The answer didn't pass validation"],
+        ["Test SP: attributes", "Test SP: attribute query rejected"],
+    )
 }
 
 /// Resolve an artifact the way a service provider would: a signed ArtifactResolve over SOAP to
@@ -559,6 +610,72 @@ async fn resolve_artifact(state: &AppState, tenant: &Tenant, artifact: &str) -> 
     (checks, Ok(inner.to_xml()))
 }
 
+/// The test SP's verdict on a Response: checks, NameID, attributes and the XML. The pairs are
+/// (accepted, rejected) texts.
+fn outcome_page(
+    tenant: &Tenant,
+    outcome: &Outcome,
+    extra: &str,
+    verdicts: [&str; 2],
+    titles: [&str; 2],
+    page_titles: [&str; 2],
+) -> Response {
+    let passed = outcome.checks.passed();
+    let pick = |pair: [&str; 2]| if passed { pair[0] } else { pair[1] }.to_string();
+    let attrs: String = outcome
+        .attributes
+        .iter()
+        .map(|(name, friendly, values)| {
+            format!(
+                "<tr><td><code>{}</code>{}</td><td>{}</td></tr>",
+                esc(name),
+                friendly.as_ref().map(|f| format!(" <small class=\"muted\">{}</small>", esc(f))).unwrap_or_default(),
+                values.iter().map(|v| format!("<code>{}</code>", esc(v))).collect::<Vec<_>>().join(" ")
+            )
+        })
+        .collect();
+    let who = outcome
+        .name_id
+        .as_ref()
+        .map(|(v, f, _)| format!("<code>{}</code> <small class=\"muted\">{}</small>", esc(v), esc(f)))
+        .unwrap_or_else(|| "–".into());
+    let body = format!(
+        r#"<section class="card">
+  <div class="eyebrow {eyebrow}">{verdict}</div>
+  <h1>{title}</h1>
+  <p>NameID {who}</p>{extra}
+  {checks}
+  <div class="actions"><a class="btn" href="{again}">Back to the test SP</a></div>
+</section>
+<section class="card"><h2>Attributes</h2>{attr_table}</section>
+<section class="card"><h2>Response</h2>{xml}{assertion}</section>"#,
+        eyebrow = if passed { "" } else { "error" },
+        verdict = esc(&pick(verdicts)),
+        title = esc(&pick(titles)),
+        checks = outcome.checks.html(),
+        again = esc(&tenant.path("/sp")),
+        attr_table = if attrs.is_empty() {
+            r#"<p class="muted">No attributes.</p>"#.to_string()
+        } else {
+            format!(r#"<table class="endpoints">{attrs}</table>"#)
+        },
+        xml = xml_block("SAML Response", &outcome.response_xml),
+        assertion = outcome.assertion_xml.as_ref().map(|a| xml_block("Decrypted assertion", a)).unwrap_or_default(),
+    );
+    let mut resp = page(tenant, &pick(page_titles), &body).into_response();
+    if !passed {
+        let failed: Vec<String> = outcome
+            .checks
+            .0
+            .iter()
+            .filter(|c| c.ok == Some(false))
+            .map(|c| format!("{}: {}", c.label, c.detail))
+            .collect();
+        crate::inspector::ErrorNote::attach(&mut resp, "rejected by the test SP", failed.join("; "));
+    }
+    resp
+}
+
 pub async fn acs(
     State(state): State<AppState>,
     tenant: Tenant,
@@ -581,7 +698,7 @@ pub async fn acs(
     };
     let expected = cookie_value(&headers, &request_cookie_name(&tenant));
     let mut outcome = match xml {
-        Ok(xml) => validate(&state, &tenant, &xml, expected.as_deref()),
+        Ok(xml) => validate(&state, &tenant, &xml, expected.as_deref(), false),
         Err(e) => {
             let mut checks = Checks::default();
             checks.fail("Response", e);
@@ -602,63 +719,19 @@ pub async fn acs(
     if passed && let Some(id) = &outcome.assertion_id {
         seen().lock().unwrap().insert(id.clone());
     }
-    let attrs: String = outcome
-        .attributes
-        .iter()
-        .map(|(name, friendly, values)| {
-            format!(
-                "<tr><td><code>{}</code>{}</td><td>{}</td></tr>",
-                esc(name),
-                friendly.as_ref().map(|f| format!(" <small class=\"muted\">{}</small>", esc(f))).unwrap_or_default(),
-                values.iter().map(|v| format!("<code>{}</code>", esc(v))).collect::<Vec<_>>().join(" ")
-            )
-        })
-        .collect();
-    let who = outcome
-        .name_id
-        .as_ref()
-        .map(|(v, f, _)| format!("<code>{}</code> <small class=\"muted\">{}</small>", esc(v), esc(f)))
-        .unwrap_or_else(|| "–".into());
     let relay = form
         .get("RelayState")
         .filter(|r| !r.is_empty())
         .map(|r| format!(r#"<p class="muted">RelayState <code>{}</code></p>"#, esc(r)))
         .unwrap_or_default();
-    let body = format!(
-        r#"<section class="card">
-  <div class="eyebrow {eyebrow}">{verdict}</div>
-  <h1>{title}</h1>
-  <p>NameID {who}</p>{relay}
-  {checks}
-  <div class="actions"><a class="btn" href="{again}">Back to the test SP</a></div>
-</section>
-<section class="card"><h2>Attributes</h2>{attr_table}</section>
-<section class="card"><h2>Response</h2>{xml}{assertion}</section>"#,
-        eyebrow = if passed { "" } else { "error" },
-        verdict = if passed { "Test SP · login accepted" } else { "Test SP · login rejected" },
-        title = if passed { "Signed in" } else { "The Response didn't pass validation" },
-        checks = outcome.checks.html(),
-        again = esc(&tenant.path("/sp")),
-        attr_table = if attrs.is_empty() {
-            r#"<p class="muted">No attributes.</p>"#.to_string()
-        } else {
-            format!(r#"<table class="endpoints">{attrs}</table>"#)
-        },
-        xml = xml_block("SAML Response", &outcome.response_xml),
-        assertion = outcome.assertion_xml.as_ref().map(|a| xml_block("Decrypted assertion", a)).unwrap_or_default(),
+    let mut resp = outcome_page(
+        &tenant,
+        &outcome,
+        &relay,
+        ["Test SP · login accepted", "Test SP · login rejected"],
+        ["Signed in", "The Response didn't pass validation"],
+        ["Test SP: signed in", "Test SP: rejected"],
     );
-    let mut resp =
-        page(&tenant, if passed { "Test SP: signed in" } else { "Test SP: rejected" }, &body).into_response();
-    if !passed {
-        let failed: Vec<String> = outcome
-            .checks
-            .0
-            .iter()
-            .filter(|c| c.ok == Some(false))
-            .map(|c| format!("{}: {}", c.label, c.detail))
-            .collect();
-        crate::inspector::ErrorNote::attach(&mut resp, "rejected by the test SP", failed.join("; "));
-    }
     set_cookie(&mut resp, &cookie(&request_cookie_name(&tenant), "", 0));
     if passed && let Some((name_id, format, qualifier)) = outcome.name_id {
         let session = SpSession {
@@ -808,7 +881,7 @@ pub async fn slo(State(state): State<AppState>, tenant: Tenant, RawQuery(q): Raw
             set_cookie(&mut resp, &clear);
             resp
         }
-        Message::AuthnRequest(_) | Message::ArtifactResolve(_) => crate::html::error_page(
+        Message::AuthnRequest(_) | Message::ArtifactResolve(_) | Message::AttributeQuery(_) => crate::html::error_page(
             &tenant,
             StatusCode::BAD_REQUEST,
             &format!("Unexpected {}", message.kind()),
