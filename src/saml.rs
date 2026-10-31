@@ -196,8 +196,18 @@ pub struct AuthnRequest {
     /// `Subject/NameID`: who the SP expects to sign in, like a login hint.
     pub subject: Option<String>,
     pub subject_format: Option<String>,
+    /// `Scoping`: the identity providers the SP will accept, and who is asking (Core 3.4.1.2).
+    pub scoping: Option<Box<Scoping>>,
     /// Has an enveloped XML signature (POST binding).
     pub signed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Scoping {
+    pub proxy_count: Option<u32>,
+    /// `IDPList/IDPEntry/@ProviderID`.
+    pub idp_list: Vec<String>,
+    pub requester_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -334,6 +344,16 @@ pub fn parse_element(root: &Element) -> Result<Message, String> {
                 subject_format: root
                     .path(&[(NS_ASSERTION, "Subject"), (NS_ASSERTION, "NameID")])
                     .and_then(|n| opt(n, "Format")),
+                scoping: root.find(NS_PROTOCOL, "Scoping").map(|s| {
+                    Box::new(Scoping {
+                        proxy_count: s.get_attr("ProxyCount").and_then(|c| c.trim().parse().ok()),
+                        idp_list: s
+                            .find(NS_PROTOCOL, "IDPList")
+                            .map(|l| l.find_all(NS_PROTOCOL, "IDPEntry").filter_map(|e| opt(e, "ProviderID")).collect())
+                            .unwrap_or_default(),
+                        requester_ids: s.find_all(NS_PROTOCOL, "RequesterID").map(Element::value).collect(),
+                    })
+                }),
                 signed,
             })
         }

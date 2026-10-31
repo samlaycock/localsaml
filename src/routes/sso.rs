@@ -353,6 +353,12 @@ async fn authn_request(
         warnings
             .push(format!("IssueInstant is {} from localsaml's clock.", crate::util::format_duration(t - state.now())));
     }
+    if let Some(scoping) = req.scoping.as_ref().filter(|s| !s.requester_ids.is_empty()) {
+        warnings.push(format!(
+            "Scoping names RequesterID {} (informational: localsaml doesn't proxy).",
+            scoping.requester_ids.join(", ")
+        ));
+    }
     if matches!(signature, SigCheck::Unverified(_)) {
         warnings.push(
             "The request is signed, but there's no certificate for this service provider to verify it with.".into(),
@@ -403,6 +409,26 @@ async fn authn_request(
             &sp,
             &pending,
             Status::parse("Requester", Some(message)).unwrap(),
+        );
+    }
+    // Scoping: localsaml authenticates users itself and never proxies, so an IDPList that doesn't
+    // name it can't be satisfied (Core 3.4.1.5.1).
+    if let Some(scoping) = &req.scoping
+        && !scoping.idp_list.is_empty()
+        && !scoping.idp_list.contains(&tenant.entity_id)
+    {
+        let message = format!(
+            "the request's IDPList ({}) doesn't include {}, and localsaml doesn't proxy",
+            scoping.idp_list.join(", "),
+            tenant.entity_id
+        );
+        return respond_status(
+            state,
+            tenant,
+            preset,
+            &sp,
+            &pending,
+            Status::parse("NoSupportedIDP", Some(message)).unwrap(),
         );
     }
     // An encrypted NameID needs the SP's encryption certificate (Core 3.4.1.1).

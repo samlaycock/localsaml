@@ -1764,3 +1764,25 @@ async fn encrypted_attributes() {
     assert!(accepted.body.contains("kim@example.com"));
     assert!(accepted.body.contains("<b>EncryptedAttribute</b> <span>decrypted "), "{}", accepted.body);
 }
+
+#[tokio::test]
+async fn scoping() {
+    let (app, _) = app();
+    let scoping = |idps: &[&str]| {
+        let entries: String = idps.iter().map(|i| format!(r#"<samlp:IDPEntry ProviderID="{i}"/>"#)).collect();
+        format!(
+            r#"<samlp:Scoping ProxyCount="1"><samlp:IDPList>{entries}</samlp:IDPList><samlp:RequesterID>https://portal.test</samlp:RequesterID></samlp:Scoping>"#
+        )
+    };
+    // An IDPList without localsaml: it doesn't proxy, so NoSupportedIDP.
+    let xml = authn_request("_sc1", SP, Some(ACS), "", &scoping(&["https://other-idp.test"]));
+    let p = posted(&get(&app, &redirect("/sso", "SAMLRequest", &xml, None, None)).await);
+    assert_eq!(p.status().short(), "NoSupportedIDP");
+    assert_eq!(p.doc.get_attr("InResponseTo"), Some("_sc1"));
+    // With localsaml in the list, the login goes ahead, and the RequesterID is shown.
+    let xml =
+        authn_request("_sc2", SP, Some(ACS), "", &scoping(&["https://other-idp.test", &format!("{BASE}/metadata")]));
+    let page = get(&app, &redirect("/sso", "SAMLRequest", &xml, None, None)).await;
+    assert_eq!(page.title(), "Sign in · localsaml");
+    assert!(page.body.contains("RequesterID https://portal.test"), "{}", page.body);
+}
