@@ -16,6 +16,7 @@ const RSA_OAEP: &str = "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p";
 const RSA_1_5: &str = "http://www.w3.org/2001/04/xmlenc#rsa-1_5";
 const SHA1: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
 const TYPE_ELEMENT: &str = "http://www.w3.org/2001/04/xmlenc#Element";
+const TYPE_ENCRYPTED_KEY: &str = "http://www.w3.org/2001/04/xmlenc#EncryptedKey";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum EncAlg {
@@ -138,33 +139,62 @@ impl EncAlg {
     }
 }
 
+/// Where the wrapped key goes: inside `EncryptedData/KeyInfo` (most IdPs), or beside the
+/// `EncryptedData`, referenced with a `ds:RetrievalMethod` (Okta).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyPlacement {
+    #[default]
+    Inline,
+    Sibling,
+}
+
 /// Encrypt a serialized element (it must declare every namespace it uses) for `recipient`,
-/// returning an `xenc:EncryptedData` element to put inside e.g. `saml:EncryptedAssertion`.
-pub fn encrypt(xml: &str, recipient: &RsaPublicKey, alg: EncAlg) -> Result<Element, String> {
+/// returning the elements to put inside e.g. `saml:EncryptedAssertion`: an `xenc:EncryptedData`,
+/// then the `xenc:EncryptedKey` when it's a sibling.
+pub fn encrypt(
+    xml: &str,
+    recipient: &RsaPublicKey,
+    alg: EncAlg,
+    placement: KeyPlacement,
+) -> Result<Vec<Element>, String> {
     let key: Vec<u8> = (0..alg.key_len()).map(|_| rand::random::<u8>()).collect();
     let ciphertext = alg.encrypt(&key, xml.as_bytes())?;
     let wrapped = recipient
         .encrypt(&mut rand::thread_rng(), Oaep::new::<sha1::Sha1>(), &key)
         .map_err(|e| format!("encrypting the key: {e}"))?;
     let x = |local: &str| Element::new(NS_XENC, "xenc", local);
+    let ds = |local: &str| Element::new(NS_DS, "ds", local);
     let cipher = |bytes: &[u8]| x("CipherData").child(x("CipherValue").text(b64_std(bytes)));
+    let encrypted_key = x("EncryptedKey")
+        .child(x("EncryptionMethod").attr("Algorithm", RSA_OAEP).child(ds("DigestMethod").attr("Algorithm", SHA1)))
+        .child(cipher(&wrapped));
+    let (data_id, key_id) = (crate::util::saml_id("_"), crate::util::saml_id("_"));
+    let (key_info, sibling) = match placement {
+        KeyPlacement::Inline => (ds("KeyInfo").child(encrypted_key), None),
+        KeyPlacement::Sibling => (
+            ds("KeyInfo")
+                .child(ds("RetrievalMethod").attr("Type", TYPE_ENCRYPTED_KEY).attr("URI", format!("#{key_id}"))),
+            Some(
+                encrypted_key
+                    .attr("Id", &key_id)
+                    .child(x("ReferenceList").child(x("DataReference").attr("URI", format!("#{data_id}")))),
+            ),
+        ),
+    };
     let mut data = x("EncryptedData")
+        .attr_opt("Id", (placement == KeyPlacement::Sibling).then_some(data_id))
         .attr("Type", TYPE_ELEMENT)
         .child(x("EncryptionMethod").attr("Algorithm", alg.uri()))
-        .child(
-            Element::new(NS_DS, "ds", "KeyInfo").child(
-                x("EncryptedKey")
-                    .child(
-                        x("EncryptionMethod")
-                            .attr("Algorithm", RSA_OAEP)
-                            .child(Element::new(NS_DS, "ds", "DigestMethod").attr("Algorithm", SHA1)),
-                    )
-                    .child(cipher(&wrapped)),
-            ),
-        )
+        .child(key_info)
         .child(cipher(&ciphertext));
     data.declare_namespaces();
-    Ok(data)
+    let mut out = vec![data];
+    if let Some(mut k) = sibling {
+        k.declare_namespaces();
+        out.push(k);
+    }
+    Ok(out)
 }
 
 /// Decrypt an `xenc:EncryptedData` element (directly or inside its parent, e.g.
@@ -211,12 +241,17 @@ mod tests {
         let key = crate::keys::untrusted();
         let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_a">hi</saml:Assertion>"#;
         for alg in [EncAlg::Aes128Cbc, EncAlg::Aes256Cbc, EncAlg::Aes128Gcm, EncAlg::Aes256Gcm] {
-            let data = encrypt(xml, &key.public, alg).unwrap();
-            let parsed = crate::xml::parse(&data.to_xml()).unwrap();
-            assert_eq!(decrypt(&parsed, std::slice::from_ref(&key.private)).unwrap(), xml, "{alg:?}");
+            for placement in [KeyPlacement::Inline, KeyPlacement::Sibling] {
+                let parts = encrypt(xml, &key.public, alg, placement).unwrap();
+                let mut container = crate::xml::Element::new(crate::saml::NS_ASSERTION, "saml", "EncryptedAssertion");
+                container.children.extend(parts.into_iter().map(crate::xml::Node::Element));
+                container.declare_namespaces();
+                let parsed = crate::xml::parse(&container.to_xml()).unwrap();
+                assert_eq!(decrypt(&parsed, std::slice::from_ref(&key.private)).unwrap(), xml, "{alg:?} {placement:?}");
+            }
         }
         let other = crate::keys::KeyPair::generate().unwrap();
-        let data = encrypt(xml, &key.public, EncAlg::Aes256Gcm).unwrap();
-        assert!(decrypt(&data, &[other.private]).is_err());
+        let data = encrypt(xml, &key.public, EncAlg::Aes256Gcm, KeyPlacement::Inline).unwrap();
+        assert!(decrypt(&data[0], &[other.private]).is_err());
     }
 }

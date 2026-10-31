@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::util::value_to_string;
-use crate::xmlenc::EncAlg;
+use crate::xmlenc::{EncAlg, KeyPlacement};
 
 pub mod nameid {
     pub const UNSPECIFIED: &str = "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified";
@@ -138,6 +138,8 @@ pub enum IdStyle {
     Alnum,
     /// `A` followed by 40 hex digits (OneLogin assertions).
     AHex,
+    /// 40 upper-case letters and digits, starting with a letter (JumpCloud).
+    Upper40,
 }
 
 impl IdStyle {
@@ -153,6 +155,12 @@ impl IdStyle {
             IdStyle::KeycloakUuid => format!("ID_{}", uuid()),
             IdStyle::PfxUuid => format!("pfx{}", uuid()),
             IdStyle::AHex => crate::util::saml_id("A"),
+            IdStyle::Upper40 => {
+                const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+                let rest: String =
+                    (0..39).map(|_| ALPHABET[rand::random::<usize>() % ALPHABET.len()] as char).collect();
+                format!("{}{rest}", (b'A' + rand::random::<u8>() % 26) as char)
+            }
             IdStyle::Alnum => {
                 const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
                 let rest: String =
@@ -233,6 +241,8 @@ pub struct Preset {
     pub encrypt_when_possible: bool,
     /// Content encryption for assertions, unless the service provider sets its own.
     pub encryption: EncAlg,
+    /// Where the encrypted key goes in an EncryptedAssertion.
+    pub encrypted_key: KeyPlacement,
     pub authn_context: &'static str,
     /// Seconds from IssueInstant to `Conditions/@NotOnOrAfter`.
     pub assertion_lifetime: i64,
@@ -448,6 +458,7 @@ fn build() -> Vec<Preset> {
             sign_assertion: true,
             encrypt_when_possible: false,
             encryption: EncAlg::Aes256Gcm,
+            encrypted_key: KeyPlacement::Inline,
             authn_context: authn::PASSWORD_PROTECTED,
             assertion_lifetime: 300,
             not_before_skew: 0,
@@ -506,6 +517,7 @@ fn build() -> Vec<Preset> {
             sign_assertion: true,
             encrypt_when_possible: false,
             encryption: EncAlg::Aes256Gcm,
+            encrypted_key: KeyPlacement::Inline,
             authn_context: authn::PASSWORD,
             assertion_lifetime: 3600,
             not_before_skew: 300,
@@ -570,6 +582,7 @@ fn build() -> Vec<Preset> {
             sign_assertion: true,
             encrypt_when_possible: false,
             encryption: EncAlg::Aes256Gcm,
+            encrypted_key: KeyPlacement::Inline,
             authn_context: authn::PASSWORD_PROTECTED,
             assertion_lifetime: 3600,
             not_before_skew: 0,
@@ -615,6 +628,7 @@ fn build() -> Vec<Preset> {
             sign_assertion: true,
             encrypt_when_possible: false,
             encryption: EncAlg::Aes256Cbc,
+            encrypted_key: KeyPlacement::Sibling,
             authn_context: authn::PASSWORD_PROTECTED,
             assertion_lifetime: 300,
             not_before_skew: 300,
@@ -661,6 +675,7 @@ fn build() -> Vec<Preset> {
             sign_assertion: true,
             encrypt_when_possible: false,
             encryption: EncAlg::Aes256Gcm,
+            encrypted_key: KeyPlacement::Inline,
             authn_context: authn::UNSPECIFIED,
             assertion_lifetime: 300,
             not_before_skew: 300,
@@ -703,6 +718,7 @@ fn build() -> Vec<Preset> {
             sign_assertion: false,
             encrypt_when_possible: false,
             encryption: EncAlg::Aes256Gcm,
+            encrypted_key: KeyPlacement::Inline,
             authn_context: authn::PASSWORD_PROTECTED,
             assertion_lifetime: 180,
             not_before_skew: 180,
@@ -760,6 +776,7 @@ fn build() -> Vec<Preset> {
             sign_assertion: true,
             encrypt_when_possible: false,
             encryption: EncAlg::Aes256Gcm,
+            encrypted_key: KeyPlacement::Inline,
             authn_context: authn::UNSPECIFIED,
             assertion_lifetime: 3600,
             not_before_skew: 0,
@@ -815,6 +832,7 @@ fn build() -> Vec<Preset> {
             sign_assertion: false,
             encrypt_when_possible: false,
             encryption: EncAlg::Aes256Gcm,
+            encrypted_key: KeyPlacement::Inline,
             authn_context: authn::UNSPECIFIED,
             assertion_lifetime: 60,
             not_before_skew: 0,
@@ -854,6 +872,7 @@ fn build() -> Vec<Preset> {
             sign_assertion: false,
             encrypt_when_possible: false,
             encryption: EncAlg::Aes256Gcm,
+            encrypted_key: KeyPlacement::Inline,
             authn_context: authn::UNSPECIFIED,
             assertion_lifetime: 300,
             not_before_skew: 300,
@@ -890,13 +909,23 @@ fn build() -> Vec<Preset> {
             sign_assertion: false,
             encrypt_when_possible: false,
             encryption: EncAlg::Aes256Gcm,
+            encrypted_key: KeyPlacement::Inline,
             authn_context: authn::PASSWORD_PROTECTED,
             assertion_lifetime: 300,
-            not_before_skew: 0,
+            not_before_skew: 300,
             session_lifetime: None,
             confirmation_lifetime: None,
             session_index: SessionIndexStyle::Session,
-            style: Style { protocol_prefix: "saml2p", assertion_prefix: "saml2", ..STD },
+            // From a captured JumpCloud response (moritzheiber/crowbar tests/fixtures/jumpcloud).
+            style: Style {
+                protocol_prefix: "saml2p",
+                assertion_prefix: "saml2",
+                id_style: IdStyle::Upper40,
+                name_format: Some(attrname::UNSPECIFIED),
+                attributes_first: true,
+                issuer_format: true,
+                ..STD
+            },
             endpoints: vec![ep(EndpointKind::Sso, "SAML SSO (GET/POST)", "/saml2/{app}")],
             single_logout: true,
         },
@@ -949,6 +978,7 @@ fn build() -> Vec<Preset> {
             sign_assertion: false,
             encrypt_when_possible: true,
             encryption: EncAlg::Aes128Gcm,
+            encrypted_key: KeyPlacement::Inline,
             authn_context: authn::PASSWORD_PROTECTED,
             assertion_lifetime: 300,
             not_before_skew: 0,

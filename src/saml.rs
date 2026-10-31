@@ -515,8 +515,10 @@ pub fn build_response(key: &KeyPair, spec: &ResponseSpec) -> Result<Issued, Stri
             tamper_name_id(&mut assertion);
         }
         assertion_pretty = Some(assertion.to_pretty());
-        let data = xmlenc::encrypt(&assertion.to_xml(), recipient, *alg)?;
-        response = response.child(a("EncryptedAssertion").child(data));
+        let mut encrypted = a("EncryptedAssertion");
+        let parts = xmlenc::encrypt(&assertion.to_xml(), recipient, *alg, spec.preset.encrypted_key)?;
+        encrypted.children.extend(parts.into_iter().map(crate::xml::Node::Element));
+        response = response.child(encrypted);
         response.declare_namespaces();
     } else {
         response = response.child(assertion);
