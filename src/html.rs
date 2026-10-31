@@ -106,6 +106,21 @@ pub fn error_page(tenant: &Tenant, status: StatusCode, title: &str, detail: &str
     resp
 }
 
+/// An error page for a SAML message that can't be answered with a SAML message (no trustworthy
+/// service provider or ACS to send an error Response to). It's an HTTP 400: SAML Bindings 3.4.6
+/// and 3.5.6 discourage HTTP error codes, but there's no SAML exchange left to stay inside, and
+/// conformance tools and service providers alike treat a 4xx as the refusal. The title is also
+/// in the `x-localsaml-error` header, for scripts.
+pub fn saml_error_page(tenant: &Tenant, title: &str, detail: &str) -> Response {
+    let mut resp = error_page(tenant, StatusCode::BAD_REQUEST, title, detail);
+    if let Ok(v) =
+        axum::http::HeaderValue::from_str(&title.replace(|c: char| !c.is_ascii() || c.is_ascii_control(), "?"))
+    {
+        resp.headers_mut().insert("x-localsaml-error", v);
+    }
+    resp
+}
+
 pub fn message_page(tenant: &Tenant, title: &str, detail: &str) -> Response {
     let body = format!(
         r#"<section class="card narrow"><div class="eyebrow">localsaml</div><h1>{}</h1><p>{}</p></section>"#,

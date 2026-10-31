@@ -23,6 +23,7 @@ pub fn routes() -> Router<AppState> {
             }
             router = match endpoint.kind {
                 EndpointKind::Sso | EndpointKind::Slo => router.route(path, any(sso::endpoint)),
+                EndpointKind::Initiate if path.contains("{client}") => router.route(path, get(sso::initiate_named)),
                 EndpointKind::Initiate => router.route(path, get(sso::initiate)),
                 EndpointKind::Metadata => router.route(path, get(metadata::metadata)),
             };

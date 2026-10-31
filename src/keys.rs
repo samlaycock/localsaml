@@ -100,6 +100,100 @@ impl SigAlg {
     }
 }
 
+const DSA_SHA1: &str = "http://www.w3.org/2000/09/xmldsig#dsa-sha1";
+const DSA_SHA256: &str = "http://www.w3.org/2009/xmldsig11#dsa-sha256";
+
+/// Signature algorithms localsaml accepts from service providers. It only signs with RSA, but
+/// verifies DSA too (SAML Bindings 3.4.4.1 lists DSA-SHA1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyAlg {
+    Rsa(SigAlg),
+    DsaSha1,
+    DsaSha256,
+}
+
+impl VerifyAlg {
+    pub fn from_uri(uri: &str) -> Option<Self> {
+        SigAlg::from_uri(uri).map(VerifyAlg::Rsa).or(match uri {
+            DSA_SHA1 => Some(VerifyAlg::DsaSha1),
+            DSA_SHA256 => Some(VerifyAlg::DsaSha256),
+            _ => None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            VerifyAlg::Rsa(a) => a.name(),
+            VerifyAlg::DsaSha1 => "dsa-sha1",
+            VerifyAlg::DsaSha256 => "dsa-sha256",
+        }
+    }
+}
+
+/// A key that can check signatures.
+pub trait Verifies {
+    fn verifies(&self, alg: VerifyAlg, data: &[u8], signature: &[u8]) -> bool;
+}
+
+impl Verifies for RsaPublicKey {
+    fn verifies(&self, alg: VerifyAlg, data: &[u8], signature: &[u8]) -> bool {
+        matches!(alg, VerifyAlg::Rsa(a) if a.verify(self, data, signature))
+    }
+}
+
+/// A service provider's signing key: RSA, or DSA.
+#[derive(Debug, Clone)]
+pub enum PublicKey {
+    Rsa(RsaPublicKey),
+    Dsa(Box<dsa::VerifyingKey>),
+}
+
+impl From<RsaPublicKey> for PublicKey {
+    fn from(key: RsaPublicKey) -> Self {
+        PublicKey::Rsa(key)
+    }
+}
+
+impl Verifies for PublicKey {
+    fn verifies(&self, alg: VerifyAlg, data: &[u8], signature: &[u8]) -> bool {
+        use rsa::signature::DigestVerifier;
+        match self {
+            PublicKey::Rsa(k) => k.verifies(alg, data, signature),
+            PublicKey::Dsa(k) => {
+                // XML-DSig DSA signature values are r and s back to back (XMLDSig §6.4.1), but Java
+                // stacks put DER-encoded signatures in Redirect binding query strings: take either.
+                let raw = || {
+                    if signature.is_empty() || !signature.len().is_multiple_of(2) {
+                        return None;
+                    }
+                    let (r, s) = signature.split_at(signature.len() / 2);
+                    dsa::Signature::from_components(dsa::BigUint::from_bytes_be(r), dsa::BigUint::from_bytes_be(s)).ok()
+                };
+                let Some(sig) = dsa::Signature::try_from(signature).ok().or_else(raw) else {
+                    return false;
+                };
+                match alg {
+                    VerifyAlg::DsaSha1 => k.verify_digest(Sha1::new_with_prefix(data), &sig).is_ok(),
+                    VerifyAlg::DsaSha256 => k.verify_digest(Sha256::new_with_prefix(data), &sig).is_ok(),
+                    VerifyAlg::Rsa(_) => false,
+                }
+            }
+        }
+    }
+}
+
+/// The signing key in a DER certificate: RSA or DSA.
+pub fn cert_verifying_key(der: &[u8]) -> Result<PublicKey, String> {
+    let cert = Certificate::from_der(der).map_err(|e| format!("invalid certificate: {e}"))?;
+    let spki = cert.tbs_certificate.subject_public_key_info.to_der().map_err(|e| e.to_string())?;
+    if let Ok(k) = RsaPublicKey::from_public_key_der(&spki) {
+        return Ok(PublicKey::Rsa(k));
+    }
+    dsa::VerifyingKey::from_public_key_der(&spki)
+        .map(|k| PublicKey::Dsa(Box::new(k)))
+        .map_err(|_| "the certificate's key is neither RSA nor DSA".to_string())
+}
+
 /// Hash `data` with the algorithm named by a `DigestMethod` URI.
 pub fn digest_with(uri: &str, data: &[u8]) -> Option<Vec<u8>> {
     Some(match uri {

@@ -176,6 +176,9 @@ pub struct Participant {
     pub name_id_format: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sp_name_qualifier: Option<String>,
+    /// The SessionIndex this service provider was given (templates differ in what they use).
+    #[serde(default)]
+    pub session_index: String,
 }
 
 /// An authentication request waiting for the login form.

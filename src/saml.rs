@@ -404,6 +404,8 @@ pub struct ResponseSpec<'a> {
     pub audience: String,
     pub in_response_to: Option<String>,
     pub session_index: String,
+    /// The assertion's ID, when the caller needs it up front (as a SessionIndex); else generated.
+    pub assertion_id: Option<String>,
     pub auth_time: i64,
     pub now: i64,
     pub sign_response: bool,
@@ -499,7 +501,7 @@ pub fn build_response(key: &KeyPair, spec: &ResponseSpec) -> Result<Issued, Stri
         });
     }
 
-    let assertion_id = style.id_style.generate();
+    let assertion_id = spec.assertion_id.clone().unwrap_or_else(|| new_assertion_id(style));
     let mut assertion = build_assertion(spec, &assertion_id, &issuer(), now, lifetime, in_response_to.as_deref());
     let mut assertion_pretty = None;
     if let Some((recipient, alg)) = &spec.encrypt {
@@ -547,6 +549,11 @@ pub fn build_response(key: &KeyPair, spec: &ResponseSpec) -> Result<Issued, Stri
     })
 }
 
+/// A new assertion ID in a template's style.
+pub fn new_assertion_id(style: &Style) -> String {
+    style.assertion_id_style.unwrap_or(style.id_style).generate()
+}
+
 /// Change the NameID's text wherever it is (after signing, for `bad_signature`).
 fn tamper_name_id(el: &mut Element) {
     if el.is(NS_ASSERTION, "NameID") {
@@ -585,7 +592,12 @@ fn build_assertion(
         a("SubjectConfirmation").attr("Method", CM_BEARER).child(
             a("SubjectConfirmationData")
                 .attr_opt("InResponseTo", in_response_to)
-                .attr("NotOnOrAfter", iso8601(now + lifetime))
+                .attr(
+                    "NotOnOrAfter",
+                    // An explicit lifetime applies to both; otherwise some templates confirm for
+                    // less (or longer) than the assertion is valid.
+                    iso8601(now + spec.lifetime.or(spec.preset.confirmation_lifetime).unwrap_or(lifetime)),
+                )
                 .attr("Recipient", recipient),
         ),
     );
@@ -628,18 +640,26 @@ fn attribute_statement(preset: &Preset, identity: &Identity) -> Option<Element> 
             continue;
         }
         let known = preset.attribute(name);
-        let mut attr = a("Attribute")
-            .attr("Name", name)
-            .attr_opt("NameFormat", known.and_then(|k| k.name_format).or(style.name_format))
-            .attr_opt("FriendlyName", known.and_then(|k| k.friendly_name));
-        for value in values {
+        let attribute = || {
+            a("Attribute")
+                .attr("Name", name)
+                .attr_opt("NameFormat", known.and_then(|k| k.name_format).or(style.name_format))
+                .attr_opt("FriendlyName", known.and_then(|k| k.friendly_name))
+        };
+        let value = |value: String| {
             let mut v = a("AttributeValue");
-            if let Some(t) = style.xsi_type {
+            if let Some(t) = known.and_then(|k| k.xsi_type).or(style.xsi_type) {
                 v = v.declare("xs", NS_XS).declare("xsi", NS_XSI).ns_attr(NS_XSI, "xsi", "type", t);
             }
-            attr = attr.child(if value.is_empty() { v } else { v.text(value) });
+            if value.is_empty() { v } else { v.text(value) }
+        };
+        if known.is_some_and(|k| k.split_values) {
+            for v in values {
+                statement = statement.child(attribute().child(value(v)));
+            }
+        } else {
+            statement = statement.child(values.into_iter().fold(attribute(), |attr, v| attr.child(value(v))));
         }
-        statement = statement.child(attr);
     }
     (!statement.children.is_empty()).then_some(statement)
 }
@@ -728,6 +748,7 @@ mod tests {
             audience: "http://sp.test".into(),
             in_response_to: Some("_req1".into()),
             session_index: "_s1".into(),
+            assertion_id: None,
             auth_time: 1_793_451_600,
             now: 1_793_451_600,
             sign_response: preset.sign_response,

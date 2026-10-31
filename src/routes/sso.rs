@@ -12,9 +12,9 @@ use sha2::{Digest, Sha256};
 
 use crate::dsig::{self, QuerySignature};
 use crate::faults::{self, Endpoint};
-use crate::html::{data_script, error_page, esc, page, saml_post, xml_block};
+use crate::html::{data_script, error_page, esc, page, saml_error_page, saml_post, xml_block};
 use crate::inspector::SamlNote;
-use crate::presets::{self, Identity, Preset, nameid};
+use crate::presets::{self, Identity, Preset, SessionIndexStyle, nameid};
 use crate::saml::{self, AuthnRequest, Message, ResponseSpec, Status, Tamper};
 use crate::sp::ServiceProvider;
 use crate::state::{AppState, LastResponse, Participant, Pending, Session};
@@ -169,9 +169,8 @@ pub async fn endpoint(
 ) -> Response {
     let query = query.unwrap_or_default();
     if let Some(param) = dsig::duplicate_param(&query) {
-        return error_page(
+        return saml_error_page(
             &tenant,
-            StatusCode::BAD_REQUEST,
             "Duplicate parameter",
             &format!("{param} appears more than once in the query string."),
         );
@@ -188,9 +187,8 @@ pub async fn endpoint(
         if let Some(sp) = sp_param(&params) {
             return start_idp_initiated(&state, &tenant, &headers, &sp, &params).await;
         }
-        return error_page(
+        return saml_error_page(
             &tenant,
-            StatusCode::BAD_REQUEST,
             "No SAML message",
             &format!(
                 "This is the SAML endpoint of {}. Send an AuthnRequest or a logout message here with the HTTP-Redirect or HTTP-POST binding, or start an IdP-initiated login at {}?sp=<entity ID>.",
@@ -199,7 +197,7 @@ pub async fn endpoint(
             ),
         );
     };
-    let bad = |title: &str, detail: &str| error_page(&tenant, StatusCode::BAD_REQUEST, title, detail);
+    let bad = |title: &str, detail: &str| saml_error_page(&tenant, title, detail);
     let xml = match saml::decode_message(&value, redirect) {
         Ok(x) => x,
         Err(e) => return bad("Undecodable SAML message", &e),
@@ -259,7 +257,7 @@ async fn authn_request(
     root: &Element,
     arrival: Arrival,
 ) -> Response {
-    let bad = |title: &str, detail: &str| error_page(tenant, StatusCode::BAD_REQUEST, title, detail);
+    let bad = |title: &str, detail: &str| saml_error_page(tenant, title, detail);
     let Some(issuer) = req.issuer.clone() else {
         return bad("AuthnRequest has no Issuer", "The request must name the service provider in <saml:Issuer>.");
     };
@@ -401,7 +399,7 @@ async fn proceed(
             non_empty(params, "dev_status_message").unwrap_or_else(|| "injected by localsaml (dev_status)".into());
         return match Status::parse(&name, Some(message)) {
             Ok(status) => respond_status(state, tenant, preset, sp, &pending, status),
-            Err(e) => error_page(tenant, StatusCode::BAD_REQUEST, "Invalid dev_status", &e),
+            Err(e) => saml_error_page(tenant, "Invalid dev_status", &e),
         };
     }
     if let Some(list) = non_empty(params, "dev_tamper") {
@@ -409,12 +407,7 @@ async fn proceed(
             match Tamper::parse(name) {
                 Some(t) => pending.tampers.push(t),
                 None => {
-                    return error_page(
-                        tenant,
-                        StatusCode::BAD_REQUEST,
-                        "Invalid dev_tamper",
-                        &format!("unknown tamper '{name}'"),
-                    );
+                    return saml_error_page(tenant, "Invalid dev_tamper", &format!("unknown tamper '{name}'"));
                 }
             }
         }
@@ -435,19 +428,14 @@ async fn proceed(
     if dev_user.is_some() || dev_attributes.is_some() || non_empty(params, "dev_name_id").is_some() {
         let overrides = match dev_attributes.as_deref().map(parse_json_object).transpose() {
             Ok(m) => m.unwrap_or_default(),
-            Err(e) => return error_page(tenant, StatusCode::BAD_REQUEST, "Invalid dev_attributes", &e),
+            Err(e) => return saml_error_page(tenant, "Invalid dev_attributes", &e),
         };
         let explicit = non_empty(params, "dev_preset").and_then(|p| presets::get(&p));
         let (preset, mut identity) = match &dev_user {
             Some(id) => match state.config.user(id) {
                 Some(user) => user.resolve(explicit, preset),
                 None => {
-                    return error_page(
-                        tenant,
-                        StatusCode::BAD_REQUEST,
-                        "Unknown dev_user",
-                        &format!("No [[users]] entry with id '{id}'."),
-                    );
+                    return saml_error_page(tenant, "Unknown dev_user", &format!("No [[users]] entry with id '{id}'."));
                 }
             },
             None => {
@@ -460,7 +448,7 @@ async fn proceed(
             }
         };
         if let Err(e) = validate_attributes(&overrides) {
-            return error_page(tenant, StatusCode::BAD_REQUEST, "Invalid dev_attributes", &e);
+            return saml_error_page(tenant, "Invalid dev_attributes", &e);
         }
         // The NameID policy applies to the final attributes (an emailAddress NameID follows the
         // overridden email); an explicit dev_name_id wins over both.
@@ -630,7 +618,7 @@ pub fn respond_status(
     let identity = preset.default_identity();
     let d = match delivery(state, preset, sp) {
         Ok(d) => d,
-        Err(e) => return error_page(tenant, StatusCode::BAD_REQUEST, "Can't send the Response", &e),
+        Err(e) => return saml_error_page(tenant, "Can't send the Response", &e),
     };
     let spec = ResponseSpec {
         preset,
@@ -640,6 +628,7 @@ pub fn respond_status(
         audience: pending.audience.clone(),
         in_response_to: pending.request_id.clone(),
         session_index: String::new(),
+        assertion_id: None,
         auth_time: state.now(),
         now: state.now(),
         sign_response: d.sign_response,
@@ -710,11 +699,19 @@ pub fn complete(
     session.identity = identity.clone();
     finish_name_id_for(&mut identity, preset, &pending.sp, &session.session_index);
     session.participants.retain(|p| p.entity_id != pending.sp);
+    // Templates differ in what they use as the SessionIndex; logout sends each SP back its own.
+    let assertion_id = saml::new_assertion_id(&preset.style);
+    let session_index = match preset.session_index {
+        SessionIndexStyle::Session => session.session_index.clone(),
+        SessionIndexStyle::AssertionId => assertion_id.clone(),
+        SessionIndexStyle::RequestId => pending.request_id.clone().unwrap_or_else(|| session.session_index.clone()),
+    };
     session.participants.push(Participant {
         entity_id: pending.sp.clone(),
         name_id: identity.name_id.clone(),
         name_id_format: identity.name_id_format.clone(),
         sp_name_qualifier: pending.sp_name_qualifier.clone(),
+        session_index: session_index.clone(),
     });
     state.store.put(Table::Sessions, &sid, &session, Some(now + state.config.session_ttl));
 
@@ -725,7 +722,7 @@ pub fn complete(
         None => {
             let d = match delivery(state, preset, sp) {
                 Ok(d) => d,
-                Err(e) => return error_page(tenant, StatusCode::BAD_REQUEST, "Can't send the Response", &e),
+                Err(e) => return saml_error_page(tenant, "Can't send the Response", &e),
             };
             let authn_context =
                 pending.requested_authn_contexts.first().cloned().unwrap_or_else(|| preset.authn_context.to_string());
@@ -736,7 +733,8 @@ pub fn complete(
                 destination: pending.acs_url.clone(),
                 audience: pending.audience.clone(),
                 in_response_to: pending.request_id.clone(),
-                session_index: session.session_index.clone(),
+                session_index,
+                assertion_id: Some(assertion_id),
                 auth_time: session.auth_time,
                 now,
                 sign_response: d.sign_response,
@@ -829,6 +827,28 @@ pub async fn initiate(
     }
 }
 
+/// IdP-initiated SSO with the service provider named in the path (Keycloak's
+/// `/clients/{client}`): the SP declared with that `idp_initiated_name`.
+pub async fn initiate_named(
+    State(state): State<AppState>,
+    tenant: Tenant,
+    headers: HeaderMap,
+    axum::extract::Path(path): axum::extract::Path<HashMap<String, String>>,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let name = path.get("client").cloned().unwrap_or_default();
+    let params = parse_form(query.unwrap_or_default().as_bytes());
+    let sp = state.service_providers().into_iter().find(|sp| sp.idp_initiated_name.as_deref() == Some(name.as_str()));
+    match sp {
+        Some(sp) => start_idp_initiated(&state, &tenant, &headers, &sp.entity_id, &params).await,
+        None => saml_error_page(
+            &tenant,
+            "Unknown client",
+            &format!("No service provider is declared with idp_initiated_name = \"{name}\"."),
+        ),
+    }
+}
+
 async fn start_idp_initiated(
     state: &AppState,
     tenant: &Tenant,
@@ -836,7 +856,7 @@ async fn start_idp_initiated(
     entity_id: &str,
     params: &HashMap<String, String>,
 ) -> Response {
-    let bad = |title: &str, detail: &str| error_page(tenant, StatusCode::BAD_REQUEST, title, detail);
+    let bad = |title: &str, detail: &str| saml_error_page(tenant, title, detail);
     let sp = match find_sp(state, tenant, entity_id).await {
         Some(sp) => sp,
         None => match non_empty(params, "acs") {
@@ -1098,24 +1118,22 @@ pub async fn login(State(state): State<AppState>, tenant: Tenant, headers: Heade
     let form = parse_form(&body);
     let req_id = form.get("req").cloned().unwrap_or_default();
     let Some(pending) = state.store.take::<Pending>(Table::Pending, &req_id) else {
-        return error_page(
+        return saml_error_page(
             &tenant,
-            StatusCode::BAD_REQUEST,
             "Login request expired",
             "This sign-in request is no longer valid. Start the login again from your application.",
         );
     };
     if pending.tenant != tenant.key() {
-        return error_page(
+        return saml_error_page(
             &tenant,
-            StatusCode::BAD_REQUEST,
             "Wrong identity provider",
             "This sign-in request was started at another of localsaml's identity providers. Start the login again.",
         );
     }
     let sp = match resolve_sp(&state, &tenant, &pending.sp).await {
         Ok(sp) => sp,
-        Err(e) => return error_page(&tenant, StatusCode::BAD_REQUEST, "Unknown service provider", &e),
+        Err(e) => return saml_error_page(&tenant, "Unknown service provider", &e),
     };
     let fallback = preset_for(&state, &tenant, &sp);
     if form.get("action").map(String::as_str) == Some("deny") {
@@ -1124,7 +1142,7 @@ pub async fn login(State(state): State<AppState>, tenant: Tenant, headers: Heade
     }
     let (preset, identity) = match editor_submission(&form, fallback) {
         Ok(v) => v,
-        Err(e) => return error_page(&tenant, StatusCode::BAD_REQUEST, "Invalid identity", &e),
+        Err(e) => return saml_error_page(&tenant, "Invalid identity", &e),
     };
     let review = form.get("review").is_some_and(|v| v == "1");
     complete(&state, &tenant, &headers, &pending, preset, &sp, identity, None, review)

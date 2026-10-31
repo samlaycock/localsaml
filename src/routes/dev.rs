@@ -196,6 +196,7 @@ pub async fn mint(state: &AppState, tenant: &Tenant, req: MintRequest) -> Result
         audience: req.audience.clone().unwrap_or_else(|| sp.audience()),
         in_response_to: req.in_response_to.clone().filter(|v| !v.is_empty()),
         session_index,
+        assertion_id: None,
         auth_time: now,
         now,
         sign_response: d.sign_response,

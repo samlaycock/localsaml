@@ -432,6 +432,7 @@ async fn declared_service_providers_are_enforced() {
     let xml = authn_request("_a2", "http://declared.test/sp", None, "", "");
     let r = get(&app, &redirect("/sso", "SAMLRequest", &xml, None, None)).await;
     assert_eq!((r.status, r.title().as_str()), (StatusCode::BAD_REQUEST, "Unsigned AuthnRequest · localsaml"));
+    assert_eq!(r.headers["x-localsaml-error"], "Unsigned AuthnRequest");
 
     // Signed by the wrong key (the IdP's, not the SP's certificate).
     let xml = authn_request("_a3", "http://cert.test/sp", None, "", "");
@@ -1156,4 +1157,116 @@ async fn auto_login_answers_passive_requests() {
     let (app, _) = app_with(Config { auto_login: true, ..Default::default() });
     let xml = authn_request("_pa", SP, Some(ACS), r#" IsPassive="true""#, "");
     assert!(posted(&get(&app, &redirect("/sso", "SAMLRequest", &xml, None, None)).await).status().is_success());
+}
+
+// ---------------------------------------------------------------------------
+// Template details
+// ---------------------------------------------------------------------------
+
+fn session_index(p: &Posted) -> String {
+    p.assertion().find(A, "AuthnStatement").unwrap().get_attr("SessionIndex").unwrap().to_string()
+}
+
+#[tokio::test]
+async fn templates_shape_sessions_attributes_and_ids() {
+    let (app, _) = app_with(with_sps(vec![ServiceProvider {
+        idp_initiated_name: Some("my-app".into()),
+        ..sp("http://kc.test/sp", "http://kc.test/acs")
+    }]));
+    let quick = |prefix: &str, id: &str| {
+        format!(
+            "{}&dev_attributes=%7B%7D",
+            redirect(&format!("{prefix}/sso"), "SAMLRequest", &simple_request(id), None, None)
+        )
+    };
+
+    // Keycloak: one Attribute per role, the confirmation outlives the 60 s Conditions, and the
+    // SessionIndex is the assertion's ID.
+    let p = posted(&get(&app, &quick("/p/keycloak", "_kc1")).await);
+    let roles: Vec<&Element> = p
+        .assertion()
+        .find(A, "AttributeStatement")
+        .unwrap()
+        .find_all(A, "Attribute")
+        .filter(|a| a.get_attr("Name") == Some("Role"))
+        .collect();
+    assert!(roles.len() > 1 && roles.iter().all(|r| r.find_all(A, "AttributeValue").count() == 1));
+    let time = |el: &Element, attr: &str| parse_iso8601(el.get_attr(attr).unwrap()).unwrap();
+    let conditions = p.assertion().find(A, "Conditions").unwrap();
+    let confirmation =
+        p.assertion().path(&[(A, "Subject"), (A, "SubjectConfirmation"), (A, "SubjectConfirmationData")]).unwrap();
+    assert_eq!(time(confirmation, "NotOnOrAfter") - time(conditions, "NotOnOrAfter"), 240);
+    assert_eq!(session_index(&p), p.assertion().get_attr("ID").unwrap());
+
+    // Okta: the SessionIndex is the AuthnRequest's ID.
+    assert_eq!(session_index(&posted(&get(&app, &quick("/p/okta", "_okta1")).await)), "_okta1");
+    // OneLogin: assertion IDs differ from the Response's.
+    let p = posted(&get(&app, &quick("/p/onelogin", "_ol1")).await);
+    assert!(p.id().starts_with("pfx") && p.assertion().get_attr("ID").unwrap().starts_with('A'));
+    // Auth0: boolean claims are typed as such.
+    let p = posted(&get(&app, &quick("/p/auth0", "_a01")).await);
+    let verified = p
+        .assertion()
+        .find(A, "AttributeStatement")
+        .unwrap()
+        .find_all(A, "Attribute")
+        .find(|a| a.get_attr("Name") == Some("http://schemas.auth0.com/email_verified"))
+        .unwrap()
+        .find(A, "AttributeValue")
+        .unwrap();
+    assert_eq!(verified.get_ns_attr(saml::NS_XSI, "type"), Some("xs:boolean"));
+
+    // Keycloak's IdP-initiated URL names the client in the path.
+    let r = get(&app, "/p/keycloak/realms/example/protocol/saml/clients/my-app?dev_attributes=%7B%7D").await;
+    let p = posted(&r);
+    assert_eq!((p.action.as_str(), p.doc.get_attr("InResponseTo")), ("http://kc.test/acs", None));
+    let r = get(&app, "/p/keycloak/realms/example/protocol/saml/clients/nope").await;
+    assert_eq!(r.headers["x-localsaml-error"], "Unknown client");
+}
+
+#[tokio::test]
+async fn dsa_signed_requests_are_verified() {
+    use localsaml::dsig::urlencode;
+    use rsa::signature::DigestSigner;
+    use sha1::Digest;
+    use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+    use x509_cert::der::{Encode, EncodePem};
+    use x509_cert::spki::SubjectPublicKeyInfoOwned;
+
+    // A DSA key, in a certificate (issued by an RSA key: only the subject key matters here).
+    #[allow(deprecated)]
+    let components = dsa::Components::generate(&mut rand::thread_rng(), dsa::KeySize::DSA_1024_160);
+    let dsa_key = dsa::SigningKey::generate(&mut rand::thread_rng(), components);
+    let spki = SubjectPublicKeyInfoOwned::from_key(dsa_key.verifying_key().clone()).unwrap();
+    let issuer = rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(sp_key().private.clone());
+    let validity = x509_cert::time::Validity::from_now(std::time::Duration::from_secs(3600)).unwrap();
+    let name: x509_cert::name::Name = "CN=dsa-sp".parse().unwrap();
+    let serial = x509_cert::serial_number::SerialNumber::from(7u32);
+    let cert = CertificateBuilder::new(Profile::Root, serial, validity, name, spki, &issuer)
+        .unwrap()
+        .build::<rsa::pkcs1v15::Signature>()
+        .unwrap();
+    assert!(cert.to_der().is_ok());
+    let declared = ServiceProvider {
+        certificate: Some(cert.to_pem(x509_cert::der::pem::LineEnding::LF).unwrap()),
+        want_authn_requests_signed: true,
+        ..sp("http://dsa.test/sp", "http://dsa.test/acs")
+    };
+    let (app, _) = app_with(with_sps(vec![declared]));
+
+    let sign = |xml: &str| {
+        let alg = "http://www.w3.org/2000/09/xmldsig#dsa-sha1";
+        let signed = format!("SAMLRequest={}&SigAlg={}", urlencode(&saml::deflate_b64(xml)), urlencode(alg));
+        let sig: dsa::Signature = dsa_key.sign_digest(sha1::Sha1::new_with_prefix(signed.as_bytes()));
+        let pad = |b: Vec<u8>| [vec![0; 20 - b.len()], b].concat();
+        let raw = [pad(sig.r().to_bytes_be()), pad(sig.s().to_bytes_be())].concat();
+        format!("/sso?{signed}&Signature={}", urlencode(&b64_std(&raw)))
+    };
+    let r = get(&app, &sign(&authn_request("_dsa1", "http://dsa.test/sp", Some("http://dsa.test/acs"), "", ""))).await;
+    assert!(r.field("req").is_some(), "{}", r.title());
+    assert!(r.body.contains("Redirect binding signature (dsa-sha1), verified"));
+    // Changing the request after signing breaks it.
+    let tampered = sign(&authn_request("_dsa2", "http://dsa.test/sp", Some("http://dsa.test/acs"), "", ""))
+        .replace("SAMLRequest=", "SAMLRequest=x");
+    assert_ne!(get(&app, &tampered).await.headers.get("x-localsaml-error"), None);
 }

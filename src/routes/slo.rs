@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 
 use crate::faults::{self, Endpoint};
-use crate::html::{error_page, esc, page, saml_post};
+use crate::html::{esc, page, saml_error_page, saml_post};
 use crate::inspector::SamlNote;
 use crate::presets::{Preset, Style};
 use crate::routes::sso::{
@@ -69,9 +69,8 @@ fn respond(
     status: Status,
 ) -> Response {
     let Some(location) = sp.slo_response_url.clone().or(sp.slo_url.clone()) else {
-        let mut resp = error_page(
+        let mut resp = saml_error_page(
             tenant,
-            StatusCode::BAD_REQUEST,
             "Nowhere to send the LogoutResponse",
             &format!(
                 "{} sent a LogoutRequest but has no SingleLogoutService. The session was ended; declare slo_url (or metadata) for the service provider to get a LogoutResponse.",
@@ -96,7 +95,7 @@ pub async fn logout_request(
     root: &Element,
     arrival: Arrival,
 ) -> Response {
-    let bad = |title: &str, detail: &str| error_page(tenant, StatusCode::BAD_REQUEST, title, detail);
+    let bad = |title: &str, detail: &str| saml_error_page(tenant, title, detail);
     let p = preset(state, tenant);
     if !p.single_logout {
         return bad("Single logout isn't supported", &format!("{} doesn't do SAML single logout.", p.name));
@@ -125,7 +124,11 @@ pub async fn logout_request(
             .store
             .entries::<Session>(Table::Sessions)
             .into_iter()
-            .find(|(_, s, _)| s.tenant == tenant.key() && req.session_indexes.contains(&s.session_index))
+            .find(|(_, s, _)| {
+                s.tenant == tenant.key()
+                    && (req.session_indexes.contains(&s.session_index)
+                        || s.participants.iter().any(|p| req.session_indexes.contains(&p.session_index)))
+            })
             .map(|(sid, s, _)| (sid, s))
     });
     let Some((sid, session)) = session else {
@@ -175,7 +178,11 @@ async fn advance(state: &AppState, tenant: &Tenant, mut logout: Logout) -> Respo
             name_id: &participant.name_id,
             name_id_format: &participant.name_id_format,
             sp_name_qualifier: participant.sp_name_qualifier.as_deref(),
-            session_index: &logout.session_index,
+            session_index: if participant.session_index.is_empty() {
+                &logout.session_index
+            } else {
+                &participant.session_index
+            },
             now: state.now(),
         });
         logout.waiting_on = Some((sp.entity_id.clone(), id.clone()));
@@ -245,9 +252,8 @@ pub async fn logout_response(
                 .find(|l| l.waiting_on.as_ref().map(|(_, id)| Some(id)) == Some(resp.in_response_to.as_ref()))
         });
     let Some(mut logout) = logout else {
-        return error_page(
+        return saml_error_page(
             tenant,
-            StatusCode::BAD_REQUEST,
             "Unexpected LogoutResponse",
             &format!(
                 "No logout in progress matches this LogoutResponse (InResponseTo {}). Status: {}.",

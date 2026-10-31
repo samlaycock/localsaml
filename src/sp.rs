@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 
-use crate::keys::{SigAlg, cert_public_key, parse_cert};
+use crate::keys::{PublicKey, SigAlg, cert_public_key, cert_verifying_key, parse_cert};
 use crate::saml::{BINDING_POST, BINDING_REDIRECT, NS_MD};
 use crate::xml::{Element, parse};
 use crate::xmlenc::EncAlg;
@@ -64,6 +64,10 @@ pub struct ServiceProvider {
     /// RelayState for IdP-initiated logins.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_relay_state: Option<String>,
+    /// The name in IdP-initiated URLs that name the SP in the path, like Keycloak's
+    /// `/realms/{realm}/protocol/saml/clients/{name}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idp_initiated_name: Option<String>,
     /// Template to sign in with when this SP starts a login on the root issuer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
@@ -190,8 +194,9 @@ impl ServiceProvider {
         self.acs_urls.is_empty() || self.acs_urls.iter().any(|a| a == url)
     }
 
-    pub fn signing_key(&self) -> Option<Result<RsaPublicKey, String>> {
-        self.certificate.as_ref().map(|c| parse_cert(c).and_then(|der| cert_public_key(&der)))
+    /// The key that checks this SP's signed messages (RSA or DSA).
+    pub fn signing_key(&self) -> Option<Result<PublicKey, String>> {
+        self.certificate.as_ref().map(|c| parse_cert(c).and_then(|der| cert_verifying_key(&der)))
     }
 
     pub fn encryption_key(&self) -> Option<Result<RsaPublicKey, String>> {

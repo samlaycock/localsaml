@@ -10,11 +10,8 @@ silent_sso = true
 entity_id = "https://samlhost:8993/services/saml"
 metadata_file = "samlconf-sp-metadata.xml"
 
-# The kit's second SP signs with DSA, which localsaml can't verify. Declared without its
-# certificate, its requests are accepted unverified, so the multi-SP logout tests can run. This
-# also means "Bindings 3.4.4.1: Redirect AuthnRequest Using DSA1 Signature Algorithm" passes
-# without the signature being checked; see README.md.
+# The kit's second SP signs with DSA (DSA-SHA1 and DSA-SHA256), which localsaml verifies like any
+# other signature, so it's declared from the same metadata, certificate included.
 [[service_providers]]
 entity_id = "https://samlhostdsa:8994/services/samldsa"
-acs_urls = ["https://samlhostdsa:8994/services/samldsa/sso/post"]
-slo_url = "https://samlhostdsa:8994/services/samldsa/logout/redirect"
+metadata_file = "samlconf-sp-metadata.xml"

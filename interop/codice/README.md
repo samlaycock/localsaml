@@ -38,6 +38,6 @@ All of SSO over both bindings, with and without RelayState and ACS URLs, passes,
   - It wants RelayState over 80 bytes rejected; that limit is a rule for the sender. localsaml accepts it and warns on the login page.
 - **localsaml behaves this way by design (2 tests).** An AuthnRequest naming an unknown `Subject` gets an assertion about that subject, which Profiles 4.1.4.1 allows. The kit only accepts an error, but every subject can sign in to localsaml.
 
-### Caveat: DSA signatures
+### DSA signatures
 
-The kit's second service provider signs with DSA (DSA-SHA1 and DSA-SHA256). localsaml only verifies RSA signatures. With the second SP's certificate declared, its signed requests are refused, so "Bindings 3.4.4.1: Redirect AuthnRequest Using DSA1 Signature Algorithm" and the six multi-SP logout tests fail. To keep the logout tests, which matter far more, `localsaml.toml` declares that SP without its certificate. Its requests are then accepted unverified, so the DSA1 test passes without the signature being checked.
+The kit's second service provider signs with DSA (DSA-SHA1 and DSA-SHA256), and puts DER-encoded signatures in Redirect binding query strings, as Java's `java.security.Signature` produces them (XML-DSig itself uses raw `r||s`). localsaml verifies both encodings, so that SP is declared from its metadata with its certificate, and "Bindings 3.4.4.1: Redirect AuthnRequest Using DSA1 Signature Algorithm" and the multi-SP logout tests verify its signatures for real.

@@ -1,9 +1,7 @@
 //! XML Signature (enveloped, Exclusive C14N) for SAML messages and assertions, and the query-string
 //! signatures of the HTTP-Redirect binding.
 
-use rsa::RsaPublicKey;
-
-use crate::keys::{KeyPair, SigAlg, digest_with};
+use crate::keys::{KeyPair, SigAlg, Verifies, VerifyAlg, digest_with};
 use crate::util::{b64_std, b64_std_decode_lenient};
 use crate::xml::{Element, Node};
 
@@ -89,7 +87,7 @@ pub fn sign(root: &mut Element, id: &str, key: &KeyPair, opts: &SignOpts) -> Res
 /// What a verified signature looked like.
 #[derive(Debug, Clone)]
 pub struct Verified {
-    pub alg: SigAlg,
+    pub alg: VerifyAlg,
     /// The certificate in `KeyInfo`, if any (base64 DER).
     pub key_info_cert: Option<String>,
 }
@@ -102,7 +100,7 @@ pub fn signature_of(el: &Element) -> Option<&Element> {
 /// Verify the enveloped signature directly inside the element with `ID` `id` against any of
 /// `keys`. The reference must point at that element, so a signature over some other part of the
 /// document (signature wrapping) doesn't count.
-pub fn verify(root: &Element, id: &str, keys: &[RsaPublicKey]) -> Result<Verified, String> {
+pub fn verify<K: Verifies>(root: &Element, id: &str, keys: &[K]) -> Result<Verified, String> {
     // With two elements sharing the ID, the one verified might not be the one the caller reads
     // (XML signature wrapping).
     if root.count_id(id) > 1 {
@@ -119,7 +117,7 @@ pub fn verify(root: &Element, id: &str, keys: &[RsaPublicKey]) -> Result<Verifie
         return Err(format!("unsupported CanonicalizationMethod {}", c14n.unwrap_or("(none)")));
     }
     let alg_uri = signed_info.find(NS_DS, "SignatureMethod").and_then(|e| e.get_attr("Algorithm")).unwrap_or("");
-    let alg = SigAlg::from_uri(alg_uri).ok_or_else(|| format!("unsupported SignatureMethod {alg_uri}"))?;
+    let alg = VerifyAlg::from_uri(alg_uri).ok_or_else(|| format!("unsupported SignatureMethod {alg_uri}"))?;
     let references: Vec<&Element> = signed_info.find_all(NS_DS, "Reference").collect();
     let [reference] = references.as_slice() else {
         return Err(format!("expected one Reference, found {}", references.len()));
@@ -157,7 +155,7 @@ pub fn verify(root: &Element, id: &str, keys: &[RsaPublicKey]) -> Result<Verifie
         .ok_or("missing or invalid SignatureValue")?;
     let si_inclusive = signed_info.find(NS_DS, "CanonicalizationMethod").map(inclusive_prefixes).unwrap_or_default();
     let canonical = signed_info.exc_c14n(&sig_scope, &si_inclusive);
-    if !keys.iter().any(|k| alg.verify(k, canonical.as_bytes(), &value)) {
+    if !keys.iter().any(|k| k.verifies(alg, canonical.as_bytes(), &value)) {
         return Err(if keys.is_empty() {
             "no certificate to verify against".into()
         } else {
@@ -208,7 +206,7 @@ pub fn duplicate_param(raw: &str) -> Option<&'static str> {
 /// A redirect-binding signature found in a query string.
 #[derive(Debug, Clone)]
 pub struct QuerySignature {
-    pub alg: Option<SigAlg>,
+    pub alg: Option<VerifyAlg>,
     pub alg_uri: String,
     /// The exact bytes that were signed, rebuilt from the raw (still encoded) query.
     pub signed: String,
@@ -233,16 +231,16 @@ impl QuerySignature {
             |v: &str| url::form_urlencoded::parse(format!("x={v}").as_bytes()).next().map(|(_, v)| v.into_owned());
         let alg_uri = decode(alg_raw)?;
         Some(Self {
-            alg: SigAlg::from_uri(&alg_uri),
+            alg: VerifyAlg::from_uri(&alg_uri),
             alg_uri,
             signed,
             signature: b64_std_decode_lenient(&decode(signature)?)?,
         })
     }
 
-    pub fn verify(&self, keys: &[RsaPublicKey]) -> Result<SigAlg, String> {
+    pub fn verify<K: Verifies>(&self, keys: &[K]) -> Result<VerifyAlg, String> {
         let alg = self.alg.ok_or_else(|| format!("unsupported SigAlg {}", self.alg_uri))?;
-        if keys.iter().any(|k| alg.verify(k, self.signed.as_bytes(), &self.signature)) {
+        if keys.iter().any(|k| k.verifies(alg, self.signed.as_bytes(), &self.signature)) {
             Ok(alg)
         } else {
             Err("the query signature doesn't verify against the service provider's certificate".into())
@@ -292,6 +290,36 @@ mod tests {
         // An unrelated key doesn't verify.
         let other = crate::keys::KeyPair::generate().unwrap();
         assert!(verify(&parsed, "_a", &[other.public]).is_err());
+    }
+
+    #[test]
+    // DSA-1024 is what DSA-signing SPs use (and it's quick to generate); it's only verified here.
+    #[allow(deprecated)]
+    fn dsa_query_signatures() {
+        use crate::keys::PublicKey;
+        use dsa::pkcs8::{DecodePublicKey, EncodePublicKey};
+        use rsa::signature::DigestSigner;
+        use sha1::Digest;
+        let components = dsa::Components::generate(&mut rand::thread_rng(), dsa::KeySize::DSA_1024_160);
+        let signing = dsa::SigningKey::generate(&mut rand::thread_rng(), components);
+        // Through SPKI DER, as a certificate would carry it.
+        let der = signing.verifying_key().to_public_key_der().unwrap();
+        let key = PublicKey::Dsa(Box::new(dsa::VerifyingKey::from_public_key_der(der.as_bytes()).unwrap()));
+        let alg = "http://www.w3.org/2000/09/xmldsig#dsa-sha1";
+        let signed = format!("SAMLRequest=abc&SigAlg={}", urlencode(alg));
+        let sig: dsa::Signature = signing.sign_digest(sha1::Sha1::new_with_prefix(signed.as_bytes()));
+        // r and s as fixed-width 20-byte integers, back to back.
+        let pad = |b: Vec<u8>| [vec![0; 20 - b.len()], b].concat();
+        let raw = [pad(sig.r().to_bytes_be()), pad(sig.s().to_bytes_be())].concat();
+        let query = format!("{signed}&Signature={}", urlencode(&b64_std(&raw)));
+        let qs = QuerySignature::from_query(&query).unwrap();
+        assert_eq!(qs.verify(std::slice::from_ref(&key)).unwrap().name(), "dsa-sha1");
+        // Java stacks send DER-encoded DSA signatures in query strings; those verify too.
+        let der = rsa::signature::SignatureEncoding::to_vec(&sig);
+        let java = QuerySignature::from_query(&format!("{signed}&Signature={}", urlencode(&b64_std(&der)))).unwrap();
+        assert!(java.verify(std::slice::from_ref(&key)).is_ok());
+        let tampered = QuerySignature::from_query(&query.replace("abc", "abd")).unwrap();
+        assert!(tampered.verify(&[key]).is_err());
     }
 
     #[test]

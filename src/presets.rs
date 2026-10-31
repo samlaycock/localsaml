@@ -48,6 +48,13 @@ pub struct Attribute {
     /// Overrides the template's `NameFormat` for this attribute.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name_format: Option<&'static str>,
+    /// Overrides the template's `xsi:type` for this attribute's values (e.g. `xs:boolean`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xsi_type: Option<&'static str>,
+    /// One `<Attribute>` per value instead of one with several values (Keycloak's role list
+    /// mapper with "Single Role Attribute" off, its default).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub split_values: bool,
     /// `string` (one value) or `list` (any number of values).
     pub kind: &'static str,
     pub default: Value,
@@ -83,6 +90,14 @@ impl Attribute {
         self.name_format = Some(format);
         self
     }
+    fn split(mut self) -> Self {
+        self.split_values = true;
+        self
+    }
+    fn xsi(mut self, xsi_type: &'static str) -> Self {
+        self.xsi_type = Some(xsi_type);
+        self
+    }
 }
 
 fn s(name: &'static str, label: &'static str, default: &str) -> Attribute {
@@ -91,6 +106,8 @@ fn s(name: &'static str, label: &'static str, default: &str) -> Attribute {
         label,
         friendly_name: None,
         name_format: None,
+        xsi_type: None,
+        split_values: false,
         kind: "string",
         default: json!(default),
         help: "",
@@ -119,6 +136,8 @@ pub enum IdStyle {
     PfxUuid,
     /// Random URL-safe characters starting with a letter (PingFederate).
     Alnum,
+    /// `A` followed by 40 hex digits (OneLogin assertions).
+    AHex,
 }
 
 impl IdStyle {
@@ -133,6 +152,7 @@ impl IdStyle {
             }
             IdStyle::KeycloakUuid => format!("ID_{}", uuid()),
             IdStyle::PfxUuid => format!("pfx{}", uuid()),
+            IdStyle::AHex => crate::util::saml_id("A"),
             IdStyle::Alnum => {
                 const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
                 let rest: String =
@@ -141,6 +161,18 @@ impl IdStyle {
             }
         }
     }
+}
+
+/// What a template uses as an AuthnStatement's `SessionIndex`.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionIndexStyle {
+    /// One random value for the whole browser session.
+    Session,
+    /// The assertion's ID (Entra ID, AD FS, Google, Keycloak).
+    AssertionId,
+    /// The AuthnRequest's ID, or the session's for IdP-initiated logins (Okta).
+    RequestId,
 }
 
 /// The XML a provider writes. Matching it catches code that depends on one provider's
@@ -162,6 +194,8 @@ pub struct Style {
     pub attributes_first: bool,
     /// Write `Format="...:entity"` on Issuer elements.
     pub issuer_format: bool,
+    /// How assertion IDs look, when not like the Response's.
+    pub assertion_id_style: Option<IdStyle>,
 }
 
 const STD: Style = Style {
@@ -173,6 +207,7 @@ const STD: Style = Style {
     xsi_type: Some("xs:string"),
     attributes_first: false,
     issuer_format: false,
+    assertion_id_style: None,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -205,6 +240,10 @@ pub struct Preset {
     pub not_before_skew: i64,
     /// `SessionNotOnOrAfter` on the AuthnStatement, in seconds from the login.
     pub session_lifetime: Option<i64>,
+    /// Seconds from IssueInstant to `SubjectConfirmationData/@NotOnOrAfter`, when it differs from
+    /// the assertion lifetime (AD FS, Keycloak).
+    pub confirmation_lifetime: Option<i64>,
+    pub session_index: SessionIndexStyle,
     pub style: Style,
     /// Provider-shaped endpoint aliases served under `/p/<id>`. The first SSO and SLO aliases
     /// are the ones the template's metadata advertises.
@@ -413,6 +452,8 @@ fn build() -> Vec<Preset> {
             assertion_lifetime: 300,
             not_before_skew: 0,
             session_lifetime: Some(8 * 3600),
+            confirmation_lifetime: None,
+            session_index: SessionIndexStyle::Session,
             style: STD,
             endpoints: vec![],
             single_logout: true,
@@ -469,6 +510,8 @@ fn build() -> Vec<Preset> {
             assertion_lifetime: 3600,
             not_before_skew: 300,
             session_lifetime: None,
+            confirmation_lifetime: None,
+            session_index: SessionIndexStyle::AssertionId,
             style: Style {
                 protocol_prefix: "samlp",
                 assertion_prefix: "",
@@ -478,6 +521,7 @@ fn build() -> Vec<Preset> {
                 xsi_type: None,
                 attributes_first: true,
                 issuer_format: false,
+                assertion_id_style: None,
             },
             endpoints: vec![
                 ep(EndpointKind::Sso, "SAML SSO and logout (GET/POST)", "/{tenant}/saml2"),
@@ -530,6 +574,8 @@ fn build() -> Vec<Preset> {
             assertion_lifetime: 3600,
             not_before_skew: 0,
             session_lifetime: None,
+            confirmation_lifetime: Some(300),
+            session_index: SessionIndexStyle::AssertionId,
             style: Style {
                 protocol_prefix: "samlp",
                 assertion_prefix: "",
@@ -539,6 +585,7 @@ fn build() -> Vec<Preset> {
                 xsi_type: None,
                 attributes_first: true,
                 issuer_format: false,
+                assertion_id_style: None,
             },
             endpoints: vec![
                 ep(EndpointKind::Sso, "SAML SSO and logout (GET/POST)", "/adfs/ls/"),
@@ -572,6 +619,8 @@ fn build() -> Vec<Preset> {
             assertion_lifetime: 300,
             not_before_skew: 300,
             session_lifetime: None,
+            confirmation_lifetime: None,
+            session_index: SessionIndexStyle::RequestId,
             style: Style {
                 protocol_prefix: "saml2p",
                 assertion_prefix: "saml2",
@@ -581,6 +630,7 @@ fn build() -> Vec<Preset> {
                 xsi_type: Some("xs:string"),
                 attributes_first: false,
                 issuer_format: true,
+                assertion_id_style: None,
             },
             endpoints: vec![
                 ep(EndpointKind::Sso, "SAML SSO (GET/POST)", "/app/{app}/{app_id}/sso/saml"),
@@ -615,6 +665,8 @@ fn build() -> Vec<Preset> {
             assertion_lifetime: 300,
             not_before_skew: 300,
             session_lifetime: None,
+            confirmation_lifetime: None,
+            session_index: SessionIndexStyle::AssertionId,
             style: Style {
                 protocol_prefix: "saml2p",
                 assertion_prefix: "saml2",
@@ -624,6 +676,7 @@ fn build() -> Vec<Preset> {
                 xsi_type: Some("xs:anyType"),
                 attributes_first: true,
                 issuer_format: false,
+                assertion_id_style: None,
             },
             endpoints: vec![ep(EndpointKind::Sso, "SAML SSO (GET/POST)", "/o/saml2/idp")],
             single_logout: false,
@@ -654,7 +707,9 @@ fn build() -> Vec<Preset> {
             assertion_lifetime: 180,
             not_before_skew: 180,
             session_lifetime: Some(24 * 3600),
-            style: Style { id_style: IdStyle::PfxUuid, ..STD },
+            confirmation_lifetime: None,
+            session_index: SessionIndexStyle::Session,
+            style: Style { id_style: IdStyle::PfxUuid, assertion_id_style: Some(IdStyle::AHex), ..STD },
             endpoints: vec![
                 ep(EndpointKind::Sso, "SAML SSO, Redirect binding", "/trust/saml2/http-redirect/sso/{connector_id}"),
                 ep(EndpointKind::Sso, "SAML SSO, POST binding", "/trust/saml2/http-post/sso/{connector_id}"),
@@ -684,7 +739,7 @@ fn build() -> Vec<Preset> {
                 s("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name", "Name", NAME),
                 s("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname", "Given name", "Jane"),
                 s("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname", "Surname", "Developer"),
-                s("http://schemas.auth0.com/email_verified", "Email verified", "true"),
+                s("http://schemas.auth0.com/email_verified", "Email verified", "true").xsi("xs:boolean"),
                 s("http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn", "UPN", EMAIL).advanced(),
                 s("http://schemas.auth0.com/nickname", "Nickname", "jane").advanced(),
                 s("http://schemas.auth0.com/picture", "Picture", "https://www.gravatar.com/avatar/?d=identicon")
@@ -696,7 +751,9 @@ fn build() -> Vec<Preset> {
                     "Username-Password-Authentication",
                 )
                 .advanced(),
-                s("http://schemas.auth0.com/identities/default/isSocial", "Social login", "false").advanced(),
+                s("http://schemas.auth0.com/identities/default/isSocial", "Social login", "false")
+                    .xsi("xs:boolean")
+                    .advanced(),
                 s("http://schemas.auth0.com/clientID", "Client ID", "localsaml").advanced(),
             ],
             sign_response: false,
@@ -707,6 +764,8 @@ fn build() -> Vec<Preset> {
             assertion_lifetime: 3600,
             not_before_skew: 0,
             session_lifetime: None,
+            confirmation_lifetime: None,
+            session_index: SessionIndexStyle::Session,
             style: Style { name_format: Some(attrname::URI), dsig_prefix: "", ..STD },
             endpoints: vec![
                 ep(EndpointKind::Sso, "SAML SSO (GET/POST)", "/samlp/{client_id}"),
@@ -738,7 +797,8 @@ fn build() -> Vec<Preset> {
                         "view-profile",
                     ],
                 )
-                .help("The role list mapper (default client scope role_list)"),
+                .help("The role list mapper (default client scope role_list): one Attribute per role")
+                .split(),
                 // The X.500 mappers are built in but not in a default client scope; they're the usual
                 // first addition.
                 s("urn:oid:1.2.840.113549.1.9.1", "Email (X500 email mapper)", EMAIL)
@@ -759,10 +819,17 @@ fn build() -> Vec<Preset> {
             assertion_lifetime: 60,
             not_before_skew: 0,
             session_lifetime: Some(10 * 3600),
+            confirmation_lifetime: Some(300),
+            session_index: SessionIndexStyle::AssertionId,
             style: Style { dsig_prefix: "dsig", id_style: IdStyle::KeycloakUuid, ..STD },
             endpoints: vec![
                 ep(EndpointKind::Sso, "SAML SSO and logout (GET/POST)", "/realms/{realm}/protocol/saml"),
                 ep(EndpointKind::Metadata, "Metadata (descriptor)", "/realms/{realm}/protocol/saml/descriptor"),
+                ep(
+                    EndpointKind::Initiate,
+                    "IdP-initiated SSO (the client's IdP-initiated SSO URL name)",
+                    "/realms/{realm}/protocol/saml/clients/{client}",
+                ),
             ],
             single_logout: true,
         },
@@ -791,6 +858,8 @@ fn build() -> Vec<Preset> {
             assertion_lifetime: 300,
             not_before_skew: 300,
             session_lifetime: None,
+            confirmation_lifetime: None,
+            session_index: SessionIndexStyle::Session,
             style: Style { id_style: IdStyle::Alnum, ..STD },
             endpoints: vec![
                 ep(EndpointKind::Sso, "SAML SSO (GET/POST)", "/idp/SSO.saml2"),
@@ -825,6 +894,8 @@ fn build() -> Vec<Preset> {
             assertion_lifetime: 300,
             not_before_skew: 0,
             session_lifetime: None,
+            confirmation_lifetime: None,
+            session_index: SessionIndexStyle::Session,
             style: Style { protocol_prefix: "saml2p", assertion_prefix: "saml2", ..STD },
             endpoints: vec![ep(EndpointKind::Sso, "SAML SSO (GET/POST)", "/saml2/{app}")],
             single_logout: true,
@@ -882,6 +953,8 @@ fn build() -> Vec<Preset> {
             assertion_lifetime: 300,
             not_before_skew: 0,
             session_lifetime: None,
+            confirmation_lifetime: None,
+            session_index: SessionIndexStyle::Session,
             style: Style {
                 protocol_prefix: "saml2p",
                 assertion_prefix: "saml2",

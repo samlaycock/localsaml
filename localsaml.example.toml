@@ -36,6 +36,7 @@ slo_url = "http://localhost:3000/saml/slo"
 # audience = "..."                   # default: the entity ID
 # default_relay_state = "/dashboard" # for IdP-initiated logins
 # preset = "okta"                    # template to use when this SP signs in on the root issuer
+# idp_initiated_name = "my-app"      # for IdP-initiated URLs that name the SP, like Keycloak's /clients/my-app
 
 # Or read everything from the SP's metadata (explicit settings above still win):
 # [[service_providers]]
