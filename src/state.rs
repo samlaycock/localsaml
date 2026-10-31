@@ -26,6 +26,8 @@ pub struct AppState {
     pub last_responses: Arc<Mutex<HashMap<String, LastResponse>>>,
     /// Service providers declared in the config file, with their metadata applied once fetched.
     declared: Arc<RwLock<Vec<ServiceProvider>>>,
+    /// When pending metadata was last fetched, so unreachable SPs don't slow every request.
+    last_refresh: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +61,7 @@ impl AppState {
             faults: Arc::default(),
             last_responses: Arc::default(),
             declared: Arc::new(RwLock::new(declared)),
+            last_refresh: Arc::default(),
         })
     }
 
@@ -66,6 +69,13 @@ impl AppState {
     /// startup and whenever a request comes from an unknown service provider (the SP may not have
     /// been running when localsaml started).
     pub async fn refresh_metadata(&self) {
+        {
+            let mut last = self.last_refresh.lock().unwrap();
+            if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(5)) {
+                return;
+            }
+            *last = Some(std::time::Instant::now());
+        }
         let pending: Vec<(usize, ServiceProvider)> = self
             .declared
             .read()
@@ -189,6 +199,11 @@ pub struct Pending {
     pub sp_name_qualifier: Option<String>,
     pub requested_authn_contexts: Vec<String>,
     pub login_hint: Option<String>,
+    /// The AuthnRequest's `Subject/NameID` (and its format): the assertion must be about it.
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub subject_format: Option<String>,
     /// `redirect`, `post` or `idp-initiated`.
     pub binding: String,
     /// How the request was signed, for the login page.

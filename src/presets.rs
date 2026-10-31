@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::util::value_to_string;
+use crate::xmlenc::EncAlg;
 
 pub mod nameid {
     pub const UNSPECIFIED: &str = "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified";
@@ -127,7 +128,7 @@ impl IdStyle {
             IdStyle::Hex => crate::util::saml_id("_"),
             IdStyle::UnderscoreUuid => format!("_{}", uuid()),
             IdStyle::OktaDigits => {
-                let digits: String = (0..23).map(|_| char::from(b'0' + rand::random::<u8>() % 10)).collect();
+                let digits: String = (0..25).map(|_| char::from(b'0' + rand::random::<u8>() % 10)).collect();
                 format!("id{digits}")
             }
             IdStyle::KeycloakUuid => format!("ID_{}", uuid()),
@@ -195,6 +196,8 @@ pub struct Preset {
     pub sign_assertion: bool,
     /// Encrypt assertions when the service provider has an encryption certificate.
     pub encrypt_when_possible: bool,
+    /// Content encryption for assertions, unless the service provider sets its own.
+    pub encryption: EncAlg,
     pub authn_context: &'static str,
     /// Seconds from IssueInstant to `Conditions/@NotOnOrAfter`.
     pub assertion_lifetime: i64,
@@ -235,7 +238,8 @@ fn ep(kind: EndpointKind, label: &'static str, path: &'static str) -> Endpoint {
 pub fn fill_path(path: &str) -> String {
     path.replace("{tenant}", ENTRA_TENANT)
         .replace("{app}", "localsaml")
-        .replace("{app_id}", "0oa1fcia6d6EMsf331d8")
+        .replace("{app_id}", "exk1fcia6d6EMsf331d8")
+        .replace("{connector_id}", "6b7cf0a1-2d3e-4f50-9a1b-2c3d4e5f6a7b")
         .replace("{realm}", "example")
         .replace("{client_id}", "localsaml")
 }
@@ -404,6 +408,7 @@ fn build() -> Vec<Preset> {
             sign_response: true,
             sign_assertion: true,
             encrypt_when_possible: false,
+            encryption: EncAlg::Aes256Gcm,
             authn_context: authn::PASSWORD_PROTECTED,
             assertion_lifetime: 300,
             not_before_skew: 0,
@@ -459,6 +464,7 @@ fn build() -> Vec<Preset> {
             sign_response: false,
             sign_assertion: true,
             encrypt_when_possible: false,
+            encryption: EncAlg::Aes256Gcm,
             authn_context: authn::PASSWORD,
             assertion_lifetime: 3600,
             not_before_skew: 300,
@@ -519,10 +525,11 @@ fn build() -> Vec<Preset> {
             sign_response: false,
             sign_assertion: true,
             encrypt_when_possible: false,
+            encryption: EncAlg::Aes256Gcm,
             authn_context: authn::PASSWORD_PROTECTED,
             assertion_lifetime: 3600,
             not_before_skew: 0,
-            session_lifetime: Some(8 * 3600),
+            session_lifetime: None,
             style: Style {
                 protocol_prefix: "samlp",
                 assertion_prefix: "",
@@ -560,6 +567,7 @@ fn build() -> Vec<Preset> {
             sign_response: true,
             sign_assertion: true,
             encrypt_when_possible: false,
+            encryption: EncAlg::Aes256Cbc,
             authn_context: authn::PASSWORD_PROTECTED,
             assertion_lifetime: 300,
             not_before_skew: 300,
@@ -595,12 +603,14 @@ fn build() -> Vec<Preset> {
                 s("email", "Primary email", EMAIL),
                 s("firstName", "First name", "Jane"),
                 s("lastName", "Last name", "Developer"),
-                l("groups", "Groups", &["developers@example.com"]).help("Group membership mapped to an app attribute"),
+                l("groups", "Groups", &["developers"])
+                    .help("Group membership mapped to an app attribute (group names)"),
                 s("department", "Department", "Engineering").advanced(),
             ],
             sign_response: false,
             sign_assertion: true,
             encrypt_when_possible: false,
+            encryption: EncAlg::Aes256Gcm,
             authn_context: authn::UNSPECIFIED,
             assertion_lifetime: 300,
             not_before_skew: 300,
@@ -612,7 +622,7 @@ fn build() -> Vec<Preset> {
                 id_style: IdStyle::Hex,
                 name_format: None,
                 xsi_type: Some("xs:anyType"),
-                attributes_first: false,
+                attributes_first: true,
                 issuer_format: false,
             },
             endpoints: vec![ep(EndpointKind::Sso, "SAML SSO (GET/POST)", "/o/saml2/idp")],
@@ -636,19 +646,20 @@ fn build() -> Vec<Preset> {
                 s("User.Username", "Username", "jane").advanced(),
                 s("PersonImmutableID", "Immutable ID", "jane").advanced().unique(),
             ],
-            sign_response: false,
-            sign_assertion: true,
+            sign_response: true,
+            sign_assertion: false,
             encrypt_when_possible: false,
+            encryption: EncAlg::Aes256Gcm,
             authn_context: authn::PASSWORD_PROTECTED,
             assertion_lifetime: 180,
             not_before_skew: 180,
             session_lifetime: Some(24 * 3600),
             style: Style { id_style: IdStyle::PfxUuid, ..STD },
             endpoints: vec![
-                ep(EndpointKind::Sso, "SAML SSO, Redirect binding", "/trust/saml2/http-redirect/sso/{app_id}"),
-                ep(EndpointKind::Sso, "SAML SSO, POST binding", "/trust/saml2/http-post/sso/{app_id}"),
-                ep(EndpointKind::Slo, "Single logout", "/trust/saml2/http-redirect/slo/{app_id}"),
-                ep(EndpointKind::Metadata, "Metadata", "/saml/metadata/{app_id}"),
+                ep(EndpointKind::Sso, "SAML SSO, Redirect binding", "/trust/saml2/http-redirect/sso/{connector_id}"),
+                ep(EndpointKind::Sso, "SAML SSO, POST binding", "/trust/saml2/http-post/sso/{connector_id}"),
+                ep(EndpointKind::Slo, "Single logout", "/trust/saml2/http-redirect/slo/{connector_id}"),
+                ep(EndpointKind::Metadata, "Metadata", "/saml/metadata/{connector_id}"),
             ],
             single_logout: true,
         },
@@ -686,15 +697,17 @@ fn build() -> Vec<Preset> {
                 )
                 .advanced(),
                 s("http://schemas.auth0.com/identities/default/isSocial", "Social login", "false").advanced(),
+                s("http://schemas.auth0.com/clientID", "Client ID", "localsaml").advanced(),
             ],
             sign_response: false,
             sign_assertion: true,
             encrypt_when_possible: false,
+            encryption: EncAlg::Aes256Gcm,
             authn_context: authn::UNSPECIFIED,
             assertion_lifetime: 3600,
             not_before_skew: 0,
             session_lifetime: None,
-            style: Style { name_format: Some(attrname::URI), ..STD },
+            style: Style { name_format: Some(attrname::URI), dsig_prefix: "", ..STD },
             endpoints: vec![
                 ep(EndpointKind::Sso, "SAML SSO (GET/POST)", "/samlp/{client_id}"),
                 ep(EndpointKind::Slo, "Single logout", "/samlp/{client_id}/logout"),
@@ -713,9 +726,21 @@ fn build() -> Vec<Preset> {
             name_id_example: "jane",
             email_attribute: Some("urn:oid:1.2.840.113549.1.9.1"),
             attributes: vec![
-                l("Role", "Roles", &["default-roles-example", "offline_access", "uma_authorization"])
-                    .friendly("Role")
-                    .help("The role list mapper"),
+                l(
+                    "Role",
+                    "Roles",
+                    &[
+                        "default-roles-example",
+                        "offline_access",
+                        "uma_authorization",
+                        "manage-account",
+                        "manage-account-links",
+                        "view-profile",
+                    ],
+                )
+                .help("The role list mapper (default client scope role_list)"),
+                // The X.500 mappers are built in but not in a default client scope; they're the usual
+                // first addition.
                 s("urn:oid:1.2.840.113549.1.9.1", "Email (X500 email mapper)", EMAIL)
                     .friendly("email")
                     .format(attrname::URI),
@@ -729,6 +754,7 @@ fn build() -> Vec<Preset> {
             sign_response: true,
             sign_assertion: false,
             encrypt_when_possible: false,
+            encryption: EncAlg::Aes256Gcm,
             authn_context: authn::UNSPECIFIED,
             assertion_lifetime: 60,
             not_before_skew: 0,
@@ -757,9 +783,10 @@ fn build() -> Vec<Preset> {
                 l("memberOf", "Groups (memberOf)", &["CN=Developers,OU=Groups,DC=example,DC=com"]),
                 s("uid", "User ID", "jane").advanced(),
             ],
-            sign_response: false,
-            sign_assertion: true,
+            sign_response: true,
+            sign_assertion: false,
             encrypt_when_possible: false,
+            encryption: EncAlg::Aes256Gcm,
             authn_context: authn::UNSPECIFIED,
             assertion_lifetime: 300,
             not_before_skew: 300,
@@ -790,9 +817,10 @@ fn build() -> Vec<Preset> {
                 l("memberOf", "Groups (memberOf)", &["Developers"]),
                 s("username", "Username", "jane").advanced(),
             ],
-            sign_response: false,
-            sign_assertion: true,
+            sign_response: true,
+            sign_assertion: false,
             encrypt_when_possible: false,
+            encryption: EncAlg::Aes256Gcm,
             authn_context: authn::PASSWORD_PROTECTED,
             assertion_lifetime: 300,
             not_before_skew: 0,
@@ -849,6 +877,7 @@ fn build() -> Vec<Preset> {
             sign_response: true,
             sign_assertion: false,
             encrypt_when_possible: true,
+            encryption: EncAlg::Aes128Gcm,
             authn_context: authn::PASSWORD_PROTECTED,
             assertion_lifetime: 300,
             not_before_skew: 0,

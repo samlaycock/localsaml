@@ -29,7 +29,7 @@ jobs:
       - run: cargo test
 
   interop:
-    name: Interop (node-saml, samlify)
+    name: Interop (node-saml, samlify, pysaml2, crewjam/saml, Shibboleth SP)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -43,8 +43,24 @@ jobs:
       - run: cargo build
       - run: npm ci
         working-directory: interop
-      - run: npm test
+      # pysaml2, crewjam/saml and Shibboleth SP run in Docker; --require-stacks fails rather than
+      # skipping them if Docker isn't there.
+      - run: npm test -- --no-build --require-stacks
         working-directory: interop
+
+  conformance:
+    name: SAML Conformance Test Kit (codice)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.99
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build
+      # Fails on any failure not listed in interop/codice/expected-failures.tsv.
+      - run: ./run.sh
+        working-directory: interop/codice
+        env:
+          BINARY: ${{ github.workspace }}/target/debug/localsaml
 
   docker:
     name: Docker build (no push)

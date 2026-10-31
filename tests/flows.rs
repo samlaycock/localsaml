@@ -303,14 +303,14 @@ async fn metadata_for_root_and_templates() {
     assert_eq!(okta.get_attr("entityID"), Some("http://www.okta.com/exk1fcia6d6EMsf331d8"));
     assert_eq!(
         location(&okta, "SingleSignOnService")[0],
-        format!("{BASE}/p/okta/app/localsaml/0oa1fcia6d6EMsf331d8/sso/saml")
+        format!("{BASE}/p/okta/app/localsaml/exk1fcia6d6EMsf331d8/sso/saml")
     );
     assert_eq!(
         location(&okta, "SingleLogoutService")[0],
-        format!("{BASE}/p/okta/app/localsaml/0oa1fcia6d6EMsf331d8/slo/saml")
+        format!("{BASE}/p/okta/app/localsaml/exk1fcia6d6EMsf331d8/slo/saml")
     );
     // The alias paths serve metadata too.
-    let alias = get(&app, "/p/okta/app/0oa1fcia6d6EMsf331d8/sso/saml/metadata").await;
+    let alias = get(&app, "/p/okta/app/exk1fcia6d6EMsf331d8/sso/saml/metadata").await;
     assert_eq!(md(&alias.body).get_attr("entityID"), okta.get_attr("entityID"));
 
     let keycloak = md(&get(&app, "/p/keycloak/metadata").await.body);
@@ -645,7 +645,7 @@ async fn idp_initiated_logins() {
     // Okta-style links: the SSO URL with the SP named in the query.
     let r = get(
         &app,
-        "/p/okta/app/localsaml/0oa1fcia6d6EMsf331d8/sso/saml?sp=http%3A%2F%2Fknown.test%2Fsp&dev_attributes=%7B%7D",
+        "/p/okta/app/localsaml/exk1fcia6d6EMsf331d8/sso/saml?sp=http%3A%2F%2Fknown.test%2Fsp&dev_attributes=%7B%7D",
     )
     .await;
     let p = posted(&r);
@@ -1032,7 +1032,7 @@ async fn template_aliases_accept_authn_requests() {
     let (app, _) = app();
     let mut jar = Jar::default();
     for path in [
-        "/p/okta/app/localsaml/0oa1fcia6d6EMsf331d8/sso/saml",
+        "/p/okta/app/localsaml/exk1fcia6d6EMsf331d8/sso/saml",
         "/p/entra/9188040d-6c67-4c5b-b112-36a304b66dad/saml2",
         "/p/shibboleth/idp/profile/SAML2/Redirect/SSO",
         "/p/adfs/adfs/ls/",
@@ -1044,4 +1044,116 @@ async fn template_aliases_accept_authn_requests() {
         let p = posted(&approve(&app, prefix, &page, prefix.trim_start_matches("/p/"), json!({}), &mut jar).await);
         assert_eq!(p.doc.get_attr("InResponseTo"), Some("_t1"), "{path}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Hardening and spec conformance
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn hostile_messages_are_refused_not_fatal() {
+    let (app, _) = app();
+    // Deeply nested XML is refused (it used to overflow the stack), and the server keeps going.
+    let deep = format!("{}{}", "<a>".repeat(50_000), "</a>".repeat(50_000));
+    let r = get(&app, &redirect("/sso", "SAMLRequest", &deep, None, None)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.body.contains("nested"), "{}", r.body);
+    assert_eq!(get(&app, "/health").await.status, StatusCode::OK);
+
+    // A second SAMLRequest could be processed instead of the one whose signature was checked.
+    let signed = redirect("/sso", "SAMLRequest", &simple_request("_dup1"), None, Some(sp_key()));
+    let extra = redirect("", "SAMLRequest", &simple_request("_evil"), None, None);
+    let r = get(&app, &format!("{signed}&{}", &extra[1..])).await;
+    assert_eq!((r.status, r.title()), (StatusCode::BAD_REQUEST, "Duplicate parameter · localsaml".to_string()));
+
+    // Script URLs are never posted or redirected to.
+    let xml = authn_request("_js", SP, Some("javascript:alert(1)//"), "", "");
+    let r = get(&app, &redirect("/sso", "SAMLRequest", &xml, None, None)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(!r.body.contains(r#"action="javascript"#));
+    let r = get(&app, &format!("/sso/initiate?sp={}&acs={}", enc(SP), enc("javascript:alert(1)"))).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    let r = post_json(&app, "/dev/api/response", json!({ "acs_url": "javascript:alert(1)" })).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+
+    // Page data can't close its <script> element, whatever the request says.
+    let subject = r#"<saml:Subject><saml:NameID>&lt;/script&gt;&lt;!--&lt;script&gt;</saml:NameID></saml:Subject>"#;
+    let xml = authn_request("_lh", SP, Some(ACS), "", subject);
+    let r = get(&app, &redirect("/sso", "SAMLRequest", &xml, None, None)).await;
+    let start = r.body.find(r#"id="lo-data">"#).unwrap() + 13;
+    let data = &r.body[start..start + r.body[start..].find("</script>").unwrap()];
+    assert!(!data.contains('<'), "{data}");
+    assert_eq!(serde_json::from_str::<Value>(data).unwrap()["loginHint"], "</script><!--<script>");
+}
+
+#[tokio::test]
+async fn the_test_sp_rejects_signature_wrapping() {
+    let (app, _) = app();
+    // Only the assertion is signed. Copy it into Extensions, then change the real one's NameID:
+    // the signature still verifies, but over the copy, not the assertion the SP reads.
+    let minted = post_json(&app, "/dev/api/response", json!({ "sign_response": false, "sign_assertion": true })).await;
+    let minted = minted.json();
+    let xml = minted["xml"].as_str().unwrap();
+    let assertion = parse(xml).unwrap().find(A, "Assertion").unwrap().to_xml();
+    assert!(xml.contains(&assertion));
+    let name_id = minted["name_id"].as_str().unwrap();
+    let wrapped = xml
+        .replacen(&assertion, &assertion.replace(&format!(">{name_id}<"), ">admin@evil.test<"), 1)
+        .replacen("<samlp:Status>", &format!("<samlp:Extensions>{assertion}</samlp:Extensions><samlp:Status>"), 1);
+    let r = post_form(&app, "/sp/acs", &[("SAMLResponse", &b64_std(&wrapped))], &mut Jar::default()).await;
+    assert_eq!(r.title(), "Test SP: rejected · localsaml");
+    assert!(r.body.contains("more than one element has ID"), "{}", r.body);
+    // The untouched response is accepted.
+    let r =
+        post_form(&app, "/sp/acs", &[("SAMLResponse", minted["saml_response"].as_str().unwrap())], &mut Jar::default())
+            .await;
+    assert_eq!(r.title(), "Test SP: signed in · localsaml");
+}
+
+#[tokio::test]
+async fn requests_are_held_to_the_spec() {
+    let (app, _) = app();
+    let quick = |xml: &str| format!("{}&dev_attributes=%7B%7D", redirect("/sso", "SAMLRequest", xml, None, None));
+
+    // A Destination that isn't where the request was sent: discarded with a Requester error.
+    let xml = authn_request("_dst1", SP, Some(ACS), r#" Destination="http://elsewhere.test/sso""#, "");
+    let p = posted(&get(&app, &quick(&xml)).await);
+    assert_eq!((p.status().code.as_str(), p.action.as_str()), (saml::status::REQUESTER, ACS));
+    let xml = authn_request("_dst2", SP, Some(ACS), &format!(r#" Destination="{BASE}/sso/""#), "");
+    assert!(posted(&get(&app, &quick(&xml)).await).status().is_success());
+
+    // A Subject in the request is who the assertion is about, whatever the form said.
+    let mut jar = Jar::default();
+    let subject = format!(
+        r#"<saml:Subject><saml:NameID Format="{}">bob@example.com</saml:NameID></saml:Subject>"#,
+        nameid::EMAIL
+    );
+    let xml = authn_request("_sub", SP, Some(ACS), "", &subject);
+    let page = get_jar(&app, &redirect("/sso", "SAMLRequest", &xml, None, None), &mut jar).await;
+    let identity = json!({ "name_id": "someone-else", "name_id_format": nameid::UNSPECIFIED, "attributes": {} });
+    let r = approve(&app, "", &page, "generic", identity, &mut jar).await;
+    assert_eq!(posted(&r).name_id(), ("bob@example.com".to_string(), nameid::EMAIL.to_string()));
+    // The HTTP-POST binding form's method is literally POST (Bindings 3.5.4).
+    assert!(r.body.contains(r#"<form method="POST""#));
+
+    // A login form posted to another issuer than the one that started it is refused.
+    let page =
+        get_jar(&app, &redirect("/p/okta/sso", "SAMLRequest", &simple_request("_t1"), None, None), &mut jar).await;
+    let r = approve(&app, "", &page, "okta", json!({}), &mut jar).await;
+    assert_eq!((r.status, r.title()), (StatusCode::BAD_REQUEST, "Wrong identity provider · localsaml".to_string()));
+
+    // The mint API's NameID follows the given attributes when the defaults are dropped.
+    let minted = post_json(
+        &app,
+        "/dev/api/response",
+        json!({ "defaults": false, "attributes": { "email": "bob@example.com" } }),
+    );
+    assert_eq!(minted.await.json()["name_id"], "bob@example.com");
+}
+
+#[tokio::test]
+async fn auto_login_answers_passive_requests() {
+    let (app, _) = app_with(Config { auto_login: true, ..Default::default() });
+    let xml = authn_request("_pa", SP, Some(ACS), r#" IsPassive="true""#, "");
+    assert!(posted(&get(&app, &redirect("/sso", "SAMLRequest", &xml, None, None)).await).status().is_success());
 }

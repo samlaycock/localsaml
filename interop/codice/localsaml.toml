@@ -1,0 +1,20 @@
+# localsaml settings for the SAML Conformance Test Kit (run.sh passes the port and base URL).
+# The kit plays two service providers, described by its own SP metadata, which is copied from
+# the kit's image into samlconf-sp-metadata.xml.
+
+# The kit expects a second service provider's login in the same session to complete without the
+# login page, as a production IdP's would. localsaml shows the page by default.
+silent_sso = true
+
+[[service_providers]]
+entity_id = "https://samlhost:8993/services/saml"
+metadata_file = "samlconf-sp-metadata.xml"
+
+# The kit's second SP signs with DSA, which localsaml can't verify. Declared without its
+# certificate, its requests are accepted unverified, so the multi-SP logout tests can run. This
+# also means "Bindings 3.4.4.1: Redirect AuthnRequest Using DSA1 Signature Algorithm" passes
+# without the signature being checked; see README.md.
+[[service_providers]]
+entity_id = "https://samlhostdsa:8994/services/samldsa"
+acs_urls = ["https://samlhostdsa:8994/services/samldsa/sso/post"]
+slo_url = "https://samlhostdsa:8994/services/samldsa/logout/redirect"

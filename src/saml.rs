@@ -193,6 +193,7 @@ pub struct AuthnRequest {
     pub authn_context_comparison: Option<String>,
     /// `Subject/NameID`: who the SP expects to sign in, like a login hint.
     pub subject: Option<String>,
+    pub subject_format: Option<String>,
     /// Has an enveloped XML signature (POST binding).
     pub signed: bool,
 }
@@ -283,6 +284,9 @@ pub fn parse_message(xml: &str) -> Result<(Message, Element), String> {
                     .path(&[(NS_ASSERTION, "Subject"), (NS_ASSERTION, "NameID")])
                     .map(Element::value)
                     .filter(|v| !v.is_empty()),
+                subject_format: root
+                    .path(&[(NS_ASSERTION, "Subject"), (NS_ASSERTION, "NameID")])
+                    .and_then(|n| opt(n, "Format")),
                 signed,
             })
         }

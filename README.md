@@ -15,7 +15,7 @@ A local SAML 2.0 identity provider for offline development and testing. It's a s
 - **Built for automated tests.** Sign in from Playwright or Cypress with a single query parameter, or turn on auto-login. [Fault injection](#injecting-faults) returns SAML error statuses and deliberately broken responses (bad signatures, wrong audience, expired, replayed). A [shifted clock](#shifting-the-clock) tests your skew handling, and [declared users](#declared-users) give a team and its CI the same named identities.
 
 > [!WARNING]
-> localsaml is for development and testing only. It accepts any service provider by default, lets anyone sign in or mint assertions as any identity, and serves unauthenticated endpoints for minting responses and rotating keys. Its signing key is not a secret. Never expose it to the internet or trust it to protect real data.
+> localsaml is for development and testing only. It accepts any service provider by default, lets anyone sign in or mint assertions as any identity, and serves unauthenticated endpoints for minting responses and rotating keys. Its signing key is not a secret, and its dev API answers cross-origin requests, so any page you visit while it runs could mint assertions or change its settings. Never expose it to the internet or trust it to protect real data.
 
 ## Contents
 
@@ -116,8 +116,8 @@ Every template issuer serves the same endpoints under `/p/<template>`, plus that
 ### Supported protocol features
 
 - **Bindings:** AuthnRequests and logout messages over HTTP-Redirect (DEFLATE, with query-string signatures) and HTTP-POST (with enveloped XML signatures). Responses are sent with HTTP-POST.
-- **AuthnRequests:** `AssertionConsumerServiceURL` or `AssertionConsumerServiceIndex`, `ForceAuthn`, `IsPassive` (a `NoPassive` status without a session), `NameIDPolicy/@Format` and `SPNameQualifier`, `RequestedAuthnContext` (the first requested class is used), `ProviderName` and `Subject/NameID` as a login hint. `login_hint` in the query works too, as it does with Entra ID. A wrong `Destination` or a stale `IssueInstant` is reported on the login page and in the inspector, not rejected.
-- **Request signatures:** when a service provider has a certificate (declared, or from its metadata), its signed requests are verified and an invalid signature is rejected. `want_authn_requests_signed` (or `AuthnRequestsSigned="true"` in its metadata) rejects unsigned requests. Without a certificate, signatures are noted but not checked.
+- **AuthnRequests:** `AssertionConsumerServiceURL` or `AssertionConsumerServiceIndex`, `ForceAuthn`, `IsPassive` (a `NoPassive` status without a session), `NameIDPolicy/@Format` and `SPNameQualifier`, `RequestedAuthnContext` (the first requested class is used), `ProviderName`, and `Subject/NameID`: it pre-fills the login page and the assertion is always about that subject (Profiles 4.1.4.1). `login_hint` in the query pre-fills it too, as it does with Entra ID. A request whose `Destination` isn't where it was sent is discarded with a `Requester` error Response (Core 3.2.1). A stale `IssueInstant` or RelayState over 80 bytes is reported on the login page and in the inspector, not rejected. ACS, SLO and return URLs must be http(s).
+- **Request signatures:** when a service provider has a certificate (declared, or from its metadata), its signed requests are verified and an invalid signature is rejected. `want_authn_requests_signed` (or `AuthnRequestsSigned="true"` in its metadata) rejects unsigned requests. Without a certificate, signatures are noted but not checked. Only RSA signatures are verified (not DSA). A query string with a SAML parameter twice is refused, so the message that's verified is always the one that's processed.
 - **Responses:** RSA-SHA256 by default (RSA-SHA512 and RSA-SHA1 too), with Exclusive XML Canonicalization and the certificate in `KeyInfo`. Whether the Response, the Assertion or both are signed follows the template, and can be overridden per service provider. Bearer subject confirmation, `Conditions` with an `AudienceRestriction`, an `AuthnStatement` with a `SessionIndex`, and an `AttributeStatement`.
 - **Encrypted assertions:** `EncryptedAssertion` with AES-256-GCM (default), AES-128-GCM, AES-256-CBC or AES-128-CBC, and RSA-OAEP key transport, for service providers with an encryption certificate.
 - **NameIDs:** the template's format by default, or the one `NameIDPolicy` asks for. Email-address NameIDs follow the email attribute. Persistent NameIDs are pairwise (stable per user and service provider, like Entra ID's and Shibboleth's), and transient ones are new each session. You can also type any NameID in the login form.
@@ -125,7 +125,7 @@ Every template issuer serves the same endpoints under `/p/<template>`, plus that
 - **IdP-initiated SSO:** unsolicited Responses (no `InResponseTo`) to a service provider's default ACS URL, with a `RelayState`. The template aliases work too, e.g. Shibboleth's `/idp/profile/SAML2/Unsolicited/SSO?providerId=…` and PingFederate's `/idp/startSSO.ping?PartnerSpId=…`.
 - **[Single logout](#single-logout):** SP-initiated and IdP-initiated. Every other service provider in the session is sent a signed LogoutRequest in turn, then the initiator gets a LogoutResponse (`PartialLogout` if some didn't answer `Success`).
 
-**Not implemented:** the HTTP-Artifact binding and artifact resolution, SOAP (back-channel) logout, ECP/PAOS, encrypted NameIDs and attributes, `Scoping`/IdP proxying, and attribute queries. A request asking for the Artifact binding gets an HTTP-POST Response, with a warning.
+**Not implemented:** the HTTP-Artifact binding and artifact resolution, SOAP (back-channel) logout, ECP/PAOS, encrypted NameIDs and attributes, DSA signatures, `Scoping`/IdP proxying, and attribute queries. A request asking for the Artifact binding gets an HTTP-POST Response, with a warning.
 
 ## Identity provider templates
 
@@ -141,14 +141,14 @@ To make a template the default on the root issuer, use `--default-preset <id>`. 
 | `generic` | emailAddress (email) | `email`, `firstName`, `lastName`, `displayName`, `uid`, `groups`, `roles`, … | Response + assertion | – |
 | `entra` | emailAddress (UPN) | WS-Fed claim URIs: `…/claims/name`, `…/emailaddress`, `…/givenname`, `objectidentifier`, `tenantid`, `role`, `groups`, `authnmethodsreferences`. No `NameFormat`, default namespace, `_<uuid>` IDs | Assertion | `/{tenant}/saml2`, `/{tenant}/federationmetadata/2007-06/federationmetadata.xml` |
 | `adfs` | emailAddress | `…/claims/upn`, `…/emailaddress`, `http://schemas.xmlsoap.org/claims/Group`, `windowsaccountname`, `primarysid`. Default namespace | Assertion | `/adfs/ls/`, `/FederationMetadata/2007-06/FederationMetadata.xml` |
-| `okta` | unspecified (email) | `email`, `firstName`, `lastName`, `groups`, with `xs:string` values and an `entity` Issuer format. `saml2:` prefixes, `id…` IDs | Response + assertion | `/app/{app}/{id}/sso/saml`, `/app/{app}/{id}/slo/saml`, `/app/{id}/sso/saml/metadata` |
-| `google` | unspecified (primary email) | `email`, `firstName`, `lastName`, `groups` (`xs:anyType`) | Assertion | `/o/saml2/idp` (no single logout) |
-| `onelogin` | emailAddress | `User.email`, `User.FirstName`, `User.LastName`, `memberOf`, `SessionNotOnOrAfter`, `pfx…` IDs | Assertion | `/trust/saml2/http-{redirect,post}/sso/{id}`, `/trust/saml2/http-redirect/slo/{id}`, `/saml/metadata/{id}` |
-| `auth0` | unspecified (`auth0\|…` user ID) | WS-Fed URIs plus `http://schemas.auth0.com/…` (`email_verified`, `identities/default/connection`, …), `uri` NameFormat | Assertion | `/samlp/{client_id}`, `/samlp/{client_id}/logout`, `/samlp/metadata/{client_id}` |
-| `keycloak` | unspecified (username) | `Role` (role list mapper), X.500 mappers `urn:oid:…` with FriendlyNames, `dsig:` prefix, `ID_…` IDs | Response (document) | `/realms/{realm}/protocol/saml`, `/realms/{realm}/protocol/saml/descriptor` |
-| `pingfederate` | unspecified | LDAP names: `mail`, `givenName`, `sn`, `memberOf` (DNs); entity ID `localhost:default:entityId` | Assertion | `/idp/SSO.saml2`, `/idp/SLO.saml2`, `/idp/startSSO.ping`, `/pf/federation_metadata.ping` |
-| `jumpcloud` | unspecified (email) | `email`, `firstname`, `lastname`, `memberOf`; entity ID `JumpCloud` | Assertion | `/saml2/{app}` |
-| `shibboleth` | transient | eduPerson and `urn:oid:` attributes with FriendlyNames (`eduPersonPrincipalName`, `mail`, `eduPersonScopedAffiliation`, `subject-id`, `pairwise-id`, …), `uri` NameFormat | Response; encrypts the assertion when the SP has a certificate | `/idp/profile/SAML2/{Redirect,POST}/SSO`, `/idp/profile/SAML2/Unsolicited/SSO`, `/idp/profile/SAML2/{Redirect,POST}/SLO`, `/idp/shibboleth` |
+| `okta` | unspecified (email) | `email`, `firstName`, `lastName`, `groups`, with `xs:string` values and an `entity` Issuer format. `saml2:` prefixes, `id…` IDs; encrypts with AES-256-CBC | Response + assertion | `/app/{app}/{id}/sso/saml`, `/app/{app}/{id}/slo/saml`, `/app/{id}/sso/saml/metadata` |
+| `google` | unspecified (primary email) | `email`, `firstName`, `lastName`, `groups` (group names, `xs:anyType`), before the AuthnStatement | Assertion | `/o/saml2/idp` (no single logout) |
+| `onelogin` | emailAddress | `User.email`, `User.FirstName`, `User.LastName`, `memberOf`, `SessionNotOnOrAfter`, `pfx…` IDs | Response | `/trust/saml2/http-{redirect,post}/sso/{id}`, `/trust/saml2/http-redirect/slo/{id}`, `/saml/metadata/{id}` |
+| `auth0` | unspecified (`auth0\|…` user ID) | WS-Fed URIs plus `http://schemas.auth0.com/…` (`email_verified`, `identities/default/connection`, …), `uri` NameFormat, default-namespace signature | Assertion | `/samlp/{client_id}`, `/samlp/{client_id}/logout`, `/samlp/metadata/{client_id}` |
+| `keycloak` | unspecified (username) | `Role` (role list mapper, a new user's effective roles), plus the commonly added X.500 mappers `urn:oid:…` with FriendlyNames, `dsig:` prefix, `ID_…` IDs | Response (document) | `/realms/{realm}/protocol/saml`, `/realms/{realm}/protocol/saml/descriptor` |
+| `pingfederate` | unspecified | LDAP names: `mail`, `givenName`, `sn`, `memberOf` (DNs); entity ID `localhost:default:entityId` | Response | `/idp/SSO.saml2`, `/idp/SLO.saml2`, `/idp/startSSO.ping`, `/pf/federation_metadata.ping` |
+| `jumpcloud` | unspecified (email) | `email`, `firstname`, `lastname`, `memberOf`; entity ID `JumpCloud` | Response | `/saml2/{app}` |
+| `shibboleth` | transient | eduPerson and `urn:oid:` attributes with FriendlyNames (`eduPersonPrincipalName`, `mail`, `eduPersonScopedAffiliation`, `subject-id`, `pairwise-id`, …), `uri` NameFormat | Response; encrypts the assertion (AES-128-GCM) when the SP has a certificate | `/idp/profile/SAML2/{Redirect,POST}/SSO`, `/idp/profile/SAML2/Unsolicited/SSO`, `/idp/profile/SAML2/{Redirect,POST}/SLO`, `/idp/shibboleth` |
 
 `{…}` path segments accept any value, so the URL from a real tenant's configuration works once you swap the host. The metadata advertises the template's own SSO and SLO paths. The templates follow each provider's defaults and most common setup. Real deployments let administrators rename attributes and change signing, so declare a service provider with `sign_response`, `sign_assertion` or custom attributes to match yours. `GET /dev/api/presets` lists all the templates.
 
@@ -217,7 +217,7 @@ Service providers build the SSO URL themselves, so these go on the redirect to l
 
 - `dev_user=<id>` signs in as a [declared user](#declared-users) immediately.
 - `dev_attributes=<JSON or base64url JSON>` signs in immediately with the template defaults merged with those attributes. `dev_preset=<id>` picks the template and `dev_name_id` sets the NameID.
-- `--auto-login` signs every request in with the template defaults, or as the declared user a login hint names. An existing session is reused unless the request has ForceAuthn.
+- `--auto-login` signs every request in with the template defaults, or as the declared user a login hint names. An existing session is reused unless the request has ForceAuthn, and passive (`IsPassive`) requests are signed in too.
 - `--silent-sso` reuses sessions without the login page but still shows it for new logins.
 
 ```js
@@ -302,7 +302,7 @@ curl -s -X DELETE http://localhost:9401/dev/api/faults   # remove them all
 
 - **SP-initiated:** a service provider sends a LogoutRequest to `/slo` (or the template's path). localsaml ends the session, then sends a signed LogoutRequest to every other service provider that got an assertion during it. These go one at a time over front-channel redirects (or POSTs), each with the NameID and SessionIndex that service provider received. When they've all answered, the initiator gets its LogoutResponse: `Success`, with a `PartialLogout` second-level status if some didn't log out.
 - **IdP-initiated:** `/slo/initiate` logs out the browser's session (or `?sid=…`), notifies every service provider the same way, and shows who was logged out (or redirects to `return_to`). The `/dev` page lists sessions with a **Single logout** button.
-- Service providers need an SLO URL to be notified, either declared (`slo_url`, `slo_binding`) or from their metadata. Others are skipped and listed as "not notified".
+- Service providers need an SLO URL to be notified, either declared (`slo_url`, `slo_binding`) or from their metadata. Others are skipped and listed as "not notified". An undeclared service provider that starts a logout has no SLO URL to answer to either, so its logout ends on an error page after the session is ended; declare it to get a LogoutResponse.
 - `DELETE /dev/api/sessions/{sid}` (**Forget** on `/dev`) ends a session without telling anyone, as if it had expired.
 - A LogoutRequest for a session that's already gone still gets `Success`. The Google Workspace template doesn't do single logout, like the real one.
 
@@ -347,7 +347,7 @@ sign_response = true                            # override the template
 ```
 
 - Settings can come from the service provider's metadata instead. Use `metadata_url` (fetched at startup, and again on the service provider's first request if it wasn't up yet), `metadata_file` or inline `metadata`. Explicit settings win. The metadata provides the entity ID, HTTP-POST ACS URLs and their indexes, the SLO endpoint and binding, signing and encryption certificates, `AuthnRequestsSigned`, `WantAssertionsSigned` and the NameID format.
-- `POST /dev/api/service-providers` registers one at runtime, from metadata XML (the request body) or JSON with the same fields as above, including `metadata_url`. Registered service providers are saved in the state database. `GET` lists them all and `DELETE ?entity_id=…` removes one. The `/dev` page has the same controls.
+- `POST /dev/api/service-providers` registers one at runtime, from metadata XML (the request body) or JSON with the same fields as above, including `metadata_url`. Registered service providers are saved in the state database. `GET` lists them all, `DELETE ?entity_id=…` removes one and `DELETE` without it removes every registered one. The `/dev` page has the same controls.
 
 Named identities go in `[[users]]`. See [Declared users](#declared-users).
 
@@ -365,7 +365,12 @@ Named identities go in `[[users]]`. See [Declared users](#declared-users).
 
 ## Interop testing
 
-There's no official conformance suite for SAML identity providers, so `interop/` drives localsaml with independent service provider libraries, [`@node-saml/node-saml`](https://github.com/node-saml/node-saml) and [samlify](https://github.com/tngan/samlify). It covers every template, both bindings, signed and encrypted messages, IdP-initiated SSO, single logout and key rotation, and checks that tampered responses are rejected. See [`interop/README.md`](interop/README.md).
+There's no maintained, official conformance suite for SAML identity providers like the OpenID Foundation's for OIDC, so localsaml is tested two ways:
+
+- **Interop with independent service providers** (`interop/`). The harness drives localsaml with SP libraries built on different XML-security stacks: [`@node-saml/node-saml`](https://github.com/node-saml/node-saml) and [samlify](https://github.com/tngan/samlify) (xml-crypto), [pysaml2](https://github.com/IdentityPython/pysaml2) (xmlsec1), [crewjam/saml](https://github.com/crewjam/saml) (goxmldsig) and the [Shibboleth SP](https://shibboleth.atlassian.net/wiki/spaces/SP3) (OpenSAML C++). For every template it covers both bindings, signed requests that localsaml must verify, encrypted assertions, IdP-initiated SSO, single logout and key rotation, and checks that tampered responses are rejected. See [`interop/README.md`](interop/README.md).
+- **The [SAML Conformance Test Kit](https://github.com/codice/saml-conformance)** (`interop/codice/`), a black-box test kit for identity providers that checks the MUSTs of the SAML 2.0 Core, Bindings and Profiles specifications for Web Browser SSO and single logout. It's no longer maintained (its last release is from 2019), so it runs from its published Docker image with a few workarounds. Every test passes except the few listed, with reasons, in [`expected-failures.tsv`](interop/codice/expected-failures.tsv). See [`interop/codice/README.md`](interop/codice/README.md).
+
+Both run in CI.
 
 ## Contributing
 

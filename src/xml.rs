@@ -12,6 +12,10 @@ use quick_xml::reader::Reader;
 
 pub const NS_XML: &str = "http://www.w3.org/XML/1998/namespace";
 
+/// Deepest element nesting [`parse`] accepts. SAML messages are a dozen levels deep; the limit
+/// keeps hostile input from overflowing the stack in the recursive code that walks the tree.
+pub const MAX_DEPTH: usize = 128;
+
 /// Namespaces in scope: prefix (`None` for the default namespace) to URI.
 pub type Scope = BTreeMap<Option<String>, String>;
 
@@ -206,6 +210,11 @@ impl Element {
             return Some(self);
         }
         self.elements_mut().find_map(|e| e.find_by_id_mut(id))
+    }
+
+    /// How many elements (this one and its descendants) have `ID` `id`.
+    pub fn count_id(&self, id: &str) -> usize {
+        usize::from(self.get_attr("ID") == Some(id)) + self.elements().map(|e| e.count_id(id)).sum::<usize>()
     }
 
     /// Like [`Element::find_by_id`], plus the namespaces in scope from the element's ancestors.
@@ -484,6 +493,9 @@ pub fn parse(xml: &str) -> Result<Element, String> {
             reader.read_event().map_err(|e| format!("invalid XML at byte {}: {e}", reader.buffer_position()))?;
         match event {
             Event::Start(e) => {
+                if stack.len() >= MAX_DEPTH {
+                    return Err(format!("elements are nested more than {MAX_DEPTH} deep"));
+                }
                 let outer = stack.last().map(|(_, s)| s.clone()).unwrap_or_default();
                 stack.push(open(&e, &outer)?);
             }
@@ -580,6 +592,11 @@ mod tests {
         assert_eq!(child.text_content(), "t<A");
         assert_eq!(root.to_xml(), xml.replace("&#x41;", "A"));
         assert!(parse("<!DOCTYPE x [<!ENTITY e SYSTEM 'file:///etc/passwd'>]><x>&e;</x>").is_err());
+        // Deep nesting is refused rather than overflowing the stack later.
+        let deep = format!("{}{}", "<a>".repeat(100_000), "</a>".repeat(100_000));
+        assert!(parse(&deep).unwrap_err().contains("nested"));
+        let ok = format!("{}{}", "<a>".repeat(MAX_DEPTH), "</a>".repeat(MAX_DEPTH));
+        assert!(parse(&ok).is_ok());
     }
 
     #[test]

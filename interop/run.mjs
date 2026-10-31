@@ -8,8 +8,12 @@
 //   node run.mjs --no-build      # use the existing target/debug/localsaml
 //   node run.mjs --binary PATH   # use another binary (e.g. target/release/localsaml)
 //   node run.mjs --verbose       # print failure details as they happen
+//   node run.mjs --stacks node,pysaml2,crewjam,shibboleth
+//                                # which service-provider stacks to run (default: all). pysaml2,
+//                                # crewjam and shibboleth run in Docker and are skipped when Docker
+//                                # isn't available, unless --require-stacks (CI) is given.
 
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -34,12 +38,23 @@ const option = (name) => {
   return i >= 0 ? args[i + 1] : undefined;
 };
 const ONLY = option('--only');
+const STACKS = (option('--stacks') || 'node,pysaml2,crewjam,shibboleth').split(',').map((x) => x.trim()).filter(Boolean);
+const REQUIRE_STACKS = flag('--require-stacks');
 const VERBOSE = flag('--verbose');
 const PORT = Number(option('--port') || 9411);
 const BASE = `http://localhost:${PORT}`;
 
 const EMAIL = 'urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress';
 const SP_HOST = 'http://sp.interop.test';
+const SHIB_PORT = Number(option('--shibboleth-port') || 9412);
+const SHIB = `http://localhost:${SHIB_PORT}`;
+/** Encrypted-assertion SPs for the Docker stacks: [stack, algorithm, extra config]. */
+const STACK_ENCRYPTION = [
+  ['pysaml2', 'aes256-gcm', ''],
+  ['pysaml2', 'aes128-cbc', ''],
+  ['crewjam', 'aes128-gcm', 'slo_binding = "post"'],
+  ['crewjam', 'aes256-cbc', 'slo_binding = "post"'],
+];
 
 // ---------------------------------------------------------------- results
 
@@ -97,6 +112,26 @@ ${extra}`);
   add('samlify');
   for (const alg of ['aes256-gcm', 'aes128-cbc']) {
     for (const lib of ['node-saml', 'samlify']) add(`enc-${alg}-${lib}`, `encrypt_assertions = true\nencryption_algorithm = "${alg}"`);
+  }
+  // Stacks in Docker. crewjam only validates logout responses with an embedded signature, so it
+  // logs out over the POST binding; it doesn't do AES-256-GCM.
+  add('pysaml2');
+  // Templates that encrypt by default (Shibboleth) would use AES-256-GCM, which crewjam lacks.
+  add('crewjam', 'slo_binding = "post"\nencryption_algorithm = "aes128-gcm"');
+  for (const [lib, alg, extra] of STACK_ENCRYPTION) add(`enc-${alg}-${lib}`, `encrypt_assertions = true\nencryption_algorithm = "${alg}"\n${extra}`);
+  // Shibboleth SP: signed requests are required, so localsaml must verify OpenSAML's signatures.
+  for (const [entity, prefix, encrypt] of [[`${SHIB}/shibboleth`, '', false], [`${SHIB}/shibboleth-enc`, '/enc', true]]) {
+    entries.push(`[[service_providers]]
+entity_id = "${entity}"
+acs_urls = ["${SHIB}${prefix}/Shibboleth.sso/SAML2/POST"]
+slo_url = "${SHIB}${prefix}/Shibboleth.sso/SLO/Redirect"
+want_authn_requests_signed = true
+encrypt_assertions = ${encrypt}
+${encrypt ? 'encryption_algorithm = "aes256-gcm"' : ''}
+certificate = """
+${keys.cert.trim()}
+"""
+`);
   }
   return entries.join('\n');
 }
@@ -165,7 +200,10 @@ class Browser {
   }
 }
 
-const unescapeHtml = (s) => s.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+const unescapeHtml = (s) => s
+  .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+  .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+  .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
 const input = (html, name) => {
   const m = html.match(new RegExp(`name="${name}" value="([^"]*)"`));
   return m ? unescapeHtml(m[1]) : undefined;
@@ -179,7 +217,7 @@ const errorText = (html) => {
 /** The HTTP-POST binding page: where it posts, and what. */
 async function postedMessage(res) {
   const html = await res.text();
-  const action = (html.match(/<form method="post" action="([^"]*)"/) || [])[1];
+  const action = (html.match(/<form method="post" action="([^"]*)"/i) || [])[1];
   const SAMLResponse = input(html, 'SAMLResponse');
   if (!action || !SAMLResponse) throw new Error(`expected an auto-posted SAMLResponse, got ${res.status} "${errorText(html)}"`);
   const RelayState = input(html, 'RelayState');
@@ -572,11 +610,427 @@ async function rotation(issuers, keys) {
   });
 }
 
+// ---------------------------------------------------------------- Docker stacks
+// pysaml2 (xmlsec1), crewjam/saml (goxmldsig) and Shibboleth SP (OpenSAML C++ / xml-security-c)
+// verify signatures and decrypt independently of xml-crypto, which node-saml and samlify share.
+
+const STACK_IMAGES = {
+  pysaml2: 'localsaml-interop-pysaml2',
+  crewjam: 'localsaml-interop-crewjam',
+  shibboleth: 'localsaml-interop-shibboleth',
+};
+
+function dockerAvailable() {
+  return spawnSync('docker', ['info'], { stdio: 'ignore' }).status === 0;
+}
+
+function buildImage(stack) {
+  console.log(`building the ${stack} image…`);
+  execFileSync('docker', ['build', '-q', '-t', STACK_IMAGES[stack], path.join(here, 'stacks', stack)], { stdio: ['ignore', 'ignore', 'inherit'] });
+}
+
+/** A long-running SP helper in Docker that takes one JSON command per line. */
+class StackProcess {
+  constructor(stack) {
+    this.stack = stack;
+    this.child = spawn('docker', ['run', '-i', '--rm', STACK_IMAGES[stack]], { stdio: ['pipe', 'pipe', 'pipe'] });
+    this.buffer = '';
+    this.waiting = [];
+    this.stderr = '';
+    this.child.stdout.on('data', (d) => {
+      this.buffer += d;
+      let i;
+      while ((i = this.buffer.indexOf('\n')) >= 0) {
+        const line = this.buffer.slice(0, i);
+        this.buffer = this.buffer.slice(i + 1);
+        const next = this.waiting.shift();
+        if (next) next(line);
+      }
+    });
+    this.child.stderr.on('data', (d) => (this.stderr += d));
+  }
+  async call(command) {
+    const line = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${this.stack} helper timed out: ${this.stderr.slice(-500)}`)), 60_000);
+      this.waiting.push((l) => { clearTimeout(timer); resolve(l); });
+      this.child.stdin.write(`${JSON.stringify(command)}\n`);
+    });
+    const result = JSON.parse(line);
+    if (!result.ok) {
+      const err = new Error(result.error);
+      err.trace = result.trace;
+      throw err;
+    }
+    return result;
+  }
+  close() {
+    this.child.stdin.end();
+    this.child.kill();
+  }
+}
+
+const first = (v) => (Array.isArray(v) ? v[0] : v);
+const decodeB64 = (b64) => Buffer.from(b64, 'base64').toString();
+
+/** pysaml2 and crewjam: the same scenarios through their JSON command interface. */
+async function runHelperStack(stack, helper, issuer, keys) {
+  const name = issuer.id;
+  const p = issuer.preset;
+  const emailAttr = p.email_attribute;
+  const spCfg = (sp) => ({ entity_id: sp.entityId, acs: sp.acs, slo: sp.slo, key: keys.key, cert: keys.cert, name_id_format: EMAIL });
+  const base = (sp, extra = {}) => ({
+    idp_metadata: issuer.md.xml,
+    sp: spCfg(sp),
+    want_assertions_signed: p.sign_assertion,
+    want_response_signed: p.sign_response,
+    ...extra,
+  });
+  const sp = spEntity(stack);
+  const devAttrs = (email) => ({ [emailAttr]: email, interopList: ['a', 'b'], ...(p.name_id_from ? { [p.name_id_from]: email } : {}) });
+  const expectEmail = (tag) => `${tag}-${stack}-${name}@example.com`;
+  const checkProfile = (r, email) => {
+    assert(r.name_id === email, `NameID ${r.name_id}, expected ${email}`);
+    assert(r.name_id_format === EMAIL, `NameID format ${r.name_id_format}`);
+    assert(first(r.attributes[emailAttr]) === email, `${emailAttr} is ${JSON.stringify(r.attributes[emailAttr])}`);
+  };
+  const parse = (sp2, posted, requestIds) => helper.call(base(sp2, { op: 'parse_response', saml_response: posted.SAMLResponse, request_ids: requestIds }));
+  /** Start an SP-initiated login; returns {id, res} where res is localsaml's answer. */
+  const start = async (b, binding, sign, extraParams, sp2 = sp) => {
+    const req = await helper.call(base(sp2, { op: 'login', binding, sign, relay_state: 'rs-1' }));
+    if (binding === 'post') {
+      assert(req.action.startsWith(issuer.base) || req.action === issuer.md.ssoPost, `POST to ${req.action}`);
+      return { req, res: await b.post(req.action, { ...req.form, ...extraParams }) };
+    }
+    const extra = new URLSearchParams(extraParams).toString();
+    return { req, res: await b.get(extra ? `${req.url}&${extra}` : req.url) };
+  };
+
+  for (const [binding, sign] of [['redirect', true], ['post', true], ['redirect', false]]) {
+    await check(name, stack, `SP-initiated, ${binding === 'post' ? 'POST' : 'Redirect'}, ${sign ? 'signed' : 'unsigned'}, dev_attributes`, async () => {
+      const email = expectEmail(`${binding}${sign ? 's' : 'u'}`);
+      const b = new Browser();
+      const { req, res } = await start(b, binding, sign, { dev_attributes: JSON.stringify(devAttrs(email)) });
+      const posted = await postedMessage(res);
+      assert(posted.action === sp.acs, `posted to ${posted.action}`);
+      const r = await parse(sp, posted, [req.id]);
+      checkProfile(r, email);
+      assert((r.attributes.interopList || []).join() === 'a,b', `interopList ${JSON.stringify(r.attributes.interopList)}`);
+      return `NameID ${r.name_id}`;
+    });
+  }
+
+  await check(name, stack, 'SP-initiated, Redirect, login form', async () => {
+    const email = expectEmail('form');
+    const b = new Browser();
+    const { req, res } = await start(b, 'redirect', true, {});
+    const posted = await postedMessage(await viaLoginForm(b, res, p.id, { name_id: email, name_id_format: EMAIL, attributes: { [emailAttr]: email } }));
+    const r = await parse(sp, posted, [req.id]);
+    checkProfile(r, email);
+    return `NameID ${r.name_id}`;
+  });
+
+  // localsaml must have verified the signature: a request changed after signing is refused.
+  for (const binding of ['redirect', 'post']) {
+    await check(name, stack, `${binding === 'post' ? 'POST' : 'Redirect'} request changed after signing is refused by localsaml`, async () => {
+      const req = await helper.call(base(sp, { op: 'login', binding, sign: true, relay_state: 'rs-1' }));
+      let res;
+      if (binding === 'post') {
+        const xml = decodeB64(req.form.SAMLRequest).replace('Destination="', 'Destination="x');
+        res = await fetch(req.action, { method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ ...req.form, SAMLRequest: Buffer.from(xml).toString('base64'), dev_user: 'alice' }) });
+      } else {
+        res = await fetch(`${req.url.replace('RelayState=rs-1', 'RelayState=rs-2')}&dev_user=alice`, { redirect: 'manual' });
+      }
+      const html = await res.text();
+      assert(res.status === 400 && /^Invalid AuthnRequest signature/.test(errorText(html)), `expected "Invalid AuthnRequest signature", got ${res.status} "${errorText(html)}"`);
+      return errorText(html).slice(0, 100);
+    });
+  }
+
+  for (const [lib, alg] of STACK_ENCRYPTION.filter(([l]) => l === stack)) {
+    await check(name, stack, `encrypted assertion (${alg})`, async () => {
+      const esp = spEntity(`enc-${alg}-${lib}`);
+      const email = expectEmail('enc');
+      const { req, res } = await start(new Browser(), 'redirect', true, { dev_attributes: JSON.stringify(devAttrs(email)) }, esp);
+      const posted = await postedMessage(res);
+      assert(decodeB64(posted.SAMLResponse).includes('EncryptedAssertion'), 'the assertion is not encrypted');
+      const r = await parse(esp, posted, [req.id]);
+      checkProfile(r, email);
+      return `NameID ${r.name_id}`;
+    });
+  }
+
+  await check(name, stack, 'IdP-initiated (/sso/initiate)', async () => {
+    const email = expectEmail('idpinit');
+    const res = await new Browser().get(`${issuer.base}/sso/initiate?sp=${encodeURIComponent(sp.entityId)}&RelayState=%2Fhome&dev_attributes=${encodeURIComponent(JSON.stringify(devAttrs(email)))}&dev_name_id=${encodeURIComponent(email)}`);
+    const posted = await postedMessage(res);
+    const r = await parse(sp, posted, []);
+    assert(r.name_id === email, `NameID ${r.name_id}`);
+    return `NameID ${r.name_id}`;
+  });
+
+  if (p.single_logout) {
+    await check(name, stack, 'SP-initiated SLO', async () => {
+      const b = new Browser();
+      const email = expectEmail('slo');
+      const { req, res } = await start(b, 'redirect', true, { dev_attributes: JSON.stringify(devAttrs(email)) });
+      const r = await parse(sp, await postedMessage(res), [req.id]);
+      const logout = await helper.call(base(sp, { op: 'logout', name_id: r.name_id, name_id_format: r.name_id_format, session_index: r.session_index, relay_state: 'bye' }));
+      let answer;
+      if (logout.url) {
+        const out = await b.get(logout.url);
+        const location = out.headers.get('location');
+        assert(location && location.startsWith(sp.slo), `expected a redirect to ${sp.slo}, got ${out.status} ${location || errorText(await out.text())}`);
+        answer = new URLSearchParams(location.slice(location.indexOf('?') + 1)).get('SAMLResponse');
+        await helper.call(base(sp, { op: 'parse_logout_response', binding: 'redirect', saml_response: answer }));
+      } else {
+        const out = await b.post(logout.action, logout.form);
+        const html = await out.text();
+        answer = input(html, 'SAMLResponse');
+        assert(answer, `expected a posted LogoutResponse, got ${out.status} "${errorText(html)}"`);
+        await helper.call(base(sp, { op: 'parse_logout_response', binding: 'post', saml_response: answer }));
+      }
+      assert(![...b.cookies.keys()].some((k) => k.startsWith('localsaml_sid_')), 'the IdP session cookie is still set');
+      return 'LogoutResponse verified';
+    });
+  }
+
+  const mint = async (query = '') => ({
+    SAMLResponse: (await json(`${issuer.base}/dev/api/response?sp=${encodeURIComponent(sp.entityId)}&${attrQuery(emailAttr, expectEmail('mint'))}${query}`)).saml_response,
+  });
+  await check(name, stack, 'minted Response accepted (control)', async () => {
+    await parse(sp, await mint(), []);
+    return 'accepted';
+  });
+  const tampers = ['bad_signature', 'wrong_cert', 'wrong_audience', 'wrong_issuer', 'expired', 'not_yet_valid', 'unsigned', 'wrong_destination'];
+  // pysaml2 doesn't check SubjectConfirmationData/@Recipient.
+  if (stack !== 'pysaml2') tampers.push('wrong_recipient');
+  for (const tamper of tampers) {
+    await check(name, stack, `tamper=${tamper} rejected`, async () => rejects(async () => parse(sp, await mint(`&tamper=${tamper}`), [])));
+  }
+  await check(name, stack, 'error status (AuthnFailed) rejected', async () => rejects(async () => parse(sp, await mint('&status=AuthnFailed'), [])));
+}
+
+// ---------------------------------------------------------------- Shibboleth SP
+
+function shibConfig(issuers) {
+  const metadata = issuers.map((i) => `      <MetadataProvider type="XML" validate="false" path="idp-${i.id}.xml"/>`).join('\n');
+  const sessions = (handlerURL) => `<Sessions lifetime="28800" timeout="3600" relayState="ss:mem" checkAddress="false" handlerURL="${handlerURL}" handlerSSL="false" cookieProps="http" redirectLimit="none">
+      <SSO>SAML2</SSO>
+      <Logout>SAML2 Local</Logout>
+      <SessionInitiator type="SAML2" Location="/LoginPost" outgoingBindings="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" template="bindingTemplate.html"/>
+      <Handler type="MetadataGenerator" Location="/Metadata" signing="false"/>
+      <Handler type="Session" Location="/Session" showAttributeValues="true" contentType="application/json"/>
+    </Sessions>`;
+  return `<SPConfig xmlns="urn:mace:shibboleth:3.0:native:sp:config" xmlns:conf="urn:mace:shibboleth:3.0:native:sp:config" clockSkew="180">
+  <RequestMapper type="XML">
+    <RequestMap>
+      <Host name="localhost" port="${SHIB_PORT}" scheme="http">
+        <Path name="enc" applicationId="enc"/>
+      </Host>
+    </RequestMap>
+  </RequestMapper>
+  <ApplicationDefaults entityID="${SHIB}/shibboleth" REMOTE_USER="nameid" signing="true" encryption="false" homeURL="${SHIB}/">
+    ${sessions('/Shibboleth.sso')}
+    <Errors supportContact="root@localhost"/>
+    <MetadataProvider type="Chaining">
+${metadata}
+    </MetadataProvider>
+    <AttributeExtractor type="XML" validate="true" reloadChanges="false" path="attribute-map.xml"/>
+    <CredentialResolver type="File" key="sp-key.pem" certificate="sp-cert.pem"/>
+    <ApplicationOverride id="enc" entityID="${SHIB}/shibboleth-enc" homeURL="${SHIB}/enc/">
+      ${sessions('/enc/Shibboleth.sso')}
+    </ApplicationOverride>
+  </ApplicationDefaults>
+  <SecurityPolicyProvider type="XML" validate="true" path="security-policy.xml"/>
+  <ProtocolProvider type="XML" validate="true" reloadChanges="false" path="protocols.xml"/>
+</SPConfig>
+`;
+}
+
+/** Map every template's email attribute to `email`, `interopList` to itself, and NameIDs to `nameid`. */
+function shibAttributeMap(presets) {
+  const formats = ['urn:oasis:names:tc:SAML:2.0:attrname-format:uri', 'urn:oasis:names:tc:SAML:2.0:attrname-format:basic', 'urn:oasis:names:tc:SAML:2.0:attrname-format:unspecified'];
+  const rules = [];
+  const add = (name, id) => {
+    for (const f of formats) rules.push(`  <Attribute name="${name}" nameFormat="${f}" id="${id}"/>`);
+  };
+  for (const name of new Set(presets.map((p) => p.email_attribute))) add(name, 'email');
+  add('interopList', 'interopList');
+  const nameIdFormats = ['urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress', 'urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified',
+    'urn:oasis:names:tc:SAML:2.0:nameid-format:persistent', 'urn:oasis:names:tc:SAML:2.0:nameid-format:transient'];
+  for (const f of nameIdFormats) {
+    rules.push(`  <Attribute name="${f}" id="nameid"><AttributeDecoder xsi:type="NameIDAttributeDecoder" formatter="$Name"/></Attribute>`);
+  }
+  return `<Attributes xmlns="urn:mace:shibboleth:2.0:attribute-map" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+${rules.join('\n')}
+</Attributes>
+`;
+}
+
+async function startShibboleth(issuers, presets, keys) {
+  const dir = path.join(tmp, 'shibboleth');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'shibboleth2.xml'), shibConfig(issuers));
+  fs.writeFileSync(path.join(dir, 'attribute-map.xml'), shibAttributeMap(presets));
+  fs.writeFileSync(path.join(dir, 'sp-key.pem'), keys.key);
+  fs.writeFileSync(path.join(dir, 'sp-cert.pem'), keys.cert);
+  for (const i of issuers) fs.writeFileSync(path.join(dir, `idp-${i.id}.xml`), i.md.xml);
+  for (const f of fs.readdirSync(dir)) fs.chmodSync(path.join(dir, f), 0o644);
+  const name = `localsaml-interop-shibboleth-${process.pid}`;
+  spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore' });
+  // No --rm: if it fails to start, its logs are still there to report.
+  execFileSync('docker', ['run', '-d', '--name', name, '-p', `${SHIB_PORT}:80`, '-v', `${dir}:/interop:ro`, STACK_IMAGES.shibboleth], { stdio: 'ignore' });
+  const logs = () => spawnSync('docker', ['logs', name], { encoding: 'utf8' }).stderr + spawnSync('docker', ['exec', name, 'cat', '/var/log/shibboleth/shibd.log'], { encoding: 'utf8' }).stdout;
+  for (let i = 0; i < 150; i++) {
+    try {
+      if ((await fetch(`${SHIB}/Shibboleth.sso/Metadata`)).ok) return { stop: () => spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore' }), logs };
+    } catch { /* not up yet */ }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  const l = logs();
+  spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore' });
+  throw new Error(`Shibboleth SP didn't start:\n${l}`);
+}
+
+/** Text of a Shibboleth error page, for failure messages. */
+function shibError(html) {
+  const text = unescapeHtml(html.replace(/<style[\s\S]*?<\/style>/g, '').replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
+  return text.slice(0, 220);
+}
+
+async function shibSession(b, app) {
+  const res = await b.get(`${SHIB}${app}/Shibboleth.sso/Session`);
+  const text = await res.text();
+  try {
+    const s = JSON.parse(text);
+    const attrs = {};
+    for (const a of s.attributes || []) attrs[a.name] = a.values;
+    return { ...s, attrs };
+  } catch {
+    return { attrs: {}, raw: text };
+  }
+}
+
+async function runShibboleth(issuer) {
+  const name = issuer.id;
+  const p = issuer.preset;
+  const emailAttr = p.email_attribute;
+  const expectEmail = (tag) => `${tag}-shib-${name}@example.com`;
+  const devAttrs = (email) => ({ [emailAttr]: email, interopList: ['a', 'b'] });
+
+  /** Log in through Shibboleth's own SessionInitiator, finishing at localsaml with dev_attributes. */
+  const login = async (b, { app = '', post = false, email }) => {
+    const target = `${SHIB}${app}/secure/`;
+    let res = await b.get(`${SHIB}${app}/Shibboleth.sso/${post ? 'LoginPost' : 'Login'}?entityID=${encodeURIComponent(issuer.md.entityId)}&target=${encodeURIComponent(target)}`);
+    const dev = { dev_attributes: JSON.stringify(devAttrs(email)), dev_name_id: email };
+    if (post) {
+      const html = await res.text();
+      const action = unescapeHtml((html.match(/action="([^"]*)"/) || [])[1] || '');
+      const fields = Object.fromEntries([...html.matchAll(/name="(SAMLRequest|RelayState)" value="([^"]*)"/g)].map((m) => [m[1], unescapeHtml(m[2])]));
+      assert(action.startsWith(BASE) && fields.SAMLRequest, `expected a POST-binding AuthnRequest page, got ${res.status} ${shibError(html)}`);
+      assert(decodeB64(fields.SAMLRequest).includes('Signature'), 'the POST AuthnRequest is not signed');
+      res = await b.post(action, { ...fields, ...dev });
+    } else {
+      const location = res.headers.get('location');
+      assert(location && location.startsWith(BASE), `expected a redirect to localsaml, got ${res.status} ${location || shibError(await res.text())}`);
+      assert(/[?&]Signature=/.test(location), 'the Redirect AuthnRequest is not signed');
+      res = await b.get(`${location}&${new URLSearchParams(dev)}`);
+    }
+    const posted = await postedMessage(res);
+    assert(posted.action === `${SHIB}${app}/Shibboleth.sso/SAML2/POST`, `posted to ${posted.action}`);
+    res = await b.post(posted.action, posted);
+    const location = res.headers.get('location');
+    assert(res.status === 302 && location === target, `Shibboleth didn't accept the Response: ${res.status} ${location || shibError(await res.text())}`);
+    return { posted, session: await shibSession(b, app) };
+  };
+  const checkSession = (s, email) => {
+    assert(first(s.attrs.nameid) === email, `nameid ${JSON.stringify(s.attrs.nameid)} (session: ${s.raw ? s.raw.slice(0, 200) : JSON.stringify(s).slice(0, 300)})`);
+    assert(first(s.attrs.email) === email, `email ${JSON.stringify(s.attrs.email)}`);
+    assert((s.attrs.interopList || []).slice().sort().join() === 'a,b', `interopList ${JSON.stringify(s.attrs.interopList)}`);
+  };
+
+  for (const post of [false, true]) {
+    await check(name, 'shibboleth', `SP-initiated, ${post ? 'POST' : 'Redirect'}, signed (required), dev_attributes`, async () => {
+      const email = expectEmail(post ? 'post' : 'redirect');
+      const { session } = await login(new Browser(), { post, email });
+      checkSession(session, email);
+      return `nameid ${email}`;
+    });
+  }
+  await check(name, 'shibboleth', 'encrypted assertion (aes256-gcm)', async () => {
+    const email = expectEmail('enc');
+    const { posted, session } = await login(new Browser(), { app: '/enc', email });
+    assert(decodeB64(posted.SAMLResponse).includes('EncryptedAssertion'), 'the assertion is not encrypted');
+    checkSession(session, email);
+    return `nameid ${email}`;
+  });
+  if (p.single_logout) {
+    await check(name, 'shibboleth', 'SP-initiated SLO', async () => {
+      const b = new Browser();
+      await login(b, { email: expectEmail('slo') });
+      const back = `${SHIB}/`;
+      let res = await b.get(`${SHIB}/Shibboleth.sso/Logout?return=${encodeURIComponent(back)}`);
+      let location = res.headers.get('location');
+      assert(location && location.startsWith(BASE) && /SAMLRequest=/.test(location), `expected a LogoutRequest to localsaml, got ${res.status} ${location || shibError(await res.text())}`);
+      res = await b.get(location);
+      location = res.headers.get('location');
+      assert(location && location.startsWith(`${SHIB}/Shibboleth.sso/SLO/Redirect`), `expected a LogoutResponse to Shibboleth, got ${res.status} ${location || errorText(await res.text())}`);
+      res = await b.get(location);
+      const final = res.headers.get('location');
+      const html = final ? '' : await res.text();
+      assert((final && final.startsWith(back)) || /logged out|logout was successful/i.test(html), `Shibboleth didn't complete the logout: ${res.status} ${final || shibError(html)}`);
+      const s = await shibSession(b, '');
+      assert(!s.attrs.nameid, 'the Shibboleth session is still active');
+      return 'logged out at both ends';
+    });
+  }
+
+  // Minted Responses posted straight to Shibboleth's ACS (unsolicited).
+  const deliver = async (query) => {
+    const r = await json(`${issuer.base}/dev/api/response?sp=${encodeURIComponent(`${SHIB}/shibboleth`)}&${attrQuery(emailAttr, expectEmail('mint'))}&relay_state=${encodeURIComponent(`${SHIB}/secure/`)}${query}`);
+    const b = new Browser();
+    const res = await b.post(r.acs_url, { SAMLResponse: r.saml_response, RelayState: r.relay_state });
+    return { res, b };
+  };
+  await check(name, 'shibboleth', 'minted Response accepted (control)', async () => {
+    const { res } = await deliver('');
+    assert(res.status === 302, `not accepted: ${res.status} ${shibError(await res.text())}`);
+    return 'accepted';
+  });
+  // Shibboleth SP accepts RSA-SHA1 by default, like node-saml.
+  const tampers = ['bad_signature', 'wrong_cert', 'wrong_audience', 'wrong_issuer', 'expired', 'not_yet_valid', 'unsigned', 'wrong_recipient', 'wrong_destination'];
+  for (const tamper of tampers) {
+    await check(name, 'shibboleth', `tamper=${tamper} rejected`, async () => {
+      const { res, b } = await deliver(`&tamper=${tamper}`);
+      const accepted = res.status === 302 && (await shibSession(b, '')).attrs.nameid;
+      if (accepted) throw new Error('accepted a Response it should have rejected');
+      return `rejected: ${shibError(await res.text()).slice(0, 100)}`;
+    });
+  }
+  await check(name, 'shibboleth', 'error status (AuthnFailed) rejected', async () => {
+    const { res, b } = await deliver('&status=AuthnFailed');
+    assert(!(res.status === 302 && (await shibSession(b, '')).attrs.nameid), 'accepted an error Response');
+    return `rejected: ${shibError(await res.text()).slice(0, 100)}`;
+  });
+}
+
 // ---------------------------------------------------------------- main
 
 async function main() {
   const keys = spKeys();
+  const dockerStacks = STACKS.filter((x) => x !== 'node');
+  for (const x of dockerStacks) if (!STACK_IMAGES[x]) throw new Error(`unknown stack '${x}' (node, ${Object.keys(STACK_IMAGES).join(', ')})`);
+  const skipped = [];
+  let runnable = dockerStacks;
+  if (dockerStacks.length && !dockerAvailable()) {
+    if (REQUIRE_STACKS) throw new Error(`Docker isn't available, and --require-stacks needs it for ${dockerStacks.join(', ')}`);
+    skipped.push(...dockerStacks.map((x) => `${x} (skipped: docker unavailable)`));
+    runnable = [];
+  }
+  for (const x of runnable) buildImage(x);
   const server = await startServer(keys);
+  const helpers = Object.fromEntries(runnable.filter((x) => x !== 'shibboleth').map((x) => [x, new StackProcess(x)]));
+  let shibboleth;
   let failed = false;
   try {
     const presets = await json(`${BASE}/dev/api/presets`);
@@ -585,9 +1039,13 @@ async function main() {
     if (ONLY) issuers = issuers.filter((i) => i.id === ONLY);
     if (!issuers.length) throw new Error(`no template '${ONLY}'`);
     for (const issuer of issuers) issuer.md = await metadataOf(issuer.base);
+    if (runnable.includes('shibboleth')) {
+      console.log('starting the Shibboleth SP…');
+      shibboleth = await startShibboleth(issuers, presets, keys);
+    }
 
     // The harness's SPs are declared in localsaml.toml; check registering one over the API too.
-    await check('root', 'api', 'register an SP over /dev/api/service-providers', async () => {
+    if (STACKS.includes('node')) await check('root', 'api', 'register an SP over /dev/api/service-providers', async () => {
       const sp = spEntity('api-registered');
       await registerSp({ entity_id: sp.entityId, acs_urls: [sp.acs], slo_url: sp.slo, certificate: keys.cert, encrypt_assertions: true });
       const listed = await json(`${BASE}/dev/api/service-providers`);
@@ -599,12 +1057,19 @@ async function main() {
 
     for (const issuer of issuers) {
       process.stderr.write(`${issuer.id}… `);
-      await runIssuer(issuer, keys);
+      if (STACKS.includes('node')) await runIssuer(issuer, keys);
+      for (const [stack, helper] of Object.entries(helpers)) await runHelperStack(stack, helper, issuer, keys);
+      if (shibboleth) await runShibboleth(issuer);
     }
-    process.stderr.write('rotation…\n');
-    await rotation(issuers, keys);
+    if (STACKS.includes('node')) {
+      process.stderr.write('rotation…\n');
+      await rotation(issuers, keys);
+    }
   } finally {
     server.child.kill();
+    for (const helper of Object.values(helpers)) helper.close();
+    if (shibboleth && (VERBOSE || results.some((r) => !r.ok && r.lib === 'shibboleth'))) console.error(shibboleth.logs().slice(-6000));
+    if (shibboleth) shibboleth.stop();
     if (VERBOSE) console.error(server.log());
   }
 
@@ -619,7 +1084,15 @@ async function main() {
     console.log(`  ${r.ok ? 'ok  ' : 'FAIL'} ${r.lib.padEnd(9)} ${r.name.padEnd(width)}  ${r.detail.replace(/\s+/g, ' ').slice(0, 140)}`);
   }
   const failures = results.filter((r) => !r.ok);
-  console.log(`\n${results.length - failures.length}/${results.length} passed`);
+  for (const x of skipped) console.log(`\n${x}`);
+  const byLib = {};
+  for (const r of results) {
+    byLib[r.lib] = byLib[r.lib] || { ok: 0, all: 0 };
+    byLib[r.lib].all++;
+    if (r.ok) byLib[r.lib].ok++;
+  }
+  console.log(`\n${Object.entries(byLib).map(([lib, c]) => `${lib} ${c.ok}/${c.all}`).join(' · ')}`);
+  console.log(`${results.length - failures.length}/${results.length} passed`);
   failed = failures.length > 0;
   fs.rmSync(tmp, { recursive: true, force: true });
   process.exit(failed ? 1 : 0);

@@ -25,6 +25,9 @@ use crate::util::{parse_form, value_to_string};
 pub const CAPACITY: usize = 500;
 /// The same limit axum applies to request bodies by default.
 pub(crate) const MAX_BODY: usize = 2 * 1024 * 1024;
+/// Decoded messages longer than this are cut short in the record.
+const MAX_RECORDED_XML: usize = 256 * 1024;
+
 /// Larger request bodies are passed on but not parsed for the record.
 const MAX_RECORDED_BODY: usize = 256 * 1024;
 
@@ -92,7 +95,10 @@ impl SamlNote {
         }
     }
 
-    pub fn attach(self, response: &mut Response) {
+    pub fn attach(mut self, response: &mut Response) {
+        for m in &mut self.messages {
+            m.xml = truncate_xml(std::mem::take(&mut m.xml));
+        }
         match response.extensions_mut().get_mut::<SamlNote>() {
             Some(existing) => {
                 existing.messages.extend(self.messages);
@@ -356,12 +362,15 @@ pub async fn record(State(state): State<AppState>, request: Request, next: Next)
                 binding: if redirect { "redirect" } else { "post" },
                 destination: None,
                 status: status.map(|s| s.short()),
-                xml,
+                xml: truncate_xml(xml),
             });
         }
     }
     let note = parts.extensions.get::<SamlNote>().cloned().unwrap_or_default();
-    sp = sp.or(note.sp.clone());
+    sp = sp.or(note.sp.clone()).or_else(|| {
+        // IdP-initiated links name the service provider in a parameter.
+        ["sp", "spEntityID", "providerId", "PartnerSpId"].iter().find_map(|k| raw_params.get(*k).cloned())
+    });
     let mut error = parts.extensions.get::<ErrorNote>().map(|n| (n.error.clone(), n.description.clone()));
     if error.is_none()
         && let Some(st) = &note.status
@@ -417,6 +426,18 @@ pub async fn record(State(state): State<AppState>, request: Request, next: Next)
         redirect,
     });
     Response::from_parts(parts, body)
+}
+
+fn truncate_xml(mut xml: String) -> String {
+    if xml.len() > MAX_RECORDED_XML {
+        let mut cut = MAX_RECORDED_XML;
+        while !xml.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        xml.truncate(cut);
+        xml.push_str("\n… (cut short)");
+    }
+    xml
 }
 
 fn strip_query(url: &str) -> String {

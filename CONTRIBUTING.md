@@ -4,7 +4,7 @@ Thanks for helping out. Bug reports, template fixes (an identity provider whose 
 
 ## Development
 
-You need a recent stable Rust toolchain. Node.js is needed for the interop tests and changesets.
+You need a recent stable Rust toolchain. Node.js and Docker are needed for the interop and conformance tests, and Node.js for changesets.
 
 ```sh
 cargo run                        # serve on http://localhost:9401
@@ -14,13 +14,13 @@ cargo fmt
 docker build -t localsaml .      # the release image
 ```
 
-CI runs `cargo fmt --check`, clippy with `-D warnings`, `cargo test` and the interop tests on every pull request.
+CI runs `cargo fmt --check`, clippy with `-D warnings`, `cargo test`, the interop tests and the SAML Conformance Test Kit on every pull request.
 
 - The login and assertion generator pages share `assets/app.js` and `assets/app.css`. Both are compiled into the binary, so rebuild after changing them.
 - Identity provider templates (attribute names, NameIDs, signing, XML style and endpoint paths) live in `src/presets.rs`. Their endpoint paths are mounted by `src/routes/providers.rs`.
 - XML signatures and canonicalization are in `src/xml.rs` and `src/dsig.rs`, and encryption is in `src/xmlenc.rs`. They only need to handle what SAML uses, but must agree byte for byte with other implementations, so change them carefully and run the interop tests.
 
-If you change protocol behaviour or anything that touches the XML, run the [interop tests](interop/README.md) (`cd interop && npm ci && npm test`) as well.
+If you change protocol behaviour or anything that touches the XML, run the [interop tests](interop/README.md) (`cd interop && npm ci && npm test`) and the [conformance kit](interop/codice/README.md) (`interop/codice/run.sh`) as well. If a conformance test starts or stops failing, update `interop/codice/expected-failures.tsv` with the reason.
 
 ## Changesets
 

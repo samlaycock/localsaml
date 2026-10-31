@@ -22,7 +22,6 @@ fn issuer_routes() -> Router<AppState> {
         .route("/sso", any(sso::endpoint))
         .route("/sso/initiate", get(sso::initiate))
         .route("/login", post(sso::login))
-        .route("/send", post(sso::send_reviewed))
         .route("/slo", any(sso::endpoint))
         .route("/slo/initiate", get(slo::initiate))
         .route("/sp", get(testsp::home))

@@ -103,6 +103,11 @@ pub fn signature_of(el: &Element) -> Option<&Element> {
 /// `keys`. The reference must point at that element, so a signature over some other part of the
 /// document (signature wrapping) doesn't count.
 pub fn verify(root: &Element, id: &str, keys: &[RsaPublicKey]) -> Result<Verified, String> {
+    // With two elements sharing the ID, the one verified might not be the one the caller reads
+    // (XML signature wrapping).
+    if root.count_id(id) > 1 {
+        return Err(format!("more than one element has ID '{id}' (signature wrapping?)"));
+    }
     let (target, outer) = root.find_by_id_scoped(id).ok_or_else(|| format!("no element with ID '{id}'"))?;
     let signature = signature_of(target).ok_or("not signed")?;
     let inside = target.scope_within(&outer);
@@ -192,6 +197,14 @@ pub fn urlencode(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
+/// The first SAML binding parameter that appears more than once in a raw query string. A
+/// duplicate could make the message that's verified differ from the one that's processed.
+pub fn duplicate_param(raw: &str) -> Option<&'static str> {
+    ["SAMLRequest", "SAMLResponse", "RelayState", "SigAlg", "Signature"]
+        .into_iter()
+        .find(|name| raw.split('&').filter(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p) == *name).count() > 1)
+}
+
 /// A redirect-binding signature found in a query string.
 #[derive(Debug, Clone)]
 pub struct QuerySignature {
@@ -273,6 +286,9 @@ mod tests {
         let tampered = parse(&root.to_xml().replace("jane &amp; co", "admin")).unwrap();
         assert!(verify(&tampered, "_a", &keys).unwrap_err().contains("digest"));
         assert!(verify(&tampered, "_r", &keys).unwrap_err().contains("digest"));
+        // A second element with the same ID (a wrapping attack) is refused.
+        let wrapped = root.to_xml().replacen("<Subject>", r#"<Subject><Assertion ID="_a"/>"#, 1);
+        assert!(verify(&parse(&wrapped).unwrap(), "_a", &keys).unwrap_err().contains("more than one"));
         // An unrelated key doesn't verify.
         let other = crate::keys::KeyPair::generate().unwrap();
         assert!(verify(&parsed, "_a", &[other.public]).is_err());
@@ -284,6 +300,8 @@ mod tests {
         let sig = QuerySignature::from_query(&format!("{query}&extra=1")).unwrap();
         assert!(sig.signed.starts_with("SAMLRequest=abc%2B&RelayState=x%20y&SigAlg="));
         assert!(sig.verify(&[key().public.clone()]).is_ok());
+        assert_eq!(duplicate_param(&query), None);
+        assert_eq!(duplicate_param(&format!("{query}&SAMLRequest=other")), Some("SAMLRequest"));
         let bad = QuerySignature::from_query(&query.replace("abc", "abd")).unwrap();
         assert!(bad.verify(&[key().public.clone()]).is_err());
     }

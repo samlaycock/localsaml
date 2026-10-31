@@ -310,7 +310,9 @@ pub async fn initiate(
         remaining: session.participants.clone(),
         waiting_on: None,
         results: vec![],
-        return_to: non_empty(&params, "return_to"),
+        // A local path or an http(s) URL; anything else (javascript:, …) is dropped.
+        return_to: non_empty(&params, "return_to")
+            .filter(|r| (r.starts_with('/') && !r.starts_with("//")) || crate::util::is_web_url(r)),
     };
     let ours = crate::routes::sso::cookie_value(&headers, &tenant.cookie_name()).as_deref() == Some(sid.as_str());
     let mut resp = advance(&state, &tenant, logout).await;

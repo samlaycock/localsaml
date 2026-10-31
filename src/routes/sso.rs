@@ -69,6 +69,11 @@ pub async fn find_sp(state: &AppState, tenant: &Tenant, entity_id: &str) -> Opti
         return Some(crate::routes::testsp::service_provider(state, tenant));
     }
     if let Some(sp) = state.service_provider(entity_id) {
+        // A declared SP whose metadata URL wasn't reachable yet: try again now it's in use.
+        if sp.metadata_pending {
+            state.refresh_metadata().await;
+            return state.service_provider(entity_id);
+        }
         return Some(sp);
     }
     if state.has_pending_metadata() {
@@ -163,6 +168,14 @@ pub async fn endpoint(
     body: Bytes,
 ) -> Response {
     let query = query.unwrap_or_default();
+    if let Some(param) = dsig::duplicate_param(&query) {
+        return error_page(
+            &tenant,
+            StatusCode::BAD_REQUEST,
+            "Duplicate parameter",
+            &format!("{param} appears more than once in the query string."),
+        );
+    }
     let in_query = parse_form(query.as_bytes());
     let form = parse_form(&body);
     let params = merged_params(Some(&query), &body);
@@ -210,6 +223,14 @@ pub async fn endpoint(
         Message::LogoutResponse(resp) => {
             crate::routes::slo::logout_response(&state, &tenant, resp, &root, arrival).await
         }
+    }
+}
+
+/// Do two URLs name the same place (ignoring case in the host, default ports, a trailing slash)?
+fn same_url(a: &str, b: &str) -> bool {
+    match (url::Url::parse(a.trim_end_matches('/')), url::Url::parse(b.trim_end_matches('/'))) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
     }
 }
 
@@ -292,8 +313,8 @@ async fn authn_request(
             }
         },
     };
-    if url::Url::parse(&acs_url).is_err() {
-        return bad("Invalid AssertionConsumerServiceURL", &format!("'{acs_url}' is not an absolute URL."));
+    if !crate::util::is_web_url(&acs_url) {
+        return bad("Invalid AssertionConsumerServiceURL", &format!("'{acs_url}' is not an absolute http(s) URL."));
     }
 
     let preset = preset_for(state, tenant, &sp);
@@ -303,10 +324,8 @@ async fn authn_request(
     {
         warnings.push(format!("ProtocolBinding {b} isn't supported; the Response is sent with HTTP-POST."));
     }
-    if let Some(d) = &req.destination
-        && d != &arrival.url
-    {
-        warnings.push(format!("Destination is '{d}', but the request was sent to '{}'.", arrival.url));
+    if arrival.relay_state.as_ref().is_some_and(|r| r.len() > 80) {
+        warnings.push("RelayState is longer than the 80 bytes SAML allows service providers to send.".into());
     }
     if let Some(t) = req.issue_instant
         && (t - state.now()).abs() > 300
@@ -336,6 +355,8 @@ async fn authn_request(
         sp_name_qualifier: req.sp_name_qualifier.clone(),
         requested_authn_contexts: req.requested_authn_contexts.clone(),
         login_hint: req.subject.clone().or_else(|| non_empty(&arrival.params, "login_hint")),
+        subject: req.subject.clone(),
+        subject_format: req.subject_format.clone(),
         binding: arrival.binding.into(),
         signature: signature.describe(),
         warnings,
@@ -346,6 +367,20 @@ async fn authn_request(
         let status =
             Status::parse("RequestVersionTooHigh", Some(format!("unsupported SAML version '{}'", req.version)));
         return respond_status(state, tenant, preset, &sp, &pending, status.unwrap_or_else(|_| Status::success()));
+    }
+    // A request whose Destination isn't where it was sent must be discarded (Core 3.2.1).
+    if let Some(d) = &req.destination
+        && !same_url(d, &arrival.url)
+    {
+        let message = format!("Destination is '{d}', but the request was sent to '{}'", arrival.url);
+        return respond_status(
+            state,
+            tenant,
+            preset,
+            &sp,
+            &pending,
+            Status::parse("Requester", Some(message)).unwrap(),
+        );
     }
     proceed(state, tenant, headers, preset, &sp, pending, &arrival.params).await
 }
@@ -439,7 +474,8 @@ async fn proceed(
 
     let session = current_session(state, tenant, headers);
     let reuse = |s: &Session| s.tenant == tenant.key();
-    if pending.is_passive {
+    // Auto-login needs no interaction, so it can answer passive requests too (below).
+    if pending.is_passive && !state.config.auto_login {
         return match session {
             Some((sid, s)) if reuse(&s) && !pending.force_authn => {
                 let p = presets::get_or_generic(&s.identity.preset);
@@ -562,7 +598,7 @@ pub fn delivery(state: &AppState, preset: &Preset, sp: &ServiceProvider) -> Resu
         Some(false) => None,
         explicit => match sp.encryption_key() {
             Some(Ok(key)) if explicit == Some(true) || preset.encrypt_when_possible => {
-                Some((key, sp.encryption_algorithm.unwrap_or_default()))
+                Some((key, sp.encryption_algorithm.unwrap_or(preset.encryption)))
             }
             Some(Err(e)) if explicit == Some(true) => return Err(format!("can't encrypt for {}: {e}", sp.label())),
             None if explicit == Some(true) => {
@@ -664,6 +700,13 @@ pub fn complete(
             },
         ),
     };
+    // An AuthnRequest naming a Subject gets an assertion about that subject (Profiles 4.1.4.1).
+    if let Some(subject) = &pending.subject {
+        identity.name_id = subject.clone();
+        if let Some(format) = &pending.subject_format {
+            identity.name_id_format = format.clone();
+        }
+    }
     session.identity = identity.clone();
     finish_name_id_for(&mut identity, preset, &pending.sp, &session.session_index);
     session.participants.retain(|p| p.entity_id != pending.sp);
@@ -732,7 +775,12 @@ pub fn complete(
     } else {
         saml_post(&pending.acs_url, "SAMLResponse", &encoded, pending.relay_state.as_deref()).into_response()
     };
-    SamlNote::sent(&pending.sp, "Response", "post", &pending.acs_url, pretty, None).attach(&mut resp);
+    let kind = if pending.tampers.is_empty() {
+        "Response".to_string()
+    } else {
+        format!("Response [{}]", pending.tampers.iter().map(|t| t.name()).collect::<Vec<_>>().join(", "))
+    };
+    SamlNote::sent(&pending.sp, &kind, "post", &pending.acs_url, pretty, None).attach(&mut resp);
     set_cookie(&mut resp, &session_cookie(tenant, &sid, state.config.session_ttl));
     resp
 }
@@ -748,7 +796,7 @@ fn review_page(tenant: &Tenant, pending: &Pending, encoded: &str, pretty: &str) 
   <div class="eyebrow">Review</div>
   <h1>Response for <span class="accent">{sp}</span></h1>
   <p class="muted">This is what will be posted to <code>{acs}</code>. Nothing has been sent yet.</p>
-  <form method="post" action="{acs}" class="actions">
+  <form method="POST" action="{acs}" class="actions">
     <input type="hidden" name="SAMLResponse" value="{encoded}">{relay}
     <button class="btn primary" type="submit">Send to the service provider</button>
   </form>
@@ -761,15 +809,6 @@ fn review_page(tenant: &Tenant, pending: &Pending, encoded: &str, pretty: &str) 
         xml = xml_block("SAML Response", pretty),
     );
     page(tenant, "Review response", &body).into_response()
-}
-
-/// Send a Response that was shown for review (kept for clients that post the review form here).
-pub async fn send_reviewed(body: Bytes) -> Response {
-    let form = parse_form(&body);
-    let (Some(acs), Some(message)) = (form.get("acs"), form.get("SAMLResponse")) else {
-        return (StatusCode::BAD_REQUEST, "acs and SAMLResponse are required").into_response();
-    };
-    saml_post(acs, "SAMLResponse", message, form.get("RelayState").map(String::as_str)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -819,6 +858,9 @@ async fn start_idp_initiated(
         },
     };
     let acs_url = match non_empty(params, "acs").or_else(|| sp.default_acs().cloned()) {
+        Some(a) if !crate::util::is_web_url(&a) => {
+            return bad("Invalid ACS URL", &format!("'{a}' is not an absolute http(s) URL."));
+        }
         Some(a) if sp.allows_acs(&a) => a,
         Some(a) => return bad("Unregistered ACS URL", &format!("'{a}' isn't one of {}'s ACS URLs.", sp.label())),
         None => {
@@ -844,6 +886,8 @@ async fn start_idp_initiated(
         sp_name_qualifier: None,
         requested_authn_contexts: vec![],
         login_hint: non_empty(params, "login_hint"),
+        subject: None,
+        subject_format: None,
         binding: "idp-initiated".into(),
         signature: "no request (IdP-initiated)".into(),
         warnings: vec![],
@@ -1061,6 +1105,14 @@ pub async fn login(State(state): State<AppState>, tenant: Tenant, headers: Heade
             "This sign-in request is no longer valid. Start the login again from your application.",
         );
     };
+    if pending.tenant != tenant.key() {
+        return error_page(
+            &tenant,
+            StatusCode::BAD_REQUEST,
+            "Wrong identity provider",
+            "This sign-in request was started at another of localsaml's identity providers. Start the login again.",
+        );
+    }
     let sp = match resolve_sp(&state, &tenant, &pending.sp).await {
         Ok(sp) => sp,
         Err(e) => return error_page(&tenant, StatusCode::BAD_REQUEST, "Unknown service provider", &e),

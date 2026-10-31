@@ -1,0 +1,11 @@
+# Tests expected to fail in strict mode (./run.sh), one per line: name<TAB>category<TAB>reason.
+# Categories: kit = the kit expects something the spec doesn't require or that no IdP can do;
+# spec = localsaml deviates from the specification; design = deliberate localsaml behaviour.
+# LENIENT=1 ./run.sh (HTTP error pages allowed) passes the first three.
+Profiles 4.1.4.1: Empty POST AuthnRequest Test	kit	An AuthnRequest with no ID, Version or Issuer has no service provider to send an error Response to, so localsaml shows an error page. The kit only accepts that in lenient mode; it also wants HTTP 200 (Bindings 3.5.6), and localsaml answers 400. Strictly, Bindings 3.4.6/3.5.6 say SAML failures MUST NOT use HTTP error codes; localsaml keeps 400 so scripts and tests can tell an error page from a login page.
+Profiles 4.1.4.1: Empty Redirect AuthnRequest Test	kit	As above, for the Redirect binding (Bindings 3.4.6).
+Bindings 3.4.3: Redirect Incomplete AuthnRequest In URL Query Test	kit	A truncated SAMLRequest can't be decoded, so there's no service provider to answer; localsaml shows an error page with HTTP 400.
+Bindings 3.5.3: POST AuthnRequest With Relay State Greater Than 80 Bytes Test	kit	Bindings 3.5.3 says RelayState MUST NOT exceed 80 bytes, a rule for the sender. The kit expects the IdP to reject it with a Requester error; localsaml accepts it and returns it unchanged, as most IdPs do.
+Bindings 3.4.3: Redirect AuthnRequest With Relay State Greater Than 80 Bytes Test	kit	As above, for the Redirect binding (Bindings 3.4.3).
+Profiles 4.1.4.1: POST AuthnRequest With Subject Containing an Invalid Name ID Test	design	The request names the subject "UNKNOWN NAME ID VALUE". Profiles 4.1.4.1 allows either an assertion about that subject or an error; localsaml issues the assertion, because any subject can sign in by design. The kit only accepts the error.
+Profiles 4.1.4.1: Redirect AuthnRequest With Subject Containing an Invalid Name ID Test	design	As above, for the Redirect binding.

@@ -79,7 +79,8 @@ fn options<'a>(items: impl IntoIterator<Item = &'a str>, selected: &str) -> Stri
     items
         .into_iter()
         .map(|v| {
-            let label = v.rsplit(':').next().unwrap_or(v);
+            // urn:…:emailAddress → emailAddress; http://…/multipleauthn → multipleauthn
+            let label = if v.starts_with("urn:") { v.rsplit(':').next() } else { v.rsplit('/').next() }.unwrap_or(v);
             let sel = if v == selected { " selected" } else { "" };
             format!(r#"<option value="{}"{sel}>{}</option>"#, esc(v), esc(if v.is_empty() { "(none)" } else { label }))
         })
@@ -250,6 +251,7 @@ struct Outcome {
     attributes: Vec<(String, Option<String>, Vec<String>)>,
     response_xml: String,
     assertion_xml: Option<String>,
+    assertion_id: Option<String>,
 }
 
 fn validate(state: &AppState, tenant: &Tenant, xml: &str, expected_request: Option<&str>) -> Outcome {
@@ -261,6 +263,7 @@ fn validate(state: &AppState, tenant: &Tenant, xml: &str, expected_request: Opti
         attributes: vec![],
         response_xml: xml.to_string(),
         assertion_xml: None,
+        assertion_id: None,
     };
     let now = wall_clock();
     let acs = tenant.url("/sp/acs");
@@ -361,6 +364,7 @@ fn validate(state: &AppState, tenant: &Tenant, xml: &str, expected_request: Opti
     };
     out.assertion_xml = (!std::ptr::eq(assertion_doc, &doc)).then(|| assertion.to_pretty());
     let assertion_id = assertion.get_attr("ID").unwrap_or_default().to_string();
+    out.assertion_id = Some(assertion_id.clone());
     if dsig::signature_of(assertion).is_some() {
         match dsig::verify(assertion_doc, &assertion_id, &keys) {
             Ok(v) => {
@@ -378,7 +382,8 @@ fn validate(state: &AppState, tenant: &Tenant, xml: &str, expected_request: Opti
     if let Some(i) = assertion.find(NS_ASSERTION, "Issuer").map(Element::value) {
         checks.check(i == tenant.entity_id, "Assertion Issuer", i);
     }
-    let fresh = seen().lock().unwrap().insert(assertion_id.clone());
+    // Only accepted assertions are consumed: a rejected response doesn't use its ID up.
+    let fresh = !seen().lock().unwrap().contains(&assertion_id);
     checks.check(
         fresh,
         "Replay",
@@ -409,7 +414,8 @@ fn validate(state: &AppState, tenant: &Tenant, xml: &str, expected_request: Opti
             let recipient = data.get_attr("Recipient").unwrap_or("");
             checks.check(recipient == acs, "Recipient", recipient.to_string());
             if let Some((raw, t)) = time(Some(data), "NotOnOrAfter") {
-                checks.check(t.is_some_and(|t| now < t + SKEW), "Confirmation NotOnOrAfter", raw);
+                let ok = t.is_some_and(|t| now < t + SKEW);
+                checks.check(ok, "Confirmation NotOnOrAfter", if ok { raw } else { format!("{raw}: expired") });
             }
             if let (Some(irt), Some(want)) = (data.get_attr("InResponseTo"), expected_request) {
                 checks.check(irt == want, "Confirmation InResponseTo", irt.to_string());
@@ -482,6 +488,9 @@ pub async fn acs(State(state): State<AppState>, tenant: Tenant, headers: HeaderM
     let expected = cookie_value(&headers, &request_cookie_name(&tenant));
     let outcome = validate(&state, &tenant, &xml, expected.as_deref());
     let passed = outcome.checks.passed();
+    if passed && let Some(id) = &outcome.assertion_id {
+        seen().lock().unwrap().insert(id.clone());
+    }
     let attrs: String = outcome
         .attributes
         .iter()
@@ -595,6 +604,14 @@ pub async fn logout(State(state): State<AppState>, tenant: Tenant, headers: Head
 /// IdP when another service provider starts a logout.
 pub async fn slo(State(state): State<AppState>, tenant: Tenant, RawQuery(q): RawQuery, body: Bytes) -> Response {
     let query = q.unwrap_or_default();
+    if let Some(param) = dsig::duplicate_param(&query) {
+        return crate::html::error_page(
+            &tenant,
+            StatusCode::BAD_REQUEST,
+            "Duplicate parameter",
+            &format!("{param} appears more than once in the query string."),
+        );
+    }
     let params: HashMap<String, String> = crate::util::merged_params(Some(&query), &body);
     let in_query = parse_form(query.as_bytes());
     let found = ["SAMLRequest", "SAMLResponse"]

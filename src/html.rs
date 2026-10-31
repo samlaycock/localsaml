@@ -88,7 +88,10 @@ fn faults_banner(tenant: &Tenant) -> String {
 
 /// Embed JSON for the page script.
 pub fn data_script(v: &Value) -> String {
-    format!(r#"<script type="application/json" id="lo-data">{}</script>"#, v.to_string().replace("</", "<\\/"))
+    format!(
+        r#"<script type="application/json" id="lo-data">{}</script>"#,
+        v.to_string().replace('<', "\\u003c").replace('>', "\\u003e").replace('&', "\\u0026")
+    )
 }
 
 pub fn error_page(tenant: &Tenant, status: StatusCode, title: &str, detail: &str) -> Response {
@@ -121,7 +124,7 @@ pub fn saml_post(action: &str, param: &str, message_b64: &str, relay_state: Opti
     Html(format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><title>Posting to the service provider · localsaml</title>
 <style>body{{font:14px system-ui,sans-serif;color:#64748b;display:grid;place-items:center;height:90vh}}</style></head>
-<body onload="document.forms[0].submit()"><form method="post" action="{action}"><input type="hidden" name="{param}" value="{message}">{relay}
+<body onload="document.forms[0].submit()"><form method="POST" action="{action}"><input type="hidden" name="{param}" value="{message}">{relay}
 <p>Sending the SAML {kind} to <code>{action}</code>…</p><noscript><button type="submit">Continue</button></noscript></form></body></html>"#,
         action = esc(action),
         param = esc(param),

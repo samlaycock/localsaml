@@ -113,7 +113,10 @@ pub async fn mint(state: &AppState, tenant: &Tenant, req: MintRequest) -> Result
             let preset = explicit.unwrap_or(fallback);
             let mut identity = preset.default_identity();
             if req.defaults == Some(false) {
+                // No template attributes, so nothing for the NameID to follow: it's derived from
+                // the given attributes (or generated) instead.
                 identity.attributes.clear();
+                identity.name_id.clear();
             }
             (preset, identity)
         }
@@ -151,8 +154,8 @@ pub async fn mint(state: &AppState, tenant: &Tenant, req: MintRequest) -> Result
         .clone()
         .or_else(|| sp.default_acs().cloned())
         .ok_or_else(|| invalid(format!("{} has no ACS URL; pass acs_url", sp.label())))?;
-    if url::Url::parse(&acs_url).is_err() {
-        return Err(invalid(format!("acs_url '{acs_url}' is not an absolute URL")));
+    if !crate::util::is_web_url(&acs_url) {
+        return Err(invalid(format!("acs_url '{acs_url}' is not an absolute http(s) URL")));
     }
     let mut d = delivery(state, preset, &sp).map_err(invalid)?;
     if let Some(v) = req.sign_response {
@@ -168,7 +171,8 @@ pub async fn mint(state: &AppState, tenant: &Tenant, req: MintRequest) -> Result
         Some(false) => d.encrypt = None,
         Some(true) => match sp.encryption_key() {
             Some(Ok(key)) => {
-                d.encrypt = Some((key, req.encryption_algorithm.or(sp.encryption_algorithm).unwrap_or_default()))
+                d.encrypt =
+                    Some((key, req.encryption_algorithm.or(sp.encryption_algorithm).unwrap_or(preset.encryption)))
             }
             Some(Err(e)) => return Err(invalid(format!("can't encrypt for {}: {e}", sp.label()))),
             None => return Err(invalid(format!("{} has no encryption certificate to encrypt for", sp.label()))),

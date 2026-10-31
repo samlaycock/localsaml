@@ -142,6 +142,11 @@ pub fn parse_iso8601(s: &str) -> Option<i64> {
     Some(days * 86_400 + h * 3600 + min * 60 + sec as i64 - offset)
 }
 
+/// An absolute `http(s)` URL: the only kind localsaml will post or redirect a browser to.
+pub fn is_web_url(s: &str) -> bool {
+    url::Url::parse(s).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+}
+
 pub fn parse_form(bytes: &[u8]) -> HashMap<String, String> {
     url::form_urlencoded::parse(bytes).into_owned().collect()
 }

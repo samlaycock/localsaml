@@ -104,7 +104,9 @@ impl ServiceProvider {
             anyhow::bail!("entity_id is required (or metadata to read it from)");
         }
         for url in self.acs_urls.iter().chain(&self.slo_url).chain(&self.slo_response_url) {
-            url::Url::parse(url).map_err(|e| anyhow::anyhow!("'{url}' is not an absolute URL: {e}"))?;
+            if !crate::util::is_web_url(url) {
+                anyhow::bail!("'{url}' is not an absolute http(s) URL");
+            }
         }
         if let Some(b) = &self.slo_binding
             && b != "redirect"

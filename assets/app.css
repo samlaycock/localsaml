@@ -319,3 +319,14 @@ pre.code.wrap { white-space: pre-wrap; word-break: break-all; max-height: 220px;
 .name-id-row input { flex: 1; }
 .auto-tag { font-size: 11px; color: var(--muted); white-space: nowrap; }
 .result-chips { margin: 4px 0 12px; }
+
+/* A row of checkboxes in a form grid gets the whole row. */
+.opts > .checks { grid-column: 1 / -1; flex-wrap: wrap; }
+.result .kv { margin-top: 4px; }
+.token-head .btn { margin-left: auto; }
+.snippet { margin-top: 14px; }
+@media (max-width: 700px) {
+  .topbar { flex-wrap: wrap; gap: 6px 16px; padding: 10px 16px; }
+  .topbar nav { margin-left: 0; width: 100%; gap: 14px; overflow-x: auto; }
+  .topbar nav a { white-space: nowrap; }
+}
