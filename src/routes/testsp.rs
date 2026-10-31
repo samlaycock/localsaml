@@ -545,7 +545,14 @@ pub async fn attributes(State(state): State<AppState>, tenant: Tenant, headers: 
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
     let sent = query.to_pretty();
-    let resp = crate::routes::backchannel::dispatch(&state, &tenant, &Bytes::from(crate::soap::envelope(query))).await;
+    let resp = crate::routes::backchannel::dispatch(
+        &state,
+        &tenant,
+        &HeaderMap::new(),
+        &tenant.url("/attribute"),
+        &Bytes::from(crate::soap::envelope(query)),
+    )
+    .await;
     let answer = match axum::body::to_bytes(resp.into_body(), 4 << 20).await {
         Ok(b) => crate::soap::unwrap(&String::from_utf8_lossy(&b)),
         Err(e) => Err(e.to_string()),
@@ -584,7 +591,14 @@ async fn resolve_artifact(state: &AppState, tenant: &Tenant, artifact: &str) -> 
         return (checks, Err(e));
     }
     let envelope = crate::soap::envelope(resolve);
-    let resp = crate::routes::backchannel::dispatch(state, tenant, &Bytes::from(envelope)).await;
+    let resp = crate::routes::backchannel::dispatch(
+        state,
+        tenant,
+        &HeaderMap::new(),
+        &tenant.url("/artifact"),
+        &Bytes::from(envelope),
+    )
+    .await;
     let body = match axum::body::to_bytes(resp.into_body(), 4 << 20).await {
         Ok(b) => String::from_utf8_lossy(&b).into_owned(),
         Err(e) => return (checks, Err(format!("reading the ArtifactResponse: {e}"))),

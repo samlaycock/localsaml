@@ -43,7 +43,8 @@ pub fn document(state: &AppState, tenant: &Tenant, signed: bool) -> Result<Strin
         idp = idp.child(md("NameIDFormat").text(*f));
     }
     let sso = tenant.sso_url();
-    for binding in [BINDING_REDIRECT, BINDING_POST] {
+    // SOAP: ECP clients relay AuthnRequests there.
+    for binding in [BINDING_REDIRECT, BINDING_POST, BINDING_SOAP] {
         idp = idp.child(md("SingleSignOnService").attr("Binding", binding).attr("Location", &sso));
     }
     // The attribute authority: AttributeQuery over SOAP.

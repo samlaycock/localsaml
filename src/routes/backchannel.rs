@@ -2,7 +2,8 @@
 //! directly, without the browser.
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{OriginalUri, State};
+use axum::http::HeaderMap;
 use axum::response::Response;
 
 use crate::inspector::SamlNote;
@@ -19,18 +20,27 @@ use crate::tenant::Tenant;
 use crate::xml::{Element, parse};
 
 /// The ArtifactResolutionService (and any other SOAP message).
-pub async fn endpoint(State(state): State<AppState>, tenant: Tenant, body: Bytes) -> Response {
-    dispatch(&state, &tenant, &body).await
+pub async fn endpoint(
+    State(state): State<AppState>,
+    tenant: Tenant,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
+) -> Response {
+    let url = format!("{}{}", crate::routes::sso::origin(&tenant.base), uri.path());
+    dispatch(&state, &tenant, &headers, &url, &body).await
 }
 
 /// Dispatch a SOAP request on a SAML endpoint by the message in its Body.
-pub async fn dispatch(state: &AppState, tenant: &Tenant, body: &Bytes) -> Response {
+pub async fn dispatch(state: &AppState, tenant: &Tenant, headers: &HeaderMap, url: &str, body: &Bytes) -> Response {
     let xml = String::from_utf8_lossy(body);
     let (envelope, message) = match soap::unwrap(&xml) {
         Ok(m) => m,
         Err(e) => return soap::fault(true, &e),
     };
     match saml::parse_element(&message) {
+        // ECP: an AuthnRequest relayed by an enhanced client, which authenticates with HTTP Basic.
+        Ok(Message::AuthnRequest(req)) => crate::routes::sso::ecp(state, tenant, headers, req, &message, url).await,
         Ok(Message::LogoutRequest(req)) => crate::routes::slo::soap_logout_request(state, tenant, &envelope, req).await,
         Ok(Message::ArtifactResolve(req)) => artifact_resolve(state, tenant, &envelope, req).await,
         Ok(Message::AttributeQuery(req)) => attribute_query(state, tenant, &envelope, req).await,

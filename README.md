@@ -93,7 +93,7 @@ To make localsaml look like a specific identity provider, use that template's is
 | What | Where |
 |---|---|
 | Metadata | `/metadata` (`?signed=true` for signed metadata) |
-| Single sign-on (HTTP-Redirect, HTTP-POST) | `/sso` |
+| Single sign-on (HTTP-Redirect, HTTP-POST; SOAP for ECP) | `/sso` |
 | Single logout (HTTP-Redirect, HTTP-POST, SOAP) | `/slo` |
 | Artifact resolution (SOAP) | `/artifact` |
 | Attribute queries (SOAP) | `/attribute` |
@@ -127,10 +127,11 @@ Every template issuer serves the same endpoints under `/p/<template>`, plus that
 - **NameIDs:** the template's format by default, or the one `NameIDPolicy` asks for. Email-address NameIDs follow the email attribute. Persistent NameIDs are pairwise (stable per user and service provider, like Entra ID's and Shibboleth's), and transient ones are new each session. You can also type any NameID in the login form.
 - **Sessions:** a cookie per issuer. With `--silent-sso` a second service provider gets an assertion without seeing the login page, like a production IdP. Otherwise the login page offers the active session as a one-click option, so you can still change identities. `ForceAuthn` always shows the login page and restarts the `AuthnInstant`.
 - **IdP-initiated SSO:** unsolicited Responses (no `InResponseTo`) to a service provider's default ACS URL, with a `RelayState`. The template aliases work too, e.g. Shibboleth's `/idp/profile/SAML2/Unsolicited/SSO?providerId=…` and PingFederate's `/idp/startSSO.ping?PartnerSpId=…`.
+- **ECP:** enhanced clients (Profiles 4.2) relay a service provider's PAOS AuthnRequest to `/sso` in a SOAP envelope, with HTTP Basic credentials: a declared user's id, email or NameID, or any other login, which pre-fills the template's identity like a login hint. Any password is accepted, and a missing `Authorization` header gets a 401 asking for one. The AuthnRequest is checked like any other, and the Response comes back in a SOAP envelope with an `ecp:Response` header naming the ACS. Errors that would be pages in a browser are SOAP faults. Declare an SP's PAOS ACSs with `acs_ecp_urls` (they're read from its metadata too).
 - **Attribute queries:** localsaml is also an attribute authority (`AttributeAuthorityDescriptor` in the metadata). A service provider POSTs an `AttributeQuery` in a SOAP envelope to `/attribute` and gets a Response with an assertion about the NameID it asked about: the attributes of the session in which it was given that NameID, or of the declared user with it, filtered to the attributes (and values) the query names. The assertion is signed (and encrypted, like that SP's assertions), with a sender-vouches `SubjectConfirmation` for that SP and no `AuthnStatement`. An unknown NameID gets `UnknownPrincipal`. A signed query is verified against the SP's certificate. The test SP has a **Query attributes** button.
 - **[Single logout](#single-logout):** SP-initiated and IdP-initiated. Every other service provider in the session is sent a signed LogoutRequest in turn, then the initiator gets a LogoutResponse (`PartialLogout` if some didn't answer `Success`).
 
-**Not implemented:** ECP/PAOS, IdP proxying, and AuthnRequests sent by artifact. A request asking for any other response binding gets an HTTP-POST Response, with a warning.
+**Not implemented:** IdP proxying, and AuthnRequests sent by artifact. A request asking for any other response binding gets an HTTP-POST Response, with a warning.
 
 ### HTTP-Artifact
 
@@ -355,6 +356,7 @@ acs_urls = ["http://localhost:3000/saml/acs"]   # enforced; the first is the def
 slo_url = "http://localhost:3000/saml/slo"      # notified on single logout
 slo_soap_url = "http://localhost:3000/saml/soap" # or back-channel, over SOAP
 # acs_artifact_urls = ["http://localhost:3000/saml/artifact"]  # HTTP-Artifact ACSs
+# acs_ecp_urls = ["http://localhost:3000/saml/ecp"]            # PAOS ACSs (ECP)
 # response_binding = "artifact"                 # post (default) or artifact
 certificate = """-----BEGIN CERTIFICATE-----
 …
@@ -365,7 +367,7 @@ encrypt_assertions = true
 sign_response = true                            # override the template
 ```
 
-- Settings can come from the service provider's metadata instead. Use `metadata_url` (fetched at startup, and again on the service provider's first request if it wasn't up yet), `metadata_file` or inline `metadata`. Explicit settings win. The metadata provides the entity ID, HTTP-POST and HTTP-Artifact ACS URLs and their indexes (and the default ACS's binding), the SLO endpoint and binding, signing and encryption certificates, `AuthnRequestsSigned`, `WantAssertionsSigned` and the NameID format.
+- Settings can come from the service provider's metadata instead. Use `metadata_url` (fetched at startup, and again on the service provider's first request if it wasn't up yet), `metadata_file` or inline `metadata`. Explicit settings win. The metadata provides the entity ID, HTTP-POST, HTTP-Artifact and PAOS ACS URLs and their indexes (and the default ACS's binding), the SLO endpoint and binding, signing and encryption certificates, `AuthnRequestsSigned`, `WantAssertionsSigned` and the NameID format.
 - `POST /dev/api/service-providers` registers one at runtime, from metadata XML (the request body) or JSON with the same fields as above, including `metadata_url`. Registered service providers are saved in the state database. `GET` lists them all, `DELETE ?entity_id=…` removes one and `DELETE` without it removes every registered one. The `/dev` page has the same controls.
 
 Named identities go in `[[users]]`. See [Declared users](#declared-users).

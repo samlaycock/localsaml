@@ -133,6 +133,7 @@ ${extra}`);
 entity_id = "${entity}"
 acs_urls = ["${SHIB}${prefix}/Shibboleth.sso/SAML2/POST"]
 acs_artifact_urls = ["${SHIB}${prefix}/Shibboleth.sso/SAML2/Artifact"]
+acs_ecp_urls = ["${SHIB}${prefix}/Shibboleth.sso/SAML2/ECP"]
 slo_url = "${SHIB}${prefix}/Shibboleth.sso/SLO/Redirect"
 want_authn_requests_signed = true
 encrypt_assertions = ${encrypt}
@@ -268,6 +269,7 @@ async function metadataOf(base) {
     certs: certs.map(pem),
     sso: location('SingleSignOnService', 'HTTP-Redirect'),
     ssoPost: location('SingleSignOnService', 'HTTP-POST'),
+    ssoSoap: location('SingleSignOnService', 'SOAP'),
     slo: location('SingleLogoutService', 'HTTP-Redirect'),
   };
 }
@@ -1050,7 +1052,7 @@ function shibConfig(issuers) {
   // reloadChanges: the key-rotation checks replace a metadata file to show the SP the new certificate.
   const metadata = issuers.map((i) => `      <MetadataProvider type="XML" validate="false" reloadChanges="true" path="idp-${i.id}.xml"/>`).join('\n');
   const sessions = (handlerURL) => `<Sessions lifetime="28800" timeout="3600" relayState="ss:mem" checkAddress="false" handlerURL="${handlerURL}" handlerSSL="false" cookieProps="http" redirectLimit="none">
-      <SSO>SAML2</SSO>
+      <SSO ECP="true">SAML2</SSO>
       <Logout>SAML2 Local</Logout>
       <SessionInitiator type="SAML2" Location="/LoginPost" outgoingBindings="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" template="bindingTemplate.html"/>
       <Handler type="MetadataGenerator" Location="/Metadata" signing="false"/>
@@ -1236,6 +1238,39 @@ async function runShibboleth(issuer, keys) {
     const replay = await new Browser().get(acs);
     assert(replay.status !== 302, `a replayed artifact was accepted: ${replay.status} ${replay.headers.get('location')}`);
     return `nameid ${email}; replay refused`;
+  });
+  await check(name, 'shibboleth', 'ECP: the harness relays Shibboleth\'s PAOS AuthnRequest with HTTP Basic', async () => {
+    // The harness is the enhanced client: it asks Shibboleth for a PAOS AuthnRequest, relays it
+    // to localsaml over SOAP with HTTP Basic credentials, and relays the Response back.
+    const b = new Browser();
+    // mod_shib declines ECP on a protected path under Apache 2.4 ("AuthType shibboleth configured
+    // without corresponding module"), so ask the session initiator directly.
+    let res = await b.fetch(`${SHIB}/Shibboleth.sso/Login?target=${encodeURIComponent(`${SHIB}/secure/`)}`, {
+      headers: { accept: 'text/html; application/vnd.paos+xml', paos: 'ver="urn:liberty:paos:2003-08";"urn:oasis:names:tc:SAML:2.0:profiles:SSO:ecp"' },
+    });
+    const fromSp = await res.text();
+    assert(res.ok && /AuthnRequest/.test(fromSp), `expected a PAOS AuthnRequest, got ${res.status} ${shibError(fromSp)}`);
+    const consumer = (fromSp.match(/responseConsumerURL="([^"]+)"/) || [])[1];
+    const relay = (fromSp.match(/<ecp:RelayState[\s\S]*?<\/ecp:RelayState>/) || [])[0];
+    const request = fromSp.match(/<samlp:AuthnRequest[\s\S]*<\/samlp:AuthnRequest>/)[0];
+    const email = expectEmail('ecp');
+    const toIdp = `<S:Envelope xmlns:S="http://schemas.xmlsoap.org/soap/envelope/"><S:Body>${request}</S:Body></S:Envelope>`;
+    res = await fetch(issuer.md.ssoSoap, {
+      method: 'POST',
+      headers: { 'content-type': 'text/xml', authorization: `Basic ${Buffer.from(`${email}:secret`).toString('base64')}` },
+      body: toIdp,
+    });
+    const fromIdp = await res.text();
+    assert(res.ok, `localsaml answered ${res.status}: ${fromIdp.slice(0, 300)}`);
+    const acs = (fromIdp.match(/AssertionConsumerServiceURL="([^"]+)"/) || [])[1];
+    assert(acs === consumer, `ecp:Response names ${acs}, but Shibboleth's paos:Request said ${consumer}`);
+    const response = fromIdp.match(/<(\w+:)?Response\b[^>]*urn:oasis:names:tc:SAML:2.0:protocol[\s\S]*<\/\1Response>/)[0];
+    const toSp = `<S:Envelope xmlns:S="http://schemas.xmlsoap.org/soap/envelope/">${relay ? `<S:Header>${relay}</S:Header>` : ''}<S:Body>${response}</S:Body></S:Envelope>`;
+    res = await b.fetch(consumer, { method: 'POST', headers: { 'content-type': 'application/vnd.paos+xml' }, body: toSp });
+    assert(res.status === 302, `Shibboleth didn't accept the ECP Response: ${res.status} ${shibReason(await res.text())}`);
+    const s = await shibSession(b, '');
+    assert(first(s.attrs.email) === email, `email ${JSON.stringify(s.attrs.email)}`);
+    return `email ${email}`;
   });
   await check(name, 'shibboleth', 'encrypted assertion (aes256-gcm)', async () => {
     const email = expectEmail('enc');

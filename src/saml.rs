@@ -26,6 +26,9 @@ pub const BINDING_REDIRECT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Re
 pub const BINDING_POST: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST";
 pub const BINDING_ARTIFACT: &str = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact";
 pub const BINDING_SOAP: &str = "urn:oasis:names:tc:SAML:2.0:bindings:SOAP";
+/// Reverse SOAP: how ECP clients carry messages between service providers and identity providers.
+pub const BINDING_PAOS: &str = "urn:oasis:names:tc:SAML:2.0:bindings:PAOS";
+pub const NS_ECP: &str = "urn:oasis:names:tc:SAML:2.0:profiles:SSO:ecp";
 pub const CM_BEARER: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
 /// The identity provider vouches for the subject (attribute query answers, sent back-channel).
 pub const CM_SENDER_VOUCHES: &str = "urn:oasis:names:tc:SAML:2.0:cm:sender-vouches";

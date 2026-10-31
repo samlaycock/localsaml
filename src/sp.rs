@@ -9,7 +9,7 @@ use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 
 use crate::keys::{PublicKey, SigAlg, cert_public_key, cert_verifying_key, parse_cert};
-use crate::saml::{BINDING_ARTIFACT, BINDING_POST, BINDING_REDIRECT, BINDING_SOAP, NS_MD};
+use crate::saml::{BINDING_ARTIFACT, BINDING_PAOS, BINDING_POST, BINDING_REDIRECT, BINDING_SOAP, NS_MD};
 use crate::xml::{Element, parse};
 use crate::xmlenc::EncAlg;
 
@@ -27,6 +27,9 @@ pub struct ServiceProvider {
     /// first unless the request names one.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub acs_artifact_urls: Vec<String>,
+    /// PAOS assertion consumer service URLs: where ECP clients deliver Responses.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub acs_ecp_urls: Vec<String>,
     /// `post` (default) or `artifact`: how to send Responses when the AuthnRequest doesn't say
     /// (ProtocolBinding), and for IdP-initiated logins.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -133,6 +136,7 @@ impl ServiceProvider {
             .acs_urls
             .iter()
             .chain(&self.acs_artifact_urls)
+            .chain(&self.acs_ecp_urls)
             .chain(&self.slo_url)
             .chain(&self.slo_response_url)
             .chain(&self.slo_soap_url)
@@ -197,9 +201,10 @@ impl ServiceProvider {
         if self.entity_id.is_empty() {
             self.entity_id = m.entity_id;
         }
-        if self.acs_urls.is_empty() && self.acs_artifact_urls.is_empty() {
+        if self.acs_urls.is_empty() && self.acs_artifact_urls.is_empty() && self.acs_ecp_urls.is_empty() {
             self.acs_urls = m.acs_urls;
             self.acs_artifact_urls = m.acs_artifact_urls;
+            self.acs_ecp_urls = m.acs_ecp_urls;
             self.acs_indexes = m.acs_indexes;
         }
         self.response_binding = self.response_binding.take().or(m.response_binding);
@@ -227,10 +232,10 @@ impl ServiceProvider {
     /// The default ACS URL for a binding (`post` or `artifact`), or for the other binding if
     /// there's none.
     pub fn default_acs(&self, binding: &str) -> Option<&String> {
-        let (first, second) = if binding == "artifact" {
-            (&self.acs_artifact_urls, &self.acs_urls)
-        } else {
-            (&self.acs_urls, &self.acs_artifact_urls)
+        let (first, second) = match binding {
+            "artifact" => (&self.acs_artifact_urls, &self.acs_urls),
+            "paos" => (&self.acs_ecp_urls, &self.acs_urls),
+            _ => (&self.acs_urls, &self.acs_artifact_urls),
         };
         first.first().or(second.first())
     }
@@ -250,8 +255,8 @@ impl ServiceProvider {
 
     /// Is `url` one of this SP's ACS URLs? SPs without any accept everything (lenient mode).
     pub fn allows_acs(&self, url: &str) -> bool {
-        (self.acs_urls.is_empty() && self.acs_artifact_urls.is_empty())
-            || self.acs_urls.iter().chain(&self.acs_artifact_urls).any(|a| a == url)
+        (self.acs_urls.is_empty() && self.acs_artifact_urls.is_empty() && self.acs_ecp_urls.is_empty())
+            || self.acs_urls.iter().chain(&self.acs_artifact_urls).chain(&self.acs_ecp_urls).any(|a| a == url)
     }
 
     /// The key that checks this SP's signed messages (RSA or DSA).
@@ -305,6 +310,11 @@ pub fn from_metadata(xml: &str, entity_id: Option<&str>) -> Result<ServiceProvid
         .collect();
     acs.sort();
     let response_binding = acs.first().filter(|a| a.3).map(|_| "artifact".to_string());
+    let acs_ecp_urls = sp
+        .find_all(NS_MD, "AssertionConsumerService")
+        .filter(|a| a.get_attr("Binding") == Some(BINDING_PAOS))
+        .filter_map(|a| Some(a.get_attr("Location")?.trim().to_string()))
+        .collect();
     let slo = |binding: &str| {
         sp.find_all(NS_MD, "SingleLogoutService").find(|s| s.get_attr("Binding") == Some(binding)).map(|s| {
             (
@@ -340,6 +350,7 @@ pub fn from_metadata(xml: &str, entity_id: Option<&str>) -> Result<ServiceProvid
         acs_indexes: acs.iter().map(|(_, i, url, _)| (*i, url.clone())).collect(),
         acs_urls: acs.iter().filter(|a| !a.3).map(|a| a.2.clone()).collect(),
         acs_artifact_urls: acs.iter().filter(|a| a.3).map(|a| a.2.clone()).collect(),
+        acs_ecp_urls,
         response_binding,
         slo_url: slo.as_ref().map(|s| s.0.clone()),
         slo_response_url: slo.and_then(|s| s.1),

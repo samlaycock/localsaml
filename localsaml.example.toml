@@ -26,6 +26,7 @@ acs_urls = ["http://localhost:3000/saml/acs"]
 slo_url = "http://localhost:3000/saml/slo"
 # slo_soap_url = "http://localhost:3000/saml/slo/soap"  # back-channel logout (SOAP binding)
 # acs_artifact_urls = ["http://localhost:3000/saml/artifact"]  # HTTP-Artifact ACSs
+# acs_ecp_urls = ["http://localhost:3000/saml/ecp"]  # PAOS ACSs, where ECP clients deliver Responses
 # response_binding = "post"          # post | artifact: when the AuthnRequest doesn't say
 # slo_binding = "redirect"           # redirect | post
 # certificate = "-----BEGIN CERTIFICATE-----..."   # verifies signed AuthnRequests

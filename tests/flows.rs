@@ -296,7 +296,10 @@ async fn metadata_for_root_and_templates() {
 
     let root = md(&get(&app, "/metadata").await.body);
     assert_eq!(root.get_attr("entityID"), Some("http://localhost:9401/metadata"));
-    assert_eq!(location(&root, "SingleSignOnService"), [format!("{BASE}/sso"), format!("{BASE}/sso")]);
+    assert_eq!(
+        location(&root, "SingleSignOnService"),
+        [format!("{BASE}/sso"), format!("{BASE}/sso"), format!("{BASE}/sso")]
+    );
     assert_eq!(location(&root, "SingleLogoutService")[0], format!("{BASE}/slo"));
 
     let okta = md(&get(&app, "/p/okta/metadata").await.body);
@@ -1785,4 +1788,62 @@ async fn scoping() {
     let page = get(&app, &redirect("/sso", "SAMLRequest", &xml, None, None)).await;
     assert_eq!(page.title(), "Sign in · localsaml");
     assert!(page.body.contains("RequesterID https://portal.test"), "{}", page.body);
+}
+
+// ---------------------------------------------------------------------------
+// ECP
+// ---------------------------------------------------------------------------
+
+async fn ecp(app: &Router, envelope: &str, login: Option<&str>) -> Resp {
+    let mut req = Request::builder().method(Method::POST).uri("/sso").header(header::CONTENT_TYPE, "text/xml");
+    if let Some(l) = login {
+        req = req.header(header::AUTHORIZATION, format!("Basic {}", b64_std(format!("{l}:any-password"))));
+    }
+    send(app, req.body(Body::from(envelope.to_string())).unwrap(), None).await
+}
+
+#[tokio::test]
+async fn ecp_logins() {
+    let ecp_sp = ServiceProvider {
+        acs_ecp_urls: vec!["http://ecp.test/ecp".into()],
+        ..sp("http://ecp.test/sp", "http://ecp.test/acs")
+    };
+    let (app, state) = app_with(Config { users: vec![alice()], ..with_sps(vec![ecp_sp]) });
+    let paos = format!(r#" ProtocolBinding="{}""#, saml::BINDING_PAOS);
+    let request = |id: &str, acs: &str, children: &str| {
+        localsaml::soap::envelope(parse(&authn_request(id, "http://ecp.test/sp", Some(acs), &paos, children)).unwrap())
+    };
+
+    // No credentials: HTTP Basic is asked for.
+    let r = ecp(&app, &request("_e1", "http://ecp.test/ecp", ""), None).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert!(r.headers.get(header::WWW_AUTHENTICATE).is_some());
+
+    // A declared user: the Response comes back in SOAP, with the ACS in an ecp:Response header.
+    let r = ecp(&app, &request("_e2", "http://ecp.test/ecp", ""), Some("alice")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let envelope = parse(&r.body).unwrap();
+    let ecp_header = envelope.path(&[(localsaml::soap::NS_SOAP, "Header"), (saml::NS_ECP, "Response")]).unwrap();
+    assert_eq!(ecp_header.get_attr("AssertionConsumerServiceURL"), Some("http://ecp.test/ecp"));
+    let (_, response) = localsaml::soap::unwrap(&r.body).unwrap();
+    assert_eq!(response.get_attr("InResponseTo"), Some("_e2"));
+    let assertion = response.find(A, "Assertion").unwrap();
+    verify(&state, &response, assertion.get_attr("ID").unwrap());
+    assert_eq!(attr_values(assertion, "groups"), ["admins"]);
+    // The session it started can be ended like any other.
+    assert_eq!(get(&app, "/dev/api/sessions").await.json().as_array().unwrap().len(), 1);
+
+    // Any other login is taken as a login hint for the template's identity.
+    let r = ecp(&app, &request("_e3", "http://ecp.test/ecp", &policy(nameid::EMAIL)), Some("sam@example.com")).await;
+    let (_, response) = localsaml::soap::unwrap(&r.body).unwrap();
+    assert_eq!(response.path(&[(A, "Assertion"), (A, "Subject"), (A, "NameID")]).unwrap().value(), "sam@example.com");
+
+    // Errors the browser would see as a page are SOAP faults; error statuses stay Responses.
+    let r = ecp(&app, &request("_e4", "http://evil.test/ecp", ""), Some("alice")).await;
+    assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(r.body.contains("Unregistered AssertionConsumerServiceURL"), "{}", r.body);
+    let scoping = r#"<samlp:Scoping><samlp:IDPList><samlp:IDPEntry ProviderID="https://other.test"/></samlp:IDPList></samlp:Scoping>"#;
+    let r = ecp(&app, &request("_e5", "http://ecp.test/ecp", scoping), Some("alice")).await;
+    let (_, response) = localsaml::soap::unwrap(&r.body).unwrap();
+    assert_eq!(Status::from_element(response.find(P, "Status")).short(), "NoSupportedIDP");
 }

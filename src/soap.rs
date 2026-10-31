@@ -22,8 +22,14 @@ pub fn is_soap(headers: &HeaderMap, body: &[u8]) -> bool {
 
 /// Wrap a message (which declares its own namespaces) in an envelope.
 pub fn envelope(message: Element) -> String {
-    let mut env =
-        Element::new(NS_SOAP, "soap11", "Envelope").child(Element::new(NS_SOAP, "soap11", "Body").child(message));
+    envelope_with_header(None, message)
+}
+
+/// An envelope with a SOAP Header block (ECP's `ecp:Response`).
+pub fn envelope_with_header(header: Option<Element>, message: Element) -> String {
+    let mut env = Element::new(NS_SOAP, "soap11", "Envelope")
+        .child_opt(header.map(|h| Element::new(NS_SOAP, "soap11", "Header").child(h)))
+        .child(Element::new(NS_SOAP, "soap11", "Body").child(message));
     env.declare_namespaces();
     env.to_document()
 }

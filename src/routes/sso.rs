@@ -169,7 +169,8 @@ pub async fn endpoint(
     body: Bytes,
 ) -> Response {
     if crate::soap::is_soap(&headers, &body) {
-        return crate::routes::backchannel::dispatch(&state, &tenant, &body).await;
+        let url = format!("{}{}", origin(&tenant.base), uri.path());
+        return crate::routes::backchannel::dispatch(&state, &tenant, &headers, &url, &body).await;
     }
     let query = query.unwrap_or_default();
     if let Some(param) = dsig::duplicate_param(&query) {
@@ -233,6 +234,75 @@ pub async fn endpoint(
     }
 }
 
+/// ECP (Profiles 4.2): an AuthnRequest relayed over SOAP by an enhanced client. It's checked like
+/// any other, the user is signed in with HTTP Basic credentials, and the Response goes back to the
+/// client in a SOAP envelope naming the ACS it must deliver it to.
+pub async fn ecp(
+    state: &AppState,
+    tenant: &Tenant,
+    headers: &HeaderMap,
+    req: AuthnRequest,
+    message: &Element,
+    url: &str,
+) -> Response {
+    let arrival =
+        Arrival { binding: "soap", relay_state: None, query_signature: None, params: HashMap::new(), url: url.into() };
+    let resp = authn_request(state, tenant, headers, req, message, arrival).await;
+    // What the browser flow shows as an error page is a SOAP fault for an ECP client.
+    let soap =
+        resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("xml"));
+    if soap || resp.status() == StatusCode::UNAUTHORIZED {
+        return resp;
+    }
+    let reason = resp
+        .headers()
+        .get("x-localsaml-error")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("the AuthnRequest was refused")
+        .to_string();
+    crate::soap::fault(true, &reason)
+}
+
+/// Sign an ECP client's user in with HTTP Basic credentials: a declared user (by id, email or
+/// NameID), or the template's identity for that login. Any password is accepted.
+async fn ecp_login(
+    state: &AppState,
+    tenant: &Tenant,
+    headers: &HeaderMap,
+    preset: &'static Preset,
+    sp: &ServiceProvider,
+    pending: Pending,
+) -> Response {
+    let login = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Basic "))
+        .and_then(|b| crate::util::b64_std_decode_lenient(b.trim()))
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|creds| creds.split_once(':').map(|(user, _)| user.to_string()))
+        .filter(|user| !user.is_empty());
+    let Some(login) = login else {
+        let mut resp = (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"localsaml\""))],
+            "ECP sign-in needs HTTP Basic credentials: a declared user's id or email, or any login (any password).",
+        )
+            .into_response();
+        crate::inspector::ErrorNote::attach(&mut resp, "ECP credentials missing", "no HTTP Basic Authorization header");
+        return resp;
+    };
+    let (preset, mut identity) = match state.config.user_for_login(&login) {
+        Some(user) => user.resolve(None, preset),
+        None => {
+            let mut identity = preset.default_identity();
+            preset.apply_login_hint(&mut identity, &login);
+            (preset, identity)
+        }
+    };
+    adapt_name_id(&mut identity, preset, &pending);
+    complete(state, tenant, headers, &pending, preset, sp, identity, None, false)
+}
+
 /// Do two URLs name the same place (ignoring case in the host, default ports, a trailing slash)?
 fn same_url(a: &str, b: &str) -> bool {
     match (url::Url::parse(a.trim_end_matches('/')), url::Url::parse(b.trim_end_matches('/'))) {
@@ -241,7 +311,7 @@ fn same_url(a: &str, b: &str) -> bool {
     }
 }
 
-fn origin(base: &str) -> String {
+pub fn origin(base: &str) -> String {
     url::Url::parse(base).map(|u| u.origin().ascii_serialization()).unwrap_or_default()
 }
 
@@ -317,7 +387,11 @@ async fn authn_request(
                 );
             }
         },
-        (None, None) => match sp.default_acs(requested_binding.unwrap_or(sp.default_binding())) {
+        (None, None) => match sp.default_acs(if arrival.binding == "soap" {
+            "paos"
+        } else {
+            requested_binding.unwrap_or(sp.default_binding())
+        }) {
             Some(url) => url.clone(),
             None => {
                 return bad(
@@ -330,8 +404,12 @@ async fn authn_request(
             }
         },
     };
-    let response_binding =
-        requested_binding.or_else(|| sp.acs_binding(&acs_url)).unwrap_or(sp.default_binding()).to_string();
+    // ECP clients take the Response back themselves (PAOS).
+    let response_binding = if arrival.binding == "soap" {
+        "paos".to_string()
+    } else {
+        requested_binding.or_else(|| sp.acs_binding(&acs_url)).unwrap_or(sp.default_binding()).to_string()
+    };
     if !crate::util::is_web_url(&acs_url) {
         return bad("Invalid AssertionConsumerServiceURL", &format!("'{acs_url}' is not an absolute http(s) URL."));
     }
@@ -341,6 +419,7 @@ async fn authn_request(
     if let Some(b) = &req.protocol_binding
         && b != saml::BINDING_POST
         && b != saml::BINDING_ARTIFACT
+        && !(b == saml::BINDING_PAOS && arrival.binding == "soap")
     {
         warnings.push(format!("ProtocolBinding {b} isn't supported; the Response is sent with HTTP-POST."));
     }
@@ -443,6 +522,9 @@ async fn authn_request(
             &pending,
             Status::parse("InvalidNameIDPolicy", Some(e)).unwrap(),
         );
+    }
+    if arrival.binding == "soap" {
+        return ecp_login(state, tenant, headers, preset, &sp, pending).await;
     }
     proceed(state, tenant, headers, preset, &sp, pending, &arrival.params).await
 }
@@ -891,7 +973,20 @@ fn deliver(
     status: Option<&Status>,
     review: bool,
 ) -> Response {
-    let (mut resp, binding) = if pending.response_binding == "artifact" {
+    let (mut resp, binding) = if pending.response_binding == "paos" {
+        let response = match crate::xml::parse(xml) {
+            Ok(r) => r,
+            Err(e) => return crate::soap::fault(false, &e),
+        };
+        let header = Element::new(saml::NS_ECP, "ecp", "Response")
+            .ns_attr(crate::soap::NS_SOAP, "soap11", "mustUnderstand", "1")
+            .ns_attr(crate::soap::NS_SOAP, "soap11", "actor", "http://schemas.xmlsoap.org/soap/actor/next")
+            .attr("AssertionConsumerServiceURL", &pending.acs_url);
+        let body = crate::soap::envelope_with_header(Some(header), response);
+        let resp = ([(header::CONTENT_TYPE, "text/xml; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], body)
+            .into_response();
+        (resp, "paos")
+    } else if pending.response_binding == "artifact" {
         let artifact = store_artifact(state, tenant, &pending.sp, xml);
         let mut url = url::Url::parse(&pending.acs_url).expect("the ACS URL was checked");
         url.query_pairs_mut().append_pair("SAMLart", &artifact);
