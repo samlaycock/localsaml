@@ -19,6 +19,8 @@ pub mod nameid {
     pub const WINDOWS: &str = "urn:oasis:names:tc:SAML:1.1:nameid-format:WindowsDomainQualifiedName";
     pub const KERBEROS: &str = "urn:oasis:names:tc:SAML:2.0:nameid-format:kerberos";
     pub const ENTITY: &str = "urn:oasis:names:tc:SAML:2.0:nameid-format:entity";
+    /// Only for `NameIDPolicy`: asks for the NameID to be encrypted (Core 8.3.10).
+    pub const ENCRYPTED: &str = "urn:oasis:names:tc:SAML:2.0:nameid-format:encrypted";
     pub const ALL: &[&str] = &[UNSPECIFIED, EMAIL, PERSISTENT, TRANSIENT, X509, WINDOWS, KERBEROS, ENTITY];
 }
 

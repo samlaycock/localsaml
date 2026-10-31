@@ -1524,3 +1524,89 @@ async fn the_test_sp_resolves_artifacts() {
     let again = get_jar(&app, &loc.as_str()[BASE.len()..], &mut jar).await;
     assert_eq!(again.title(), "Test SP: rejected · localsaml");
 }
+
+// ---------------------------------------------------------------------------
+// Encrypted NameIDs
+// ---------------------------------------------------------------------------
+
+fn sp_keys() -> &'static [rsa::RsaPrivateKey] {
+    std::slice::from_ref(&sp_key().private)
+}
+
+/// The NameID in an assertion's (or LogoutRequest's) EncryptedID.
+fn decrypted_name_id(container: &Element, keys: &[rsa::RsaPrivateKey]) -> Element {
+    let encrypted = container
+        .find(A, "Subject")
+        .unwrap_or(container)
+        .find(A, "EncryptedID")
+        .unwrap_or_else(|| panic!("no EncryptedID in {}", container.to_pretty()));
+    saml::decrypt_id(encrypted, keys).unwrap()
+}
+
+#[tokio::test]
+async fn encrypted_name_ids() {
+    let secret = ServiceProvider { encrypt_name_id: true, certificate: Some(sp_key().cert_b64()), ..slo_sp("secret") };
+    let (app, state) = app_with(with_sps(vec![secret, sp(SP, ACS)]));
+
+    // A service provider with encrypt_name_id gets an EncryptedID, for its own key, and its
+    // LogoutRequest carries one too.
+    let mut jar = Jar::default();
+    let p = quick_login(&app, "", "http://secret.test/sp", &mut jar, "&dev_name_id=jo%40example.com").await;
+    verify(&state, &p.doc, &p.id());
+    let assertion = p.assertion();
+    assert!(assertion.path(&[(A, "Subject"), (A, "NameID")]).is_none());
+    let name_id = decrypted_name_id(assertion, sp_keys());
+    assert_eq!(name_id.value(), "jo@example.com");
+    let r = get_jar(&app, "/slo/initiate", &mut jar).await;
+    let (_, request) = redirected(&r, "SAMLRequest");
+    assert!(request.find(A, "NameID").is_none());
+    assert_eq!(decrypted_name_id(&request, sp_keys()).value(), "jo@example.com");
+
+    // An AuthnRequest asking for an encrypted NameID needs an encryption certificate.
+    let policy = format!(r#"<samlp:NameIDPolicy Format="{}"/>"#, nameid::ENCRYPTED);
+    let xml = authn_request("_enc1", SP, Some(ACS), "", &policy);
+    let r = get_jar(
+        &app,
+        &format!("{}&dev_attributes=%7B%7D", redirect("/sso", "SAMLRequest", &xml, None, None)),
+        &mut jar,
+    )
+    .await;
+    let p = posted(&r);
+    assert_eq!(p.status().short(), "InvalidNameIDPolicy");
+
+    // The test SP asks for one (it has the IdP's key), decrypts it, and encrypts the NameID in
+    // its own LogoutRequest, which localsaml decrypts.
+    let mut jar = Jar::default();
+    let r = get_jar(&app, "/sp/login?binding=redirect&encrypt_name_id=1&name_id_format=ignored", &mut jar).await;
+    let page = get_jar(&app, &r.location().as_str()[BASE.len()..], &mut jar).await;
+    assert!(page.body.contains("Sign in"), "{}", page.title());
+    let resp =
+        approve(&app, "", &page, "generic", json!({ "attributes": { "email": "kim@example.com" } }), &mut jar).await;
+    let p = posted(&resp);
+    let name_id = decrypted_name_id(p.assertion(), &state.keys.private_keys());
+    assert_eq!(name_id.get_attr("Format"), Some(nameid::EMAIL));
+    let b64 = resp.field("SAMLResponse").unwrap();
+    let accepted = post_form(&app, "/sp/acs", &[("SAMLResponse", &b64)], &mut jar).await;
+    assert_eq!(accepted.title(), "Test SP: signed in · localsaml", "{}", accepted.body);
+    assert!(accepted.body.contains("kim@example.com"));
+    let r = post_form(&app, "/sp/logout", &[], &mut jar).await;
+    let (loc, request) = redirected(&r, "SAMLRequest");
+    assert!(request.find(A, "EncryptedID").is_some());
+    let r = get_jar(&app, &loc.as_str()[BASE.len()..], &mut jar).await;
+    let (_, answer) = redirected(&r, "SAMLResponse");
+    assert!(Status::from_element(answer.find(P, "Status")).is_success(), "{}", answer.to_pretty());
+    assert!(get(&app, "/dev/api/sessions").await.json().as_array().unwrap().is_empty());
+
+    // The response API, with and without the service provider's setting.
+    let minted = post_json(&app, "/dev/api/response", json!({ "sp": SP, "encrypt_name_id": true })).await;
+    assert_eq!(minted.status, StatusCode::BAD_REQUEST, "no certificate for {SP}");
+    let minted = post_json(&app, "/dev/api/response", json!({ "sp": "http://secret.test/sp" })).await.json();
+    assert_eq!(minted["name_id_encrypted"], true);
+    let doc = parse(minted["xml"].as_str().unwrap()).unwrap();
+    decrypted_name_id(doc.find(A, "Assertion").unwrap(), sp_keys());
+    let minted =
+        post_json(&app, "/dev/api/response", json!({ "sp": "http://secret.test/sp", "encrypt_name_id": false }))
+            .await
+            .json();
+    assert_eq!(minted["name_id_encrypted"], false);
+}

@@ -989,12 +989,19 @@ async function runHelperStack(stack, helper, issuer, keys) {
     });
   }
 
-  const mint = async (query = '') => ({
-    SAMLResponse: (await json(`${issuer.base}/dev/api/response?sp=${encodeURIComponent(sp.entityId)}&${attrQuery(emailAttr, expectEmail('mint'))}${query}`)).saml_response,
-  });
+  const minted = (query) => json(`${issuer.base}/dev/api/response?sp=${encodeURIComponent(sp.entityId)}&${attrQuery(emailAttr, expectEmail('mint'))}${query}`);
+  const mint = async (query = '') => ({ SAMLResponse: (await minted(query)).saml_response });
   await check(name, stack, 'minted Response accepted (control)', async () => {
     await parse(sp, await mint(), []);
     return 'accepted';
+  });
+  // node-saml, samlify and crewjam accept an EncryptedID but don't decrypt it (no NameID).
+  if (stack === 'pysaml2') await check(name, stack, 'encrypted NameID (EncryptedID) decrypted', async () => {
+    const m = await minted('&encrypt_name_id=true');
+    assert(m.name_id_encrypted === true, 'the NameID is not encrypted');
+    const r = await parse(sp, { SAMLResponse: m.saml_response }, []);
+    assert(r.name_id === m.name_id, `NameID ${JSON.stringify(r.name_id)}, expected ${m.name_id}`);
+    return `NameID ${r.name_id}`;
   });
   const tampers = ['bad_signature', 'wrong_cert', 'wrong_audience', 'wrong_issuer', 'expired', 'not_yet_valid', 'unsigned', 'wrong_destination'];
   // pysaml2 doesn't check SubjectConfirmationData/@Recipient.
@@ -1298,12 +1305,20 @@ async function runShibboleth(issuer, keys) {
     const r = await json(`${issuer.base}/dev/api/response?sp=${encodeURIComponent(`${SHIB}/shibboleth`)}&${attrQuery(emailAttr, expectEmail('mint'))}&relay_state=${encodeURIComponent(`${SHIB}/secure/`)}${query}`);
     const b = new Browser();
     const res = await b.post(r.acs_url, { SAMLResponse: r.saml_response, RelayState: r.relay_state });
-    return { res, b };
+    return { res, b, r };
   };
   await check(name, 'shibboleth', 'minted Response accepted (control)', async () => {
     const { res } = await deliver('');
     assert(res.status === 302, `not accepted: ${res.status} ${shibError(await res.text())}`);
     return 'accepted';
+  });
+  await check(name, 'shibboleth', 'encrypted NameID (EncryptedID) decrypted', async () => {
+    const { res, b, r } = await deliver('&encrypt_name_id=true');
+    assert(r.name_id_encrypted === true, 'the NameID is not encrypted');
+    assert(res.status === 302, `not accepted: ${res.status} ${shibReason(await res.text())}`);
+    const s = await shibSession(b, '');
+    assert(first(s.attrs.nameid) === r.name_id, `nameid ${JSON.stringify(s.attrs.nameid)}, expected ${r.name_id}`);
+    return `nameid ${r.name_id}`;
   });
   // Shibboleth SP accepts RSA-SHA1 by default, like node-saml.
   const tampers = ['bad_signature', 'wrong_cert', 'wrong_audience', 'wrong_issuer', 'expired', 'not_yet_valid', 'unsigned', 'wrong_recipient', 'wrong_destination'];

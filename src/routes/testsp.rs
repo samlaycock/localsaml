@@ -26,7 +26,7 @@ use crate::state::AppState;
 use crate::tenant::Tenant;
 use crate::util::{b64, b64_decode, b64_std, iso8601, non_empty, parse_form, parse_iso8601, wall_clock};
 use crate::xml::{Element, parse};
-use crate::xmlenc::{self, NS_XENC};
+use crate::xmlenc::{self, EncAlg, NS_XENC};
 
 /// Clock skew the test SP allows, in seconds.
 const SKEW: i64 = 60;
@@ -59,6 +59,9 @@ struct SpSession {
     sp_name_qualifier: Option<String>,
     session_index: Option<String>,
     issuer: String,
+    /// The NameID came as an EncryptedID; the LogoutRequest encrypts it too.
+    #[serde(default)]
+    encrypted: bool,
 }
 
 fn session_cookie_name(tenant: &Tenant) -> String {
@@ -123,6 +126,7 @@ pub async fn home(tenant: Tenant, headers: HeaderMap) -> Response {
       <label class="check"><input type="checkbox" name="sign" value="1" checked> Sign the request</label>
       <label class="check"><input type="checkbox" name="force_authn" value="1"> ForceAuthn</label>
       <label class="check"><input type="checkbox" name="is_passive" value="1"> IsPassive</label>
+      <label class="check"><input type="checkbox" name="encrypt_name_id" value="1"> Encrypted NameID</label>
     </div>
   </div>
   <div class="actions">
@@ -174,7 +178,13 @@ pub async fn login(State(state): State<AppState>, tenant: Tenant, RawQuery(q): R
         .declare("samlp", NS_PROTOCOL)
         .declare("saml", NS_ASSERTION)
         .child(a("Issuer").text(entity_id(&tenant)));
-    if let Some(f) = non_empty(&params, "name_id_format") {
+    // NameIDPolicy has one Format: asking for an encrypted NameID replaces the format.
+    let format = if flag("encrypt_name_id") {
+        Some(nameid::ENCRYPTED.to_string())
+    } else {
+        non_empty(&params, "name_id_format")
+    };
+    if let Some(f) = format {
         req = req.child(p("NameIDPolicy").attr("Format", f).attr("AllowCreate", "true"));
     }
     if let Some(c) = non_empty(&params, "authn_context") {
@@ -263,6 +273,7 @@ struct Outcome {
     response_xml: String,
     assertion_xml: Option<String>,
     assertion_id: Option<String>,
+    name_id_encrypted: bool,
 }
 
 fn validate(state: &AppState, tenant: &Tenant, xml: &str, expected_request: Option<&str>) -> Outcome {
@@ -275,6 +286,7 @@ fn validate(state: &AppState, tenant: &Tenant, xml: &str, expected_request: Opti
         response_xml: xml.to_string(),
         assertion_xml: None,
         assertion_id: None,
+        name_id_encrypted: false,
     };
     let now = wall_clock();
     let acs = tenant.url("/sp/acs");
@@ -408,14 +420,28 @@ fn validate(state: &AppState, tenant: &Tenant, xml: &str, expected_request: Opti
     let time =
         |el: Option<&Element>, attr: &str| el.and_then(|e| e.get_attr(attr)).map(|v| (v.to_string(), parse_iso8601(v)));
     let subject = assertion.find(NS_ASSERTION, "Subject");
-    if let Some(n) = subject.and_then(|s| s.find(NS_ASSERTION, "NameID")) {
+    let decrypted = match subject.and_then(|s| s.find(NS_ASSERTION, "EncryptedID")) {
+        Some(e) => match saml::decrypt_id(e, &state.keys.private_keys()) {
+            Ok(n) => {
+                checks.ok("EncryptedID", "decrypted with the test SP's key");
+                out.name_id_encrypted = true;
+                Some(n)
+            }
+            Err(e) => {
+                checks.fail("EncryptedID", e);
+                None
+            }
+        },
+        None => None,
+    };
+    if let Some(n) = decrypted.as_ref().or_else(|| subject.and_then(|s| s.find(NS_ASSERTION, "NameID"))) {
         out.name_id = Some((
             n.value(),
             n.get_attr("Format").unwrap_or(nameid::UNSPECIFIED).to_string(),
             n.get_attr("SPNameQualifier").map(String::from),
         ));
     } else {
-        checks.fail("NameID", "the assertion has no Subject/NameID");
+        checks.fail("NameID", "the assertion has no Subject/NameID or EncryptedID");
     }
     let confirmation = subject.and_then(|s| {
         s.find_all(NS_ASSERTION, "SubjectConfirmation").find(|c| c.get_attr("Method") == Some(saml::CM_BEARER))
@@ -567,6 +593,7 @@ pub async fn acs(
                 response_xml: String::new(),
                 assertion_xml: None,
                 assertion_id: None,
+                name_id_encrypted: false,
             }
         }
     };
@@ -640,6 +667,7 @@ pub async fn acs(
             sp_name_qualifier: qualifier,
             session_index: outcome.session_index,
             issuer: tenant.entity_id.clone(),
+            encrypted: outcome.name_id_encrypted,
         };
         let value = b64(serde_json::to_vec(&session).unwrap_or_default());
         set_cookie(&mut resp, &cookie(&session_cookie_name(&tenant), &value, 8 * 3600));
@@ -662,7 +690,10 @@ pub async fn logout(State(state): State<AppState>, tenant: Tenant, headers: Head
         return resp;
     };
     let style = crate::presets::generic().style.clone();
-    let (message, _) = saml::logout_request(&saml::LogoutRequestSpec {
+    // An SP that got an EncryptedID encrypts the NameID for the IdP in its LogoutRequest too.
+    let idp_key = state.keys.with_current(|k| k.public.clone());
+    let encrypt = session.encrypted.then_some((&idp_key, EncAlg::Aes256Gcm));
+    let message = saml::logout_request(&saml::LogoutRequestSpec {
         style: &style,
         issuer: &entity_id(&tenant),
         destination: &slo,
@@ -671,7 +702,12 @@ pub async fn logout(State(state): State<AppState>, tenant: Tenant, headers: Head
         sp_name_qualifier: session.sp_name_qualifier.as_deref(),
         session_index: session.session_index.as_deref().unwrap_or_default(),
         now: wall_clock(),
+        encrypt,
     });
+    let message = match message {
+        Ok((m, _)) => m,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
     let url = state.keys.with_current(|k| {
         saml::redirect_url(
             &slo,
@@ -745,7 +781,11 @@ pub async fn slo(State(state): State<AppState>, tenant: Tenant, RawQuery(q): Raw
                     "The identity provider has no SLO endpoint to answer.",
                 );
             };
-            let status = match verified(&req.id) {
+            let name_id = match root.find(NS_ASSERTION, "EncryptedID") {
+                Some(e) => saml::decrypt_id(e, &state.keys.private_keys()).map(|_| ()),
+                None => Ok(()),
+            };
+            let status = match verified(&req.id).and(name_id) {
                 Ok(_) => Status::success(),
                 Err(e) => {
                     Status::parse("Requester", Some(format!("the test SP rejected the LogoutRequest: {e}"))).unwrap()

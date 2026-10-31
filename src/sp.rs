@@ -56,6 +56,10 @@ pub struct ServiceProvider {
     pub encrypt_assertions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encryption_algorithm: Option<EncAlg>,
+    /// Send NameIDs as `EncryptedID`s (in assertions and LogoutRequests), with the encryption
+    /// certificate. An AuthnRequest can ask for it too (`NameIDPolicy` format `encrypted`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub encrypt_name_id: bool,
     /// Override the template's signing behaviour.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sign_response: Option<bool>,

@@ -88,12 +88,28 @@ fn respond(
     send(state, style, sp, &location, "SAMLResponse", message, &id, relay_state, Some(&status))
 }
 
+/// Fill in a LogoutRequest's NameID from its `EncryptedID` (encrypted for localsaml's key).
+fn decrypt_name_id(state: &AppState, req: &mut LogoutRequest, root: &Element) -> Result<(), String> {
+    if !req.name_id_encrypted {
+        return Ok(());
+    }
+    let encrypted = root
+        .find_by_id(&req.id)
+        .and_then(|m| m.find(saml::NS_ASSERTION, "EncryptedID"))
+        .ok_or("the EncryptedID is missing")?;
+    let name_id = saml::decrypt_id(encrypted, &state.keys.private_keys())
+        .map_err(|e| format!("can't decrypt the EncryptedID: {e}"))?;
+    req.name_id = Some(name_id.value());
+    req.name_id_format = name_id.get_attr("Format").map(String::from);
+    Ok(())
+}
+
 /// A LogoutRequest from a service provider.
 pub async fn logout_request(
     state: &AppState,
     tenant: &Tenant,
     headers: &HeaderMap,
-    req: LogoutRequest,
+    mut req: LogoutRequest,
     root: &Element,
     arrival: Arrival,
 ) -> Response {
@@ -118,6 +134,10 @@ pub async fn logout_request(
             );
         }
         _ => {}
+    }
+    if let Err(e) = decrypt_name_id(state, &mut req, root) {
+        let status = Status::parse("Requester", Some(e)).unwrap();
+        return respond(state, tenant, &sp, &req.id, arrival.relay_state.as_deref(), status);
     }
     let target = faults::Target { endpoint: Endpoint::Slo, issuer: tenant.key(), sp: Some(&sp.entity_id) };
     if let Some(fault) = state.faults.take(&target) {
@@ -168,6 +188,32 @@ pub async fn logout_request(
     resp
 }
 
+/// The LogoutRequest for a participant: the NameID (encrypted if theirs was) and SessionIndex
+/// they were given.
+fn participant_logout_request(
+    state: &AppState,
+    tenant: &Tenant,
+    sp: &ServiceProvider,
+    destination: &str,
+    participant: &Participant,
+    session_index: &str,
+) -> Result<(Element, String), String> {
+    let p = preset(state, tenant);
+    let encryption =
+        if participant.name_id_encrypted { Some(crate::routes::sso::name_id_encryption(p, sp)?) } else { None };
+    saml::logout_request(&LogoutRequestSpec {
+        style: &p.style,
+        issuer: &tenant.entity_id,
+        destination,
+        name_id: &participant.name_id,
+        name_id_format: &participant.name_id_format,
+        sp_name_qualifier: participant.sp_name_qualifier.as_deref(),
+        session_index: if participant.session_index.is_empty() { session_index } else { &participant.session_index },
+        now: state.now(),
+        encrypt: encryption.as_ref().map(|(key, alg)| (key, *alg)),
+    })
+}
+
 /// Ask the next service provider to log out, or finish.
 async fn advance(state: &AppState, tenant: &Tenant, mut logout: Logout) -> Response {
     while let Some(participant) = (!logout.remaining.is_empty()).then(|| logout.remaining.remove(0)) {
@@ -185,20 +231,14 @@ async fn advance(state: &AppState, tenant: &Tenant, mut logout: Logout) -> Respo
             continue;
         };
         let style = &preset(state, tenant).style;
-        let (message, id) = saml::logout_request(&LogoutRequestSpec {
-            style,
-            issuer: &tenant.entity_id,
-            destination: &location,
-            name_id: &participant.name_id,
-            name_id_format: &participant.name_id_format,
-            sp_name_qualifier: participant.sp_name_qualifier.as_deref(),
-            session_index: if participant.session_index.is_empty() {
-                &logout.session_index
-            } else {
-                &participant.session_index
-            },
-            now: state.now(),
-        });
+        let (message, id) =
+            match participant_logout_request(state, tenant, &sp, &location, &participant, &logout.session_index) {
+                Ok(m) => m,
+                Err(e) => {
+                    logout.results.push((participant.entity_id, format!("failed: {e}")));
+                    continue;
+                }
+            };
         logout.waiting_on = Some((sp.entity_id.clone(), id.clone()));
         state.store.put(Table::Logouts, &logout.id, &logout, Some(state.now() + LOGOUT_TTL));
         return send(state, style, &sp, &location, "SAMLRequest", message, &id, Some(&logout.id), None);
@@ -379,16 +419,10 @@ pub async fn back_channel(
 ) -> String {
     let started = std::time::Instant::now();
     let style = &preset(state, tenant).style;
-    let (mut message, id) = saml::logout_request(&LogoutRequestSpec {
-        style,
-        issuer: &tenant.entity_id,
-        destination: url,
-        name_id: &participant.name_id,
-        name_id_format: &participant.name_id_format,
-        sp_name_qualifier: participant.sp_name_qualifier.as_deref(),
-        session_index: if participant.session_index.is_empty() { session_index } else { &participant.session_index },
-        now: state.now(),
-    });
+    let (mut message, id) = match participant_logout_request(state, tenant, sp, url, participant, session_index) {
+        Ok(m) => m,
+        Err(e) => return format!("failed: {e}"),
+    };
     let alg = sp.signature_algorithm.unwrap_or(state.config.signature_algorithm);
     if let Err(e) = state.keys.with_current(|key| saml::sign_message(&mut message, &id, key, style, alg)) {
         return format!("failed: signing the LogoutRequest: {e}");
@@ -477,7 +511,7 @@ pub async fn soap_logout_request(
     state: &AppState,
     tenant: &Tenant,
     envelope: &Element,
-    req: LogoutRequest,
+    mut req: LogoutRequest,
 ) -> Response {
     let fault = crate::soap::fault;
     let p = preset(state, tenant);
@@ -497,6 +531,9 @@ pub async fn soap_logout_request(
             return fault(true, &format!("{} must sign its logout messages (want_logout_signed)", sp.label()));
         }
         _ => {}
+    }
+    if let Err(e) = decrypt_name_id(state, &mut req, envelope) {
+        return fault(true, &e);
     }
     // No cookie on a back-channel request: find the session by SessionIndex, else by the NameID
     // this SP was given.

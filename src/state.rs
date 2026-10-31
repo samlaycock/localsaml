@@ -179,6 +179,9 @@ pub struct Participant {
     /// The SessionIndex this service provider was given (templates differ in what they use).
     #[serde(default)]
     pub session_index: String,
+    /// It got the NameID as an `EncryptedID`, so its LogoutRequest carries one too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub name_id_encrypted: bool,
 }
 
 /// An authentication request waiting for the login form.
@@ -199,6 +202,9 @@ pub struct Pending {
     pub is_passive: bool,
     /// NameID format the request asked for (`NameIDPolicy/@Format`).
     pub name_id_format: Option<String>,
+    /// `NameIDPolicy` asked for an encrypted NameID.
+    #[serde(default)]
+    pub encrypt_name_id: bool,
     pub sp_name_qualifier: Option<String>,
     pub requested_authn_contexts: Vec<String>,
     pub login_hint: Option<String>,

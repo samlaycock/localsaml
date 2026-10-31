@@ -371,7 +371,9 @@ async fn authn_request(
         relay_state: arrival.relay_state.clone(),
         force_authn: req.force_authn,
         is_passive: req.is_passive,
-        name_id_format: req.name_id_format.clone().filter(|f| f != nameid::UNSPECIFIED),
+        // `encrypted` isn't a format to issue: the NameID gets the usual format, encrypted.
+        name_id_format: req.name_id_format.clone().filter(|f| f != nameid::UNSPECIFIED && f != nameid::ENCRYPTED),
+        encrypt_name_id: req.name_id_format.as_deref() == Some(nameid::ENCRYPTED),
         sp_name_qualifier: req.sp_name_qualifier.clone(),
         requested_authn_contexts: req.requested_authn_contexts.clone(),
         login_hint: req.subject.clone().or_else(|| non_empty(&arrival.params, "login_hint")),
@@ -401,6 +403,19 @@ async fn authn_request(
             &sp,
             &pending,
             Status::parse("Requester", Some(message)).unwrap(),
+        );
+    }
+    // An encrypted NameID needs the SP's encryption certificate (Core 3.4.1.1).
+    if pending.encrypt_name_id
+        && let Err(e) = name_id_encryption(preset, &sp)
+    {
+        return respond_status(
+            state,
+            tenant,
+            preset,
+            &sp,
+            &pending,
+            Status::parse("InvalidNameIDPolicy", Some(e)).unwrap(),
         );
     }
     proceed(state, tenant, headers, preset, &sp, pending, &arrival.params).await
@@ -602,6 +617,19 @@ pub struct Delivery {
     pub sign_assertion: bool,
     pub sig_alg: crate::keys::SigAlg,
     pub encrypt: Option<(rsa::RsaPublicKey, crate::xmlenc::EncAlg)>,
+    pub encrypt_name_id: Option<(rsa::RsaPublicKey, crate::xmlenc::EncAlg)>,
+}
+
+/// The key and algorithm to encrypt NameIDs for a service provider with.
+pub fn name_id_encryption(
+    preset: &Preset,
+    sp: &ServiceProvider,
+) -> Result<(rsa::RsaPublicKey, crate::xmlenc::EncAlg), String> {
+    match sp.encryption_key() {
+        Some(Ok(key)) => Ok((key, sp.encryption_algorithm.unwrap_or(preset.encryption))),
+        Some(Err(e)) => Err(format!("can't encrypt for {}: {e}", sp.label())),
+        None => Err(format!("{} has no encryption certificate to encrypt its NameID with", sp.label())),
+    }
 }
 
 pub fn delivery(state: &AppState, preset: &Preset, sp: &ServiceProvider) -> Result<Delivery, String> {
@@ -626,6 +654,7 @@ pub fn delivery(state: &AppState, preset: &Preset, sp: &ServiceProvider) -> Resu
         sign_assertion: sp.sign_assertion.unwrap_or(preset.sign_assertion),
         sig_alg: sp.signature_algorithm.unwrap_or(state.config.signature_algorithm),
         encrypt,
+        encrypt_name_id: if sp.encrypt_name_id { Some(name_id_encryption(preset, sp)?) } else { None },
     })
 }
 
@@ -658,6 +687,7 @@ pub fn respond_status(
         sign_assertion: false,
         sig_alg: d.sig_alg,
         encrypt: None,
+        encrypt_name_id: None,
         lifetime: None,
         authn_context: String::new(),
         sp_name_qualifier: None,
@@ -732,6 +762,7 @@ pub fn complete(
         name_id_format: identity.name_id_format.clone(),
         sp_name_qualifier: pending.sp_name_qualifier.clone(),
         session_index: session_index.clone(),
+        name_id_encrypted: pending.encrypt_name_id || sp.encrypt_name_id,
     });
     state.store.put(Table::Sessions, &sid, &session, Some(now + state.config.session_ttl));
 
@@ -740,10 +771,16 @@ pub fn complete(
     let (xml, pretty) = match previous {
         Some(prev) => (prev.xml, prev.pretty),
         None => {
-            let d = match delivery(state, preset, sp) {
+            let mut d = match delivery(state, preset, sp) {
                 Ok(d) => d,
                 Err(e) => return saml_error_page(tenant, "Can't send the Response", &e),
             };
+            if pending.encrypt_name_id && d.encrypt_name_id.is_none() {
+                match name_id_encryption(preset, sp) {
+                    Ok(e) => d.encrypt_name_id = Some(e),
+                    Err(e) => return saml_error_page(tenant, "Can't send the Response", &e),
+                }
+            }
             let authn_context =
                 pending.requested_authn_contexts.first().cloned().unwrap_or_else(|| preset.authn_context.to_string());
             let spec = ResponseSpec {
@@ -761,6 +798,7 @@ pub fn complete(
                 sign_assertion: d.sign_assertion,
                 sig_alg: d.sig_alg,
                 encrypt: d.encrypt,
+                encrypt_name_id: d.encrypt_name_id,
                 lifetime: state.config.assertion_ttl,
                 authn_context,
                 sp_name_qualifier: pending.sp_name_qualifier.clone(),
@@ -993,6 +1031,7 @@ async fn start_idp_initiated(
         force_authn: false,
         is_passive: false,
         name_id_format: None,
+        encrypt_name_id: false,
         sp_name_qualifier: None,
         requested_authn_contexts: vec![],
         login_hint: non_empty(params, "login_hint"),

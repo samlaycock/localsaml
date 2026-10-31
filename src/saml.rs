@@ -208,6 +208,9 @@ pub struct LogoutRequest {
     pub session_indexes: Vec<String>,
     pub not_on_or_after: Option<i64>,
     pub signed: bool,
+    /// The NameID is an `EncryptedID` (`name_id` is empty until it's decrypted).
+    #[serde(default)]
+    pub name_id_encrypted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,6 +322,7 @@ pub fn parse_element(root: &Element) -> Result<Message, String> {
                 session_indexes: root.find_all(NS_PROTOCOL, "SessionIndex").map(Element::value).collect(),
                 not_on_or_after: root.get_attr("NotOnOrAfter").and_then(parse_iso8601),
                 signed,
+                name_id_encrypted: root.find(NS_ASSERTION, "EncryptedID").is_some(),
             })
         }
         "LogoutResponse" => Message::LogoutResponse(LogoutResponse {
@@ -439,6 +443,8 @@ pub struct ResponseSpec<'a> {
     pub sign_assertion: bool,
     pub sig_alg: SigAlg,
     pub encrypt: Option<(RsaPublicKey, EncAlg)>,
+    /// Send the NameID as an `EncryptedID` for this key.
+    pub encrypt_name_id: Option<(RsaPublicKey, EncAlg)>,
     /// Overrides the template's assertion lifetime.
     pub lifetime: Option<i64>,
     pub authn_context: String,
@@ -529,7 +535,8 @@ pub fn build_response(key: &KeyPair, spec: &ResponseSpec) -> Result<Issued, Stri
     }
 
     let assertion_id = spec.assertion_id.clone().unwrap_or_else(|| new_assertion_id(style));
-    let mut assertion = build_assertion(spec, &assertion_id, &issuer(), now, lifetime, in_response_to.as_deref());
+    let (mut assertion, name_id_pretty) =
+        build_assertion(spec, &assertion_id, &issuer(), now, lifetime, in_response_to.as_deref())?;
     let mut assertion_pretty = None;
     if let Some((recipient, alg)) = &spec.encrypt {
         assertion.declare_namespaces();
@@ -539,7 +546,7 @@ pub fn build_response(key: &KeyPair, spec: &ResponseSpec) -> Result<Issued, Stri
         // With an encrypted assertion, break its own signature before encryption; a response
         // signature is broken below.
         if has(Tamper::BadSignature) && spec.sign_assertion {
-            tamper_name_id(&mut assertion);
+            tamper_signed(&mut assertion, now);
         }
         assertion_pretty = Some(assertion.to_pretty());
         let mut encrypted = a("EncryptedAssertion");
@@ -559,7 +566,7 @@ pub fn build_response(key: &KeyPair, spec: &ResponseSpec) -> Result<Issued, Stri
     }
     if has(Tamper::BadSignature) {
         if spec.encrypt.is_none() {
-            tamper_name_id(&mut response);
+            tamper_signed(&mut response, now);
         } else if spec.sign_response {
             // The NameID is inside the ciphertext, so change a signed value of the Response itself.
             response.set_attr("IssueInstant", iso8601(now + 1));
@@ -568,6 +575,9 @@ pub fn build_response(key: &KeyPair, spec: &ResponseSpec) -> Result<Issued, Stri
     let mut pretty = response.to_pretty();
     if let Some(plain) = assertion_pretty {
         pretty.push_str(&format!("\n<!-- The EncryptedAssertion, decrypted: -->\n{plain}"));
+    }
+    if let Some(plain) = name_id_pretty {
+        pretty.push_str(&format!("\n<!-- The EncryptedID, decrypted: -->\n{plain}"));
     }
     Ok(Issued {
         xml: response.to_document(),
@@ -584,16 +594,56 @@ pub fn new_assertion_id(style: &Style) -> String {
 }
 
 /// Change the NameID's text wherever it is (after signing, for `bad_signature`).
-fn tamper_name_id(el: &mut Element) {
+fn tamper_name_id(el: &mut Element) -> bool {
     if el.is(NS_ASSERTION, "NameID") {
         el.children = vec![crate::xml::Node::Text("tampered-after-signing".into())];
+        return true;
+    }
+    el.elements_mut().any(tamper_name_id)
+}
+
+/// Change a signed value of an assertion (or the Response holding it): the NameID, or with an
+/// EncryptedID, the assertion's IssueInstant.
+fn tamper_signed(el: &mut Element, now: i64) {
+    if tamper_name_id(el) {
         return;
     }
-    for child in el.elements_mut() {
-        tamper_name_id(child);
+    let assertion = if el.is(NS_ASSERTION, "Assertion") { Some(el) } else { el.find_mut(NS_ASSERTION, "Assertion") };
+    if let Some(a) = assertion {
+        a.set_attr("IssueInstant", iso8601(now + 1));
     }
 }
 
+/// An `EncryptedID` holding `name_id` (Core 2.2.4), for `recipient`. The EncryptedKey is always
+/// inside the EncryptedData's KeyInfo: some service providers (pysaml2) decrypt the EncryptedData
+/// alone, and no template's IdP sends encrypted NameIDs the other way.
+pub fn encrypted_id(
+    style: &Style,
+    name_id: &Element,
+    recipient: &RsaPublicKey,
+    alg: EncAlg,
+) -> Result<Element, String> {
+    let mut plain = name_id.clone();
+    plain.declare_namespaces();
+    let mut encrypted = Element::new(NS_ASSERTION, style.assertion_prefix, "EncryptedID");
+    encrypted.children.extend(
+        xmlenc::encrypt(&plain.to_xml(), recipient, alg, xmlenc::KeyPlacement::Inline)?
+            .into_iter()
+            .map(crate::xml::Node::Element),
+    );
+    Ok(encrypted)
+}
+
+/// The NameID in an `EncryptedID`.
+pub fn decrypt_id(encrypted: &Element, keys: &[rsa::RsaPrivateKey]) -> Result<Element, String> {
+    let name_id = parse(&xmlenc::decrypt(encrypted, keys)?)?;
+    if !name_id.is(NS_ASSERTION, "NameID") {
+        return Err(format!("the EncryptedID holds <{}>, not a NameID", name_id.qname()));
+    }
+    Ok(name_id)
+}
+
+/// The assertion, and with an EncryptedID, the NameID it holds (for people).
 fn build_assertion(
     spec: &ResponseSpec,
     id: &str,
@@ -601,7 +651,7 @@ fn build_assertion(
     now: i64,
     lifetime: i64,
     in_response_to: Option<&str>,
-) -> Element {
+) -> Result<(Element, Option<String>), String> {
     let style = &spec.preset.style;
     let has = |t: Tamper| spec.tampers.contains(&t);
     let a = |local: &str| Element::new(NS_ASSERTION, style.assertion_prefix, local);
@@ -617,6 +667,13 @@ fn build_assertion(
         .attr_opt("SPNameQualifier", spec.sp_name_qualifier.clone())
         .attr("Format", &spec.identity.name_id_format)
         .text(&spec.identity.name_id);
+    let (name_id, plain) = match &spec.encrypt_name_id {
+        Some((recipient, alg)) => {
+            let encrypted = encrypted_id(style, &name_id, recipient, *alg)?;
+            (encrypted, Some(name_id.to_pretty()))
+        }
+        None => (name_id, None),
+    };
     let subject = a("Subject").child(name_id).child(
         a("SubjectConfirmation").attr("Method", CM_BEARER).child(
             a("SubjectConfirmationData")
@@ -653,7 +710,7 @@ fn build_assertion(
     } else {
         assertion = assertion.child(authn).child_opt(attributes);
     }
-    assertion
+    Ok((assertion, plain))
 }
 
 fn attribute_statement(preset: &Preset, identity: &Identity) -> Option<Element> {
@@ -711,10 +768,12 @@ pub struct LogoutRequestSpec<'a> {
     pub sp_name_qualifier: Option<&'a str>,
     pub session_index: &'a str,
     pub now: i64,
+    /// Send the NameID as an `EncryptedID`.
+    pub encrypt: Option<(&'a RsaPublicKey, EncAlg)>,
 }
 
 /// A LogoutRequest and its ID.
-pub fn logout_request(spec: &LogoutRequestSpec) -> (Element, String) {
+pub fn logout_request(spec: &LogoutRequestSpec) -> Result<(Element, String), String> {
     let style = spec.style;
     let id = style.id_style.generate();
     let a = |local: &str| Element::new(NS_ASSERTION, style.assertion_prefix, local);
@@ -727,15 +786,19 @@ pub fn logout_request(spec: &LogoutRequestSpec) -> (Element, String) {
         .attr("NotOnOrAfter", iso8601(spec.now + 300))
         .declare(style.protocol_prefix, NS_PROTOCOL)
         .child(a("Issuer").attr_opt("Format", style.issuer_format.then_some(nameid::ENTITY)).text(spec.issuer))
-        .child(
-            a("NameID")
+        .child({
+            let name_id = a("NameID")
                 .attr_opt("SPNameQualifier", spec.sp_name_qualifier)
                 .attr("Format", spec.name_id_format)
-                .text(spec.name_id),
-        )
+                .text(spec.name_id);
+            match spec.encrypt {
+                Some((recipient, alg)) => encrypted_id(style, &name_id, recipient, alg)?,
+                None => name_id,
+            }
+        })
         .child(p("SessionIndex").text(spec.session_index));
     el.declare_namespaces();
-    (el, id)
+    Ok((el, id))
 }
 
 /// A LogoutResponse and its ID.
@@ -801,12 +864,37 @@ mod tests {
             sign_assertion: preset.sign_assertion,
             sig_alg: SigAlg::RsaSha256,
             encrypt: None,
+            encrypt_name_id: None,
             lifetime: None,
             authn_context: preset.authn_context.into(),
             sp_name_qualifier: None,
             status: None,
             tampers: vec![],
         }
+    }
+
+    #[test]
+    fn encrypted_name_ids_decrypt_and_tampering_still_breaks_the_signature() {
+        let key = crate::keys::untrusted();
+        let preset = presets::generic();
+        let identity = preset.default_identity();
+        let mut s = spec(preset, &identity);
+        s.sign_response = true;
+        s.encrypt_name_id = Some((key.public.clone(), EncAlg::Aes256Gcm));
+        let issued = build_response(key, &s).unwrap();
+        let doc = parse(&issued.xml).unwrap();
+        let subject = doc.find(NS_ASSERTION, "Assertion").unwrap().find(NS_ASSERTION, "Subject").unwrap();
+        assert!(subject.find(NS_ASSERTION, "NameID").is_none());
+        let name_id =
+            decrypt_id(subject.find(NS_ASSERTION, "EncryptedID").unwrap(), std::slice::from_ref(&key.private)).unwrap();
+        assert_eq!(name_id.value(), identity.name_id);
+        assert!(issued.pretty.contains("The EncryptedID, decrypted"));
+        dsig::verify(&doc, &issued.response_id, std::slice::from_ref(&key.public)).unwrap();
+
+        s.tampers = vec![Tamper::BadSignature];
+        let issued = build_response(key, &s).unwrap();
+        let doc = parse(&issued.xml).unwrap();
+        assert!(dsig::verify(&doc, &issued.response_id, std::slice::from_ref(&key.public)).is_err());
     }
 
     #[test]

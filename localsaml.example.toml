@@ -34,6 +34,7 @@ slo_url = "http://localhost:3000/saml/slo"
 # encryption_certificate = "..."     # defaults to certificate
 # encrypt_assertions = true          # default: the template's (Shibboleth encrypts when it can)
 # encryption_algorithm = "aes256-gcm"  # aes256-gcm | aes128-gcm | aes256-cbc | aes128-cbc
+# encrypt_name_id = false            # send NameIDs as EncryptedIDs (assertions and LogoutRequests)
 # sign_response = true               # default: the template's
 # sign_assertion = true
 # name_id_format = "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent"
