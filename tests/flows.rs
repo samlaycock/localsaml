@@ -1806,6 +1806,7 @@ async fn ecp(app: &Router, envelope: &str, login: Option<&str>) -> Resp {
 async fn ecp_logins() {
     let ecp_sp = ServiceProvider {
         acs_ecp_urls: vec!["http://ecp.test/ecp".into()],
+        certificate: Some(sp_key().cert_b64()),
         ..sp("http://ecp.test/sp", "http://ecp.test/acs")
     };
     let (app, state) = app_with(Config { users: vec![alice()], ..with_sps(vec![ecp_sp]) });
@@ -1832,6 +1833,37 @@ async fn ecp_logins() {
     assert_eq!(attr_values(assertion, "groups"), ["admins"]);
     // The session it started can be ended like any other.
     assert_eq!(get(&app, "/dev/api/sessions").await.json().as_array().unwrap().len(), 1);
+
+    // A signed request whose namespaces are declared on the Envelope (as some clients do) still
+    // verifies: the message keeps the declarations it inherited.
+    let signed = signed_xml(
+        &authn_request("_e6", "http://ecp.test/sp", Some("http://ecp.test/ecp"), &paos, ""),
+        "_e6",
+        sp_key(),
+    );
+    let decls = format!(r#" xmlns:samlp="{P}" xmlns:saml="{A}""#);
+    assert!(signed.contains(&decls), "{signed}");
+    let hoisted = format!(
+        r#"<S:Envelope xmlns:S="{}"{decls}><S:Body>{}</S:Body></S:Envelope>"#,
+        localsaml::soap::NS_SOAP,
+        signed.replacen(&decls, "", 1)
+    );
+    let r = ecp(&app, &hoisted, Some("alice")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    // A tampered one doesn't, and the fault says why.
+    let r = ecp(&app, &hoisted.replace("http://ecp.test/ecp\"", "http://ecp.test/ecp?x\""), Some("alice")).await;
+    assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(r.body.contains("Invalid AuthnRequest signature: "), "{}", r.body);
+
+    // The Basic scheme is case-insensitive (RFC 7617).
+    let lower = Request::builder()
+        .method(Method::POST)
+        .uri("/sso")
+        .header(header::CONTENT_TYPE, "text/xml")
+        .header(header::AUTHORIZATION, format!("basic {}", b64_std("alice:x")))
+        .body(Body::from(request("_e7", "http://ecp.test/ecp", "")))
+        .unwrap();
+    assert_eq!(send(&app, lower, None).await.status, StatusCode::OK);
 
     // Any other login is taken as a login hint for the template's identity.
     let r = ecp(&app, &request("_e3", "http://ecp.test/ecp", &policy(nameid::EMAIL)), Some("sam@example.com")).await;

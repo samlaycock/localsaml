@@ -254,12 +254,10 @@ pub async fn ecp(
     if soap || resp.status() == StatusCode::UNAUTHORIZED {
         return resp;
     }
-    let reason = resp
-        .headers()
-        .get("x-localsaml-error")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("the AuthnRequest was refused")
-        .to_string();
+    let reason = match resp.extensions().get::<crate::inspector::ErrorNote>() {
+        Some(note) => format!("{}: {}", note.error, note.description),
+        None => "the AuthnRequest was refused".to_string(),
+    };
     crate::soap::fault(true, &reason)
 }
 
@@ -276,7 +274,7 @@ async fn ecp_login(
     let login = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Basic "))
+        .and_then(|v| v.split_once(' ').filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic")).map(|(_, c)| c))
         .and_then(|b| crate::util::b64_std_decode_lenient(b.trim()))
         .and_then(|b| String::from_utf8(b).ok())
         .and_then(|creds| creds.split_once(':').map(|(user, _)| user.to_string()))
@@ -405,10 +403,14 @@ async fn authn_request(
         },
     };
     // ECP clients take the Response back themselves (PAOS).
+    // A URL the request names goes with its ProtocolBinding; an ACS chosen by index or by default
+    // goes with the binding it's registered for.
     let response_binding = if arrival.binding == "soap" {
         "paos".to_string()
-    } else {
+    } else if req.acs_url.is_some() {
         requested_binding.or_else(|| sp.acs_binding(&acs_url)).unwrap_or(sp.default_binding()).to_string()
+    } else {
+        sp.acs_binding(&acs_url).or(requested_binding).unwrap_or(sp.default_binding()).to_string()
     };
     if !crate::util::is_web_url(&acs_url) {
         return bad("Invalid AssertionConsumerServiceURL", &format!("'{acs_url}' is not an absolute http(s) URL."));
@@ -778,10 +780,9 @@ pub fn respond_status(
     status: Status,
 ) -> Response {
     let identity = preset.default_identity();
-    let d = match delivery(state, preset, sp) {
-        Ok(d) => d,
-        Err(e) => return saml_error_page(tenant, "Can't send the Response", &e),
-    };
+    // No assertion, so nothing to encrypt: only the signing settings matter.
+    let sign_response = sp.sign_response.unwrap_or(preset.sign_response);
+    let sig_alg = sp.signature_algorithm.unwrap_or(state.config.signature_algorithm);
     let spec = ResponseSpec {
         preset,
         issuer: tenant.entity_id.clone(),
@@ -793,9 +794,9 @@ pub fn respond_status(
         assertion_id: None,
         auth_time: state.now(),
         now: state.now(),
-        sign_response: d.sign_response,
+        sign_response,
         sign_assertion: false,
-        sig_alg: d.sig_alg,
+        sig_alg,
         encrypt: None,
         encrypt_name_id: None,
         encrypt_attributes: None,
@@ -1139,9 +1140,12 @@ async fn start_idp_initiated(
             return bad("No ACS URL", &format!("{} has no ACS URL to send an unsolicited Response to.", sp.label()));
         }
     };
-    let response_binding = binding
-        .or_else(|| sp.acs_binding(&acs_url).map(String::from))
-        .unwrap_or_else(|| sp.default_binding().to_string());
+    let response_binding = if non_empty(params, "acs").is_some() {
+        binding.or_else(|| sp.acs_binding(&acs_url).map(String::from))
+    } else {
+        sp.acs_binding(&acs_url).map(String::from).or(binding)
+    }
+    .unwrap_or_else(|| sp.default_binding().to_string());
     let preset = preset_for(state, tenant, &sp);
     let pending = Pending {
         id: uuid::Uuid::new_v4().to_string(),

@@ -6,7 +6,7 @@ use std::time::Duration;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-use crate::xml::{Element, Node, parse};
+use crate::xml::{Element, Node, Scope, parse};
 
 pub const NS_SOAP: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 
@@ -40,13 +40,15 @@ pub fn unwrap(xml: &str) -> Result<(Element, Element), String> {
     if !root.is(NS_SOAP, "Envelope") {
         return Err(format!("expected a SOAP 1.1 Envelope, got <{}>", root.qname()));
     }
-    let message = root
-        .find(NS_SOAP, "Body")
-        .ok_or("the SOAP envelope has no Body")?
-        .elements()
-        .next()
-        .cloned()
-        .ok_or("the SOAP Body is empty")?;
+    let body = root.find(NS_SOAP, "Body").ok_or("the SOAP envelope has no Body")?;
+    let mut message = body.elements().next().cloned().ok_or("the SOAP Body is empty")?;
+    // The message on its own keeps the namespaces it inherited from the Envelope and Body, so
+    // its signature (Exclusive C14N, perhaps with an InclusiveNamespaces list) still verifies.
+    for (prefix, uri) in body.scope_within(&root.scope_within(&Scope::new())) {
+        if !message.decls.iter().any(|(p, _)| *p == prefix) {
+            message.decls.push((prefix, uri));
+        }
+    }
     if message.is(NS_SOAP, "Fault") {
         let reason = message.elements().find(|e| e.local == "faultstring").map(Element::value).unwrap_or_default();
         return Err(format!("SOAP fault: {reason}"));
@@ -91,7 +93,10 @@ mod tests {
     fn envelopes_round_trip() {
         let mut msg = Element::new("urn:x", "x", "Ping").attr("ID", "_1");
         msg.declare_namespaces();
-        let (_, back) = unwrap(&envelope(msg.clone())).unwrap();
+        let (_, mut back) = unwrap(&envelope(msg.clone())).unwrap();
+        // The message keeps the namespaces it inherited from the envelope.
+        assert!(back.decls.contains(&(Some("soap11".into()), NS_SOAP.into())));
+        back.decls.retain(|(p, _)| p.as_deref() != Some("soap11"));
         assert_eq!(back, msg);
         assert!(unwrap("<x/>").is_err());
         let mut fault_env =

@@ -157,6 +157,14 @@ impl ServiceProvider {
         {
             anyhow::bail!("response_binding must be 'post' or 'artifact'");
         }
+        let has_metadata = self.metadata_url.is_some() || self.metadata_file.is_some() || self.metadata.is_some();
+        if (self.encrypt_name_id || self.encrypt_attributes || self.encrypt_assertions == Some(true))
+            && self.certificate.is_none()
+            && self.encryption_certificate.is_none()
+            && !has_metadata
+        {
+            anyhow::bail!("encryption is on, but there's no certificate (or metadata) to encrypt for");
+        }
         for cert in self.certificate.iter().chain(&self.encryption_certificate) {
             parse_cert(cert).map_err(anyhow::Error::msg)?;
         }

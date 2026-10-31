@@ -256,6 +256,7 @@ pub struct AttributeQuery {
     /// Empty when the subject is an `EncryptedID` that hasn't been decrypted yet.
     pub name_id: Option<String>,
     pub name_id_format: Option<String>,
+    pub sp_name_qualifier: Option<String>,
     pub name_id_encrypted: bool,
     /// The attributes asked for; none means all of them.
     pub attributes: Vec<RequestedAttribute>,
@@ -404,6 +405,7 @@ pub fn parse_element(root: &Element) -> Result<Message, String> {
                 destination: opt(&root, "Destination"),
                 name_id: name_id.map(Element::value),
                 name_id_format: name_id.and_then(|n| opt(n, "Format")),
+                sp_name_qualifier: name_id.and_then(|n| opt(n, "SPNameQualifier")),
                 name_id_encrypted,
                 attributes: root
                     .find_all(NS_ASSERTION, "Attribute")

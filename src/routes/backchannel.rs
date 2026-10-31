@@ -68,10 +68,10 @@ async fn artifact_resolve(state: &AppState, tenant: &Tenant, envelope: &Element,
         Ok(()) => match state.store.get::<StoredArtifact>(Table::Artifacts, &req.artifact) {
             None => Err("unknown, expired or already resolved".to_string()),
             Some(stored) if stored.sp != sp.entity_id => Err(format!("issued for {}, not {}", stored.sp, sp.entity_id)),
-            Some(stored) => {
-                state.store.remove(Table::Artifacts, &req.artifact);
-                parse(&stored.xml)
-            }
+            // Only the request that actually removes it gets the message (one-time use, even
+            // when two resolutions race).
+            Some(stored) if state.store.remove(Table::Artifacts, &req.artifact) => parse(&stored.xml),
+            Some(_) => Err("already resolved".to_string()),
         },
     };
     let preset = preset_for(state, tenant, &sp);
@@ -150,6 +150,7 @@ async fn attribute_query(state: &AppState, tenant: &Tenant, envelope: &Element, 
             Ok(n) => {
                 req.name_id = Some(n.value());
                 req.name_id_format = n.get_attr("Format").map(String::from);
+                req.sp_name_qualifier = n.get_attr("SPNameQualifier").map(String::from);
             }
             Err(e) => {
                 return answer(
@@ -166,9 +167,7 @@ async fn attribute_query(state: &AppState, tenant: &Tenant, envelope: &Element, 
     // The subject as the service provider named it (Core 3.3.4: the assertion's Subject must
     // match the query's).
     identity.name_id = name_id;
-    if let Some(f) = &req.name_id_format {
-        identity.name_id_format = f.clone();
-    }
+    identity.name_id_format = req.name_id_format.clone().unwrap_or_else(|| crate::presets::nameid::UNSPECIFIED.into());
     if !req.attributes.is_empty() {
         let mut kept = serde_json::Map::new();
         for wanted in &req.attributes {
@@ -187,8 +186,12 @@ async fn attribute_query(state: &AppState, tenant: &Tenant, envelope: &Element, 
         Ok(d) => d,
         Err(e) => return soap::fault(false, &e),
     };
+    // An encrypted subject is answered encrypted, or not at all.
     if req.name_id_encrypted && d.encrypt_name_id.is_none() {
-        d.encrypt_name_id = name_id_encryption(preset, &sp).ok();
+        match name_id_encryption(preset, &sp) {
+            Ok(e) => d.encrypt_name_id = Some(e),
+            Err(e) => return answer(Status::parse("Requester", Some(e)).unwrap()),
+        }
     }
     let now = state.now();
     let spec = ResponseSpec {
@@ -211,7 +214,7 @@ async fn attribute_query(state: &AppState, tenant: &Tenant, envelope: &Element, 
         encrypt_attributes: d.encrypt_attributes,
         lifetime: state.config.assertion_ttl,
         authn_context: String::new(),
-        sp_name_qualifier: None,
+        sp_name_qualifier: req.sp_name_qualifier.clone(),
         status: None,
         tampers: vec![],
         attribute_query: true,
