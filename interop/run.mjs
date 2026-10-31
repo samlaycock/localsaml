@@ -132,6 +132,7 @@ ${extra}`);
     entries.push(`[[service_providers]]
 entity_id = "${entity}"
 acs_urls = ["${SHIB}${prefix}/Shibboleth.sso/SAML2/POST"]
+acs_artifact_urls = ["${SHIB}${prefix}/Shibboleth.sso/SAML2/Artifact"]
 slo_url = "${SHIB}${prefix}/Shibboleth.sso/SLO/Redirect"
 want_authn_requests_signed = true
 encrypt_assertions = ${encrypt}
@@ -167,6 +168,9 @@ ${declaredSps(keys)}
   const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('LOCALSAML_')));
   const child = spawn(path.resolve(binary), [
     '--ephemeral-keys', '--port', String(PORT), '--base-url', BASE, '--data-dir', path.join(tmp, 'data'),
+    // Shibboleth SP resolves artifacts from its container (host.docker.internal). Docker Desktop
+    // forwards that to the host's loopback; on Linux it's the bridge gateway, so listen there too.
+    ...(process.platform === 'linux' ? ['--host', '0.0.0.0'] : []),
   ], { cwd: tmp, env, stdio: ['ignore', 'pipe', 'pipe'] });
   let log = '';
   child.stdout.on('data', (d) => (log += d));
@@ -1004,6 +1008,8 @@ async function runHelperStack(stack, helper, issuer, keys) {
 // ---------------------------------------------------------------- Shibboleth SP
 
 function shibConfig(issuers) {
+  // requireConfidentiality: artifacts are resolved over plain HTTP (localsaml has no TLS), so
+  // the ArtifactResponse's signature is what authenticates it.
   // reloadChanges: the key-rotation checks replace a metadata file to show the SP the new certificate.
   const metadata = issuers.map((i) => `      <MetadataProvider type="XML" validate="false" reloadChanges="true" path="idp-${i.id}.xml"/>`).join('\n');
   const sessions = (handlerURL) => `<Sessions lifetime="28800" timeout="3600" relayState="ss:mem" checkAddress="false" handlerURL="${handlerURL}" handlerSSL="false" cookieProps="http" redirectLimit="none">
@@ -1021,7 +1027,7 @@ function shibConfig(issuers) {
       </Host>
     </RequestMap>
   </RequestMapper>
-  <ApplicationDefaults entityID="${SHIB}/shibboleth" REMOTE_USER="nameid" signing="true" encryption="false" homeURL="${SHIB}/">
+  <ApplicationDefaults entityID="${SHIB}/shibboleth" REMOTE_USER="nameid" signing="true" encryption="false" homeURL="${SHIB}/" requireConfidentiality="false">
     ${sessions('/Shibboleth.sso')}
     <Errors supportContact="root@localhost"/>
     <MetadataProvider type="Chaining">
@@ -1059,6 +1065,17 @@ ${rules.join('\n')}
 `;
 }
 
+/** The message in a Redirect binding URL. */
+function inflateRedirect(url) {
+  const q = new URL(url).searchParams;
+  return zlib.inflateRawSync(Buffer.from(q.get('SAMLRequest') || q.get('SAMLResponse'), 'base64')).toString();
+}
+
+/** Issuer metadata for Shibboleth SP, which resolves artifacts from inside its container. */
+function shibMetadata(xml) {
+  return xml.replace(/(<md:ArtifactResolutionService\b[^>]*Location=")http:\/\/localhost:/g, '$1http://host.docker.internal:');
+}
+
 async function startShibboleth(issuers, presets, keys) {
   const dir = path.join(tmp, 'shibboleth');
   fs.mkdirSync(dir, { recursive: true });
@@ -1066,16 +1083,16 @@ async function startShibboleth(issuers, presets, keys) {
   fs.writeFileSync(path.join(dir, 'attribute-map.xml'), shibAttributeMap(presets));
   fs.writeFileSync(path.join(dir, 'sp-key.pem'), keys.key);
   fs.writeFileSync(path.join(dir, 'sp-cert.pem'), keys.cert);
-  for (const i of issuers) fs.writeFileSync(path.join(dir, `idp-${i.id}.xml`), i.md.xml);
+  for (const i of issuers) fs.writeFileSync(path.join(dir, `idp-${i.id}.xml`), shibMetadata(i.md.xml));
   for (const f of fs.readdirSync(dir)) fs.chmodSync(path.join(dir, f), 0o644);
   const name = `localsaml-interop-shibboleth-${process.pid}`;
   spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore' });
   // No --rm: if it fails to start, its logs are still there to report.
-  execFileSync('docker', ['run', '-d', '--name', name, '-p', `${SHIB_PORT}:80`, '-e', `SHIB_URL=${SHIB}`, '-v', `${dir}:/interop:ro`, STACK_IMAGES.shibboleth], { stdio: 'ignore' });
+  execFileSync('docker', ['run', '-d', '--name', name, '--add-host', 'host.docker.internal:host-gateway', '-p', `${SHIB_PORT}:80`, '-e', `SHIB_URL=${SHIB}`, '-v', `${dir}:/interop:ro`, STACK_IMAGES.shibboleth], { stdio: 'ignore' });
   const logs = () => spawnSync('docker', ['logs', name], { encoding: 'utf8' }).stderr + spawnSync('docker', ['exec', name, 'cat', '/var/log/shibboleth/shibd.log'], { encoding: 'utf8' }).stdout;
   /** Replace an issuer's metadata (shibd reloads it on its next use). */
   const updateMetadata = (id, xml) => execFileSync('docker', ['exec', '-i', name, 'sh', '-c',
-    `cat > /etc/shibboleth/idp-${id}.xml.new && mv /etc/shibboleth/idp-${id}.xml.new /etc/shibboleth/idp-${id}.xml`], { input: xml });
+    `cat > /etc/shibboleth/idp-${id}.xml.new && mv /etc/shibboleth/idp-${id}.xml.new /etc/shibboleth/idp-${id}.xml`], { input: shibMetadata(xml) });
   for (let i = 0; i < 150; i++) {
     try {
       if ((await fetch(`${SHIB}/Shibboleth.sso/Metadata`)).ok) return { stop: () => spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore' }), logs, updateMetadata };
@@ -1158,6 +1175,31 @@ async function runShibboleth(issuer, keys) {
       return `nameid ${email}`;
     });
   }
+  await check(name, 'shibboleth', 'SP-initiated, HTTP-Artifact Response resolved over SOAP', async () => {
+    const b = new Browser();
+    const email = expectEmail('artifact');
+    const target = `${SHIB}/secure/`;
+    // Shibboleth's own metadata says which ACS index is HTTP-Artifact.
+    const spMd = await (await fetch(`${SHIB}/Shibboleth.sso/Metadata`)).text();
+    const acsIndex = (spMd.match(/<md:AssertionConsumerService[^>]*Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact"[^>]*index="(\d+)"/) || [])[1];
+    assert(acsIndex, 'Shibboleth SP has no HTTP-Artifact ACS');
+    let res = await b.get(`${SHIB}/Shibboleth.sso/Login?entityID=${encodeURIComponent(issuer.md.entityId)}&target=${encodeURIComponent(target)}&acsIndex=${acsIndex}`);
+    const location = res.headers.get('location');
+    assert(location && location.startsWith(BASE), `expected a redirect to localsaml, got ${res.status} ${location || shibError(await res.text())}`);
+    const request = inflateRedirect(location);
+    assert(request.includes('bindings:HTTP-Artifact'), `the AuthnRequest doesn't ask for HTTP-Artifact: ${request.slice(0, 300)}`);
+    res = await b.get(`${location}&${new URLSearchParams({ dev_attributes: JSON.stringify(devAttrs(email)), dev_name_id: email })}`);
+    const acs = res.headers.get('location') || '';
+    assert(res.status === 303 && acs.startsWith(`${SHIB}/Shibboleth.sso/SAML2/Artifact?SAMLart=`), `expected a redirect with an artifact, got ${res.status} ${acs || res.headers.get('x-localsaml-error')}: ${request.slice(0, 400)}`);
+    res = await b.get(acs);
+    const back = res.headers.get('location');
+    assert(res.status === 302 && back === target, `Shibboleth didn't accept the artifact: ${res.status} ${back || shibReason(await res.text())}`);
+    checkSession(await shibSession(b, ''), email);
+    // localsaml resolves each artifact once: a replay gets an empty ArtifactResponse.
+    const replay = await new Browser().get(acs);
+    assert(replay.status !== 302, `a replayed artifact was accepted: ${replay.status} ${replay.headers.get('location')}`);
+    return `nameid ${email}; replay refused`;
+  });
   await check(name, 'shibboleth', 'encrypted assertion (aes256-gcm)', async () => {
     const email = expectEmail('enc');
     const { posted, session } = await login(new Browser(), { app: '/enc', email });
