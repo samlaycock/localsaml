@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # The release workflow dispatches CI on the release pull request's branch.
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.99
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  interop:
+    name: Interop (node-saml, samlify)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.99
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: interop/package-lock.json
+      - run: cargo build
+      - run: npm ci
+        working-directory: interop
+      - run: npm test
+        working-directory: interop
+
+  docker:
+    name: Docker build (no push)
+    # Only release pull requests: the image is only published from them.
+    if: github.ref_name == 'changeset-release/main' || github.head_ref == 'changeset-release/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=linux/amd64
+          cache-to: type=gha,mode=max,scope=linux/amd64
+
+  changeset:
+    name: Changeset present
+    # The release pull request consumes changesets rather than adding one.
+    if: github.event_name == 'pull_request' && github.head_ref != 'changeset-release/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Check for a changeset
+        run: |
+          if ! npx changeset status --since="origin/${{ github.base_ref }}"; then
+            echo "::error::This pull request needs a changeset. Run 'npm run changeset' (or 'npm run changeset -- --empty' for changes users won't notice)."
+            exit 1
+          fi

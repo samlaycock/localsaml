@@ -1,0 +1,53 @@
+# Copy to ./localsaml.toml (picked up automatically) or pass --config <path>.
+# Every setting is optional; CLI flags and LOCALSAML_* env vars take precedence.
+
+# host = "127.0.0.1"            # use "0.0.0.0" in Docker
+# port = 9401
+# base_url = "http://localhost:9401"
+# dynamic_base_url = false      # derive the base URL from the Host header
+# entity_id = "http://localhost:9401/metadata"   # the root issuer's entity ID
+# default_preset = "generic"    # template used on the root issuer (generic, entra, okta, ...)
+# auto_login = false            # skip the login UI (CI / headless e2e)
+# silent_sso = false            # reuse a session without showing the login UI, like a real IdP
+# strict_service_providers = false  # reject service providers not declared below or registered
+# data_dir = "~/.localsaml"     # signing key, certificate and state
+# ephemeral_keys = false
+# assertion_ttl = 300           # default: the template's
+# session_ttl = 28800
+# signature_algorithm = "rsa-sha256"   # rsa-sha256 | rsa-sha512 | rsa-sha1
+
+# Declared service providers get their ACS URLs enforced, their signed requests verified,
+# assertions encrypted for them (if asked) and single logout. Undeclared ones are accepted
+# with the ACS URL from their AuthnRequest, unless strict_service_providers = true.
+[[service_providers]]
+entity_id = "http://localhost:3000/saml/metadata"
+name = "My App"
+acs_urls = ["http://localhost:3000/saml/acs"]
+slo_url = "http://localhost:3000/saml/slo"
+# slo_binding = "redirect"           # redirect | post
+# certificate = "-----BEGIN CERTIFICATE-----..."   # verifies signed AuthnRequests
+# want_authn_requests_signed = false
+# encryption_certificate = "..."     # defaults to certificate
+# encrypt_assertions = true          # default: the template's (Shibboleth encrypts when it can)
+# encryption_algorithm = "aes256-gcm"  # aes256-gcm | aes128-gcm | aes256-cbc | aes128-cbc
+# sign_response = true               # default: the template's
+# sign_assertion = true
+# name_id_format = "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent"
+# audience = "..."                   # default: the entity ID
+# default_relay_state = "/dashboard" # for IdP-initiated logins
+# preset = "okta"                    # template to use when this SP signs in on the root issuer
+
+# Or read everything from the SP's metadata (explicit settings above still win):
+# [[service_providers]]
+# metadata_url = "http://localhost:3000/saml/metadata"   # retried until the SP is up
+# metadata_file = "sp-metadata.xml"                      # relative to this file
+
+# Named users for the login page, dev_user=<id> and the dev API ("user").
+# Attributes are merged over the template's defaults; values are strings or lists of strings.
+[[users]]
+id = "alice"
+label = "Alice (admin)"
+preset = "okta"
+attributes = { email = "alice@acme.dev", firstName = "Alice", groups = ["Everyone", "Admins"] }
+# name_id = "alice@acme.dev"         # default: derived like the template's
+# name_id_format = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"

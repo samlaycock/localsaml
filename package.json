@@ -1,0 +1,16 @@
+{
+  "name": "localsaml",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Release tooling for localsaml. The version here is the source of truth; Cargo.toml follows it.",
+  "repository": "github:samlaycock/localsaml",
+  "license": "MIT OR Apache-2.0",
+  "scripts": {
+    "changeset": "changeset",
+    "version": "changeset version && node scripts/sync-version.mjs"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "^1.0.1",
+    "@changesets/cli": "^3.0.3"
+  }
+}

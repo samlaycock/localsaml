@@ -1,0 +1,5 @@
+---
+"localsaml": minor
+---
+
+First release of localsaml, a local SAML 2.0 identity provider for offline development, published as a Docker image (`ghcr.io/samlaycock/localsaml`) for linux/amd64 and linux/arm64. Signing in shows a short wizard (template, attributes, subject) instead of a password prompt, with saved identities for one-click sign-in. Templates reproduce the attribute names, NameIDs, signing behaviour, XML style and endpoint paths of Microsoft Entra ID, AD FS, Okta, Google Workspace, OneLogin, Auth0, Keycloak, PingFederate, JumpCloud and Shibboleth. It supports the HTTP-Redirect and HTTP-POST bindings, signed requests and responses, encrypted assertions, IdP-initiated SSO and single logout, and adds a built-in test SP, an assertion generator, a request inspector that decodes every SAML message, fault injection (error statuses and deliberately defective responses), a shifted clock and signing key rotation.

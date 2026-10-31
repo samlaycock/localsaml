@@ -1,0 +1,14 @@
+{
+  "name": "localsaml-interop",
+  "private": true,
+  "description": "Drives localsaml with real SAML service-provider libraries (node-saml, samlify).",
+  "type": "module",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "dependencies": {
+    "@authenio/samlify-node-xmllint": "2.0.0",
+    "@node-saml/node-saml": "5.2.0",
+    "samlify": "2.15.1"
+  }
+}

@@ -1,0 +1,50 @@
+[package]
+name = "localsaml"
+version = "0.0.0"
+edition = "2024"
+description = "A local SAML 2.0 identity provider for offline development and testing"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/samlaycock/localsaml"
+readme = "README.md"
+keywords = ["saml", "sso", "testing", "identity-provider", "idp"]
+categories = ["development-tools::testing", "authentication"]
+
+[dependencies]
+aes = "0.8"
+aes-gcm = "0.10"
+anyhow = "1.0.104"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.23"
+cbc = { version = "0.1", features = ["alloc"] }
+clap = { version = "4.6.7", features = ["derive", "env"] }
+flate2 = "1"
+quick-xml = "0.38"
+rand = "0.8"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+rsa = { version = "0.9", features = ["sha1", "sha2"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha1 = { version = "0.10", features = ["oid"] }
+sha2 = { version = "0.10", features = ["oid"] }
+tokio = { version = "1.54.1", features = ["full"] }
+toml = "1.1.8"
+tower-http = { version = "0.7.1", features = ["cors", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url = "2.5.8"
+uuid = { version = "1.29.0", features = ["v4"] }
+x509-cert = { version = "0.2", features = ["builder"] }
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tower = { version = "0.5.3", features = ["util"] }
+
+# RSA key generation is painfully slow without optimisation.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.release]
+strip = "symbols"
