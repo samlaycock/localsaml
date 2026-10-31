@@ -123,13 +123,14 @@ Every template issuer serves the same endpoints under `/p/<template>`, plus that
 - **Responses:** RSA-SHA256 by default (RSA-SHA512 and RSA-SHA1 too), with Exclusive XML Canonicalization and the certificate in `KeyInfo`. Whether the Response, the Assertion or both are signed follows the template, and can be overridden per service provider. Bearer subject confirmation, `Conditions` with an `AudienceRestriction`, an `AuthnStatement` with a `SessionIndex`, and an `AttributeStatement`.
 - **Encrypted assertions:** `EncryptedAssertion` with AES-256-GCM (default), AES-128-GCM, AES-256-CBC or AES-128-CBC, and RSA-OAEP key transport, for service providers with an encryption certificate.
 - **Encrypted NameIDs:** an `EncryptedID` instead of the NameID (with the key inside the EncryptedData, so service providers that decrypt it on its own can), for service providers with `encrypt_name_id = true` or whose AuthnRequest asks for `NameIDPolicy Format="urn:oasis:names:tc:SAML:2.0:nameid-format:encrypted"` (`InvalidNameIDPolicy` if there's no encryption certificate). LogoutRequests to them carry an `EncryptedID` too, and LogoutRequests with one, encrypted for localsaml's certificate, are decrypted.
+- **Encrypted attributes:** with `encrypt_attributes = true`, each attribute is sent as an `EncryptedAttribute`. Few service providers handle them: Shibboleth SP (OpenSAML C++) rejects an AttributeStatement that holds only EncryptedAttributes, and pysaml2 7.5 fails to decrypt them, so check yours does before relying on it.
 - **NameIDs:** the template's format by default, or the one `NameIDPolicy` asks for. Email-address NameIDs follow the email attribute. Persistent NameIDs are pairwise (stable per user and service provider, like Entra ID's and Shibboleth's), and transient ones are new each session. You can also type any NameID in the login form.
 - **Sessions:** a cookie per issuer. With `--silent-sso` a second service provider gets an assertion without seeing the login page, like a production IdP. Otherwise the login page offers the active session as a one-click option, so you can still change identities. `ForceAuthn` always shows the login page and restarts the `AuthnInstant`.
 - **IdP-initiated SSO:** unsolicited Responses (no `InResponseTo`) to a service provider's default ACS URL, with a `RelayState`. The template aliases work too, e.g. Shibboleth's `/idp/profile/SAML2/Unsolicited/SSO?providerId=…` and PingFederate's `/idp/startSSO.ping?PartnerSpId=…`.
 - **Attribute queries:** localsaml is also an attribute authority (`AttributeAuthorityDescriptor` in the metadata). A service provider POSTs an `AttributeQuery` in a SOAP envelope to `/attribute` and gets a Response with an assertion about the NameID it asked about: the attributes of the session in which it was given that NameID, or of the declared user with it, filtered to the attributes (and values) the query names. The assertion is signed (and encrypted, like that SP's assertions), with a sender-vouches `SubjectConfirmation` for that SP and no `AuthnStatement`. An unknown NameID gets `UnknownPrincipal`. A signed query is verified against the SP's certificate. The test SP has a **Query attributes** button.
 - **[Single logout](#single-logout):** SP-initiated and IdP-initiated. Every other service provider in the session is sent a signed LogoutRequest in turn, then the initiator gets a LogoutResponse (`PartialLogout` if some didn't answer `Success`).
 
-**Not implemented:** ECP/PAOS, encrypted attributes, `Scoping`/IdP proxying, and AuthnRequests sent by artifact. A request asking for any other response binding gets an HTTP-POST Response, with a warning.
+**Not implemented:** ECP/PAOS, `Scoping`/IdP proxying, and AuthnRequests sent by artifact. A request asking for any other response binding gets an HTTP-POST Response, with a warning.
 
 ### HTTP-Artifact
 
@@ -199,7 +200,7 @@ curl -s -X POST http://localhost:9401/dev/api/response -H 'content-type: applica
 }'
 ```
 
-The response has `saml_response` (base64), `xml`, `pretty`, `acs_url`, `relay_state`, `name_id`, `attributes`, the IDs, what was signed and encrypted, and a ready-made `curl` command. Other options are `user`, `audience`, `name_id`, `name_id_format`, `defaults: false` (start from no attributes), `sign_assertion`, `signature_algorithm`, `encrypt`, `encryption_algorithm`, `authn_context`, `session_index`, `tamper` (a list of [defects](#injecting-faults)), `status`/`status_message` (an error Response), `encrypt_name_id` and `binding: "artifact"` (also returns an `artifact` to [resolve](#http-artifact), and its ACS `url`). Without `sp`, the Response is for the test SP.
+The response has `saml_response` (base64), `xml`, `pretty`, `acs_url`, `relay_state`, `name_id`, `attributes`, the IDs, what was signed and encrypted, and a ready-made `curl` command. Other options are `user`, `audience`, `name_id`, `name_id_format`, `defaults: false` (start from no attributes), `sign_assertion`, `signature_algorithm`, `encrypt`, `encryption_algorithm`, `authn_context`, `session_index`, `tamper` (a list of [defects](#injecting-faults)), `status`/`status_message` (an error Response), `encrypt_name_id`, `encrypt_attributes` and `binding: "artifact"` (also returns an `artifact` to [resolve](#http-artifact), and its ACS `url`). Without `sp`, the Response is for the test SP.
 
 ### Declared users
 
@@ -360,6 +361,7 @@ certificate = """-----BEGIN CERTIFICATE-----
 -----END CERTIFICATE-----"""                     # verifies signed requests, encrypts assertions
 encrypt_assertions = true
 # encrypt_name_id = true                        # EncryptedID instead of NameID
+# encrypt_attributes = true                     # EncryptedAttributes (few SPs accept them)
 sign_response = true                            # override the template
 ```
 

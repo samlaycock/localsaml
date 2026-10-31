@@ -60,6 +60,9 @@ pub struct ServiceProvider {
     /// certificate. An AuthnRequest can ask for it too (`NameIDPolicy` format `encrypted`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub encrypt_name_id: bool,
+    /// Send each attribute as an `EncryptedAttribute`, with the encryption certificate.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub encrypt_attributes: bool,
     /// Override the template's signing behaviour.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sign_response: Option<bool>,

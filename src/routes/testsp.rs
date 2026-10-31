@@ -501,7 +501,19 @@ fn validate(state: &AppState, tenant: &Tenant, xml: &str, expected_request: Opti
         );
     }
     if let Some(statement) = assertion.find(NS_ASSERTION, "AttributeStatement") {
-        for attr in statement.find_all(NS_ASSERTION, "Attribute") {
+        let mut decrypted = vec![];
+        let encrypted: Vec<&Element> = statement.find_all(NS_ASSERTION, "EncryptedAttribute").collect();
+        for e in &encrypted {
+            match xmlenc::decrypt(e, &state.keys.private_keys()).and_then(|x| parse(&x)) {
+                Ok(a) if a.is(NS_ASSERTION, "Attribute") => decrypted.push(a),
+                Ok(a) => checks.fail("EncryptedAttribute", format!("holds <{}>, not an Attribute", a.qname())),
+                Err(e) => checks.fail("EncryptedAttribute", e),
+            }
+        }
+        if !encrypted.is_empty() && decrypted.len() == encrypted.len() {
+            checks.ok("EncryptedAttribute", format!("decrypted {} attributes", decrypted.len()));
+        }
+        for attr in statement.find_all(NS_ASSERTION, "Attribute").chain(&decrypted) {
             out.attributes.push((
                 attr.get_attr("Name").unwrap_or_default().to_string(),
                 attr.get_attr("FriendlyName").map(String::from),

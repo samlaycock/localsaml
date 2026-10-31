@@ -618,9 +618,10 @@ pub struct Delivery {
     pub sig_alg: crate::keys::SigAlg,
     pub encrypt: Option<(rsa::RsaPublicKey, crate::xmlenc::EncAlg)>,
     pub encrypt_name_id: Option<(rsa::RsaPublicKey, crate::xmlenc::EncAlg)>,
+    pub encrypt_attributes: Option<(rsa::RsaPublicKey, crate::xmlenc::EncAlg)>,
 }
 
-/// The key and algorithm to encrypt NameIDs for a service provider with.
+/// The key and algorithm to encrypt NameIDs (or attributes) for a service provider with.
 pub fn name_id_encryption(
     preset: &Preset,
     sp: &ServiceProvider,
@@ -628,7 +629,7 @@ pub fn name_id_encryption(
     match sp.encryption_key() {
         Some(Ok(key)) => Ok((key, sp.encryption_algorithm.unwrap_or(preset.encryption))),
         Some(Err(e)) => Err(format!("can't encrypt for {}: {e}", sp.label())),
-        None => Err(format!("{} has no encryption certificate to encrypt its NameID with", sp.label())),
+        None => Err(format!("{} has no encryption certificate to encrypt for", sp.label())),
     }
 }
 
@@ -655,6 +656,7 @@ pub fn delivery(state: &AppState, preset: &Preset, sp: &ServiceProvider) -> Resu
         sig_alg: sp.signature_algorithm.unwrap_or(state.config.signature_algorithm),
         encrypt,
         encrypt_name_id: if sp.encrypt_name_id { Some(name_id_encryption(preset, sp)?) } else { None },
+        encrypt_attributes: if sp.encrypt_attributes { Some(name_id_encryption(preset, sp)?) } else { None },
     })
 }
 
@@ -688,6 +690,7 @@ pub fn respond_status(
         sig_alg: d.sig_alg,
         encrypt: None,
         encrypt_name_id: None,
+        encrypt_attributes: None,
         lifetime: None,
         authn_context: String::new(),
         sp_name_qualifier: None,
@@ -800,6 +803,7 @@ pub fn complete(
                 sig_alg: d.sig_alg,
                 encrypt: d.encrypt,
                 encrypt_name_id: d.encrypt_name_id,
+                encrypt_attributes: d.encrypt_attributes,
                 lifetime: state.config.assertion_ttl,
                 authn_context,
                 sp_name_qualifier: pending.sp_name_qualifier.clone(),

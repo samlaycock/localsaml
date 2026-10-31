@@ -1725,3 +1725,42 @@ async fn attribute_queries() {
     let r = post_form(&app, "/sp/attributes", &[], &mut sp_jar).await;
     assert_eq!(r.title(), "Test SP: attributes · localsaml", "{}", r.body);
 }
+
+#[tokio::test]
+async fn encrypted_attributes() {
+    let secret =
+        ServiceProvider { encrypt_attributes: true, certificate: Some(sp_key().cert_b64()), ..slo_sp("secret") };
+    let (app, state) = app_with(with_sps(vec![secret]));
+    let mut jar = Jar::default();
+    let attrs = enc(r#"{"email":"jo@example.com","groups":["a","b"]}"#);
+    let p = posted(
+        &get_jar(&app, &format!("/sso/initiate?sp={}&dev_attributes={attrs}", enc("http://secret.test/sp")), &mut jar)
+            .await,
+    );
+    verify(&state, &p.doc, &p.id());
+    let statement = p.assertion().find(A, "AttributeStatement").unwrap();
+    assert_eq!(statement.find_all(A, "Attribute").count(), 0);
+    let decrypted: Vec<Element> = statement
+        .find_all(A, "EncryptedAttribute")
+        .map(|e| parse(&xmlenc::decrypt(e, sp_keys()).unwrap()).unwrap())
+        .collect();
+    let groups = decrypted.iter().find(|a| a.get_attr("Name") == Some("groups")).unwrap();
+    let values: Vec<String> = groups.find_all(A, "AttributeValue").map(Element::text_content).collect();
+    assert_eq!(values, ["a", "b"]);
+
+    // The response API, and the test SP decrypting them.
+    let minted = post_json(
+        &app,
+        "/dev/api/response",
+        json!({ "encrypt_attributes": true, "attributes": { "email": "kim@example.com" } }),
+    )
+    .await
+    .json();
+    assert_eq!(minted["attributes_encrypted"], true);
+    let mut sp_jar = Jar::default();
+    let accepted =
+        post_form(&app, "/sp/acs", &[("SAMLResponse", minted["saml_response"].as_str().unwrap())], &mut sp_jar).await;
+    assert_eq!(accepted.title(), "Test SP: signed in · localsaml", "{}", accepted.body);
+    assert!(accepted.body.contains("kim@example.com"));
+    assert!(accepted.body.contains("<b>EncryptedAttribute</b> <span>decrypted "), "{}", accepted.body);
+}

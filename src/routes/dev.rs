@@ -77,6 +77,8 @@ pub struct MintRequest {
     pub encryption_algorithm: Option<EncAlg>,
     /// Send the NameID as an `EncryptedID` (default: the service provider's setting).
     pub encrypt_name_id: Option<bool>,
+    /// Send attributes as `EncryptedAttribute`s (default: the service provider's setting).
+    pub encrypt_attributes: Option<bool>,
     /// Assertion lifetime in seconds.
     pub expires_in: Option<i64>,
     pub authn_context: Option<String>,
@@ -213,6 +215,11 @@ pub async fn mint(state: &AppState, tenant: &Tenant, req: MintRequest) -> Result
             Some(false) => None,
             None => d.encrypt_name_id.clone(),
         },
+        encrypt_attributes: match req.encrypt_attributes {
+            Some(true) => Some(crate::routes::sso::name_id_encryption(preset, &sp).map_err(invalid)?),
+            Some(false) => None,
+            None => d.encrypt_attributes.clone(),
+        },
         lifetime: req.expires_in.or(state.config.assertion_ttl),
         authn_context: req.authn_context.clone().unwrap_or_else(|| preset.authn_context.into()),
         sp_name_qualifier: None,
@@ -260,6 +267,7 @@ pub async fn mint(state: &AppState, tenant: &Tenant, req: MintRequest) -> Result
         "signed": { "response": d.sign_response && !req.tamper.contains(&Tamper::Unsigned), "assertion": d.sign_assertion && !req.tamper.contains(&Tamper::Unsigned) },
         "encrypted": issued.encrypted,
         "name_id_encrypted": spec.encrypt_name_id.is_some(),
+        "attributes_encrypted": spec.encrypt_attributes.is_some(),
         "xml": issued.xml,
         "pretty": issued.pretty,
         "curl": curl,
@@ -320,6 +328,7 @@ pub async fn api_response_get(State(state): State<AppState>, tenant: Tenant, Raw
             "sign_assertion" => req.sign_assertion = Some(yes),
             "encrypt" => req.encrypt = Some(yes),
             "encrypt_name_id" => req.encrypt_name_id = Some(yes),
+            "encrypt_attributes" => req.encrypt_attributes = Some(yes),
             "expires_in" => req.expires_in = v.parse().ok(),
             "authn_context" => req.authn_context = Some(v),
             "status" => req.status = Some(v),
@@ -824,6 +833,7 @@ pub async fn page_handler(State(state): State<AppState>, tenant: Tenant, headers
     <label>Signature algorithm<select id="dev-alg">{algs}</select></label>
     <label>Encrypt assertion<select id="dev-encrypt">{encs}</select></label>
     <label>Encrypt NameID<select id="dev-encrypt-name-id">{tri}</select></label>
+    <label>Encrypt attributes<select id="dev-encrypt-attributes">{tri}</select></label>
     <div class="checks tampers"><span class="muted small">Defects:</span>{tampers}</div>
   </div>
   <datalist id="dev-sps">{sp_options}</datalist>

@@ -593,6 +593,7 @@ document.addEventListener('click', async (e) => {
         encrypt: encrypt === '' ? undefined : encrypt !== 'none',
         encryption_algorithm: encrypt && encrypt !== 'none' ? encrypt : undefined,
         encrypt_name_id: tri(opt('dev-encrypt-name-id').value),
+        encrypt_attributes: tri(opt('dev-encrypt-attributes').value),
         tamper: [...devOptions.querySelectorAll('.dev-tamper:checked')].map((c) => c.value),
         defaults: false,
         name_id: identity.name_id || undefined,

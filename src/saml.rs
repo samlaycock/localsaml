@@ -502,6 +502,8 @@ pub struct ResponseSpec<'a> {
     pub encrypt: Option<(RsaPublicKey, EncAlg)>,
     /// Send the NameID as an `EncryptedID` for this key.
     pub encrypt_name_id: Option<(RsaPublicKey, EncAlg)>,
+    /// Send each attribute as an `EncryptedAttribute` for this key.
+    pub encrypt_attributes: Option<(RsaPublicKey, EncAlg)>,
     /// Overrides the template's assertion lifetime.
     pub lifetime: Option<i64>,
     pub authn_context: String,
@@ -595,7 +597,7 @@ pub fn build_response(key: &KeyPair, spec: &ResponseSpec) -> Result<Issued, Stri
     }
 
     let assertion_id = spec.assertion_id.clone().unwrap_or_else(|| new_assertion_id(style));
-    let (mut assertion, name_id_pretty) =
+    let (mut assertion, decrypted_notes) =
         build_assertion(spec, &assertion_id, &issuer(), now, lifetime, in_response_to.as_deref())?;
     let mut assertion_pretty = None;
     if let Some((recipient, alg)) = &spec.encrypt {
@@ -636,8 +638,8 @@ pub fn build_response(key: &KeyPair, spec: &ResponseSpec) -> Result<Issued, Stri
     if let Some(plain) = assertion_pretty {
         pretty.push_str(&format!("\n<!-- The EncryptedAssertion, decrypted: -->\n{plain}"));
     }
-    if let Some(plain) = name_id_pretty {
-        pretty.push_str(&format!("\n<!-- The EncryptedID, decrypted: -->\n{plain}"));
+    if let Some(plain) = decrypted_notes {
+        pretty.push_str(&plain);
     }
     Ok(Issued {
         xml: response.to_document(),
@@ -683,9 +685,20 @@ pub fn encrypted_id(
     recipient: &RsaPublicKey,
     alg: EncAlg,
 ) -> Result<Element, String> {
-    let mut plain = name_id.clone();
+    encrypted_element(style, "EncryptedID", name_id, recipient, alg)
+}
+
+/// `el` encrypted inside an `EncryptedID`, `EncryptedAttribute` (…) element.
+fn encrypted_element(
+    style: &Style,
+    local: &str,
+    el: &Element,
+    recipient: &RsaPublicKey,
+    alg: EncAlg,
+) -> Result<Element, String> {
+    let mut plain = el.clone();
     plain.declare_namespaces();
-    let mut encrypted = Element::new(NS_ASSERTION, style.assertion_prefix, "EncryptedID");
+    let mut encrypted = Element::new(NS_ASSERTION, style.assertion_prefix, local);
     encrypted.children.extend(
         xmlenc::encrypt(&plain.to_xml(), recipient, alg, xmlenc::KeyPlacement::Inline)?
             .into_iter()
@@ -703,7 +716,7 @@ pub fn decrypt_id(encrypted: &Element, keys: &[rsa::RsaPrivateKey]) -> Result<El
     Ok(name_id)
 }
 
-/// The assertion, and with an EncryptedID, the NameID it holds (for people).
+/// The assertion, and with an EncryptedID or EncryptedAttributes, what they hold (for people).
 fn build_assertion(
     spec: &ResponseSpec,
     id: &str,
@@ -727,12 +740,13 @@ fn build_assertion(
         .attr_opt("SPNameQualifier", spec.sp_name_qualifier.clone())
         .attr("Format", &spec.identity.name_id_format)
         .text(&spec.identity.name_id);
-    let (name_id, plain) = match &spec.encrypt_name_id {
+    let mut plain = String::new();
+    let name_id = match &spec.encrypt_name_id {
         Some((recipient, alg)) => {
-            let encrypted = encrypted_id(style, &name_id, recipient, *alg)?;
-            (encrypted, Some(name_id.to_pretty()))
+            plain.push_str(&format!("\n<!-- The EncryptedID, decrypted: -->\n{}", name_id.to_pretty()));
+            encrypted_id(style, &name_id, recipient, *alg)?
         }
-        None => (name_id, None),
+        None => name_id,
     };
     // A query's answer goes back over SOAP: the identity provider vouches for the subject to the
     // service provider (the Recipient), rather than a browser bearing it to an ACS.
@@ -760,7 +774,15 @@ fn build_assertion(
         .attr_opt("SessionNotOnOrAfter", spec.preset.session_lifetime.map(|s| iso8601(spec.auth_time + s)))
         .child(a("AuthnContext").child(a("AuthnContextClassRef").text(&spec.authn_context)));
     // An attribute authority answers with the values it has (no template's empty attributes).
-    let attributes = attribute_statement(spec.preset, spec.identity, !spec.attribute_query);
+    let mut attributes = attribute_statement(spec.preset, spec.identity, !spec.attribute_query);
+    if let (Some((recipient, alg)), Some(statement)) = (&spec.encrypt_attributes, attributes.as_mut()) {
+        plain.push_str(&format!("\n<!-- The EncryptedAttributes, decrypted: -->\n{}", statement.to_pretty()));
+        for node in statement.children.iter_mut() {
+            if let crate::xml::Node::Element(attribute) = node {
+                *attribute = encrypted_element(style, "EncryptedAttribute", attribute, recipient, *alg)?;
+            }
+        }
+    }
 
     let mut assertion = a("Assertion")
         .attr("ID", id)
@@ -776,7 +798,7 @@ fn build_assertion(
     } else {
         assertion = assertion.child(authn).child_opt(attributes);
     }
-    Ok((assertion, plain))
+    Ok((assertion, Some(plain).filter(|p| !p.is_empty())))
 }
 
 fn attribute_statement(preset: &Preset, identity: &Identity, empty_attributes: bool) -> Option<Element> {
@@ -932,6 +954,7 @@ mod tests {
             sig_alg: SigAlg::RsaSha256,
             encrypt: None,
             encrypt_name_id: None,
+            encrypt_attributes: None,
             lifetime: None,
             authn_context: preset.authn_context.into(),
             sp_name_qualifier: None,
