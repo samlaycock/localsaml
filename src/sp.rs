@@ -9,7 +9,7 @@ use rsa::RsaPublicKey;
 use serde::{Deserialize, Serialize};
 
 use crate::keys::{PublicKey, SigAlg, cert_public_key, cert_verifying_key, parse_cert};
-use crate::saml::{BINDING_POST, BINDING_REDIRECT, BINDING_SOAP, NS_MD};
+use crate::saml::{BINDING_ARTIFACT, BINDING_POST, BINDING_REDIRECT, BINDING_SOAP, NS_MD};
 use crate::xml::{Element, parse};
 use crate::xmlenc::EncAlg;
 
@@ -23,6 +23,14 @@ pub struct ServiceProvider {
     pub name: Option<String>,
     /// Assertion consumer service URLs (HTTP-POST); the first is the default.
     pub acs_urls: Vec<String>,
+    /// HTTP-Artifact assertion consumer service URLs: Responses sent with HTTP-Artifact go to the
+    /// first unless the request names one.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub acs_artifact_urls: Vec<String>,
+    /// `post` (default) or `artifact`: how to send Responses when the AuthnRequest doesn't say
+    /// (ProtocolBinding), and for IdP-initiated logins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_binding: Option<String>,
     /// `AssertionConsumerServiceIndex` values from metadata.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub acs_indexes: BTreeMap<u32, String>,
@@ -114,7 +122,14 @@ impl ServiceProvider {
             }
             anyhow::bail!("entity_id is required (or metadata to read it from)");
         }
-        for url in self.acs_urls.iter().chain(&self.slo_url).chain(&self.slo_response_url).chain(&self.slo_soap_url) {
+        for url in self
+            .acs_urls
+            .iter()
+            .chain(&self.acs_artifact_urls)
+            .chain(&self.slo_url)
+            .chain(&self.slo_response_url)
+            .chain(&self.slo_soap_url)
+        {
             if !crate::util::is_web_url(url) {
                 anyhow::bail!("'{url}' is not an absolute http(s) URL");
             }
@@ -124,6 +139,12 @@ impl ServiceProvider {
             && b != "post"
         {
             anyhow::bail!("slo_binding must be 'redirect' or 'post'");
+        }
+        if let Some(b) = &self.response_binding
+            && b != "post"
+            && b != "artifact"
+        {
+            anyhow::bail!("response_binding must be 'post' or 'artifact'");
         }
         for cert in self.certificate.iter().chain(&self.encryption_certificate) {
             parse_cert(cert).map_err(anyhow::Error::msg)?;
@@ -169,10 +190,12 @@ impl ServiceProvider {
         if self.entity_id.is_empty() {
             self.entity_id = m.entity_id;
         }
-        if self.acs_urls.is_empty() {
+        if self.acs_urls.is_empty() && self.acs_artifact_urls.is_empty() {
             self.acs_urls = m.acs_urls;
+            self.acs_artifact_urls = m.acs_artifact_urls;
             self.acs_indexes = m.acs_indexes;
         }
+        self.response_binding = self.response_binding.take().or(m.response_binding);
         self.slo_url = self.slo_url.take().or(m.slo_url);
         self.slo_response_url = self.slo_response_url.take().or(m.slo_response_url);
         self.slo_binding = self.slo_binding.take().or(m.slo_binding);
@@ -189,8 +212,29 @@ impl ServiceProvider {
         self.audience.clone().unwrap_or_else(|| self.entity_id.clone())
     }
 
-    pub fn default_acs(&self) -> Option<&String> {
-        self.acs_urls.first()
+    /// How Responses go to this SP unless a request says otherwise.
+    pub fn default_binding(&self) -> &str {
+        self.response_binding.as_deref().unwrap_or("post")
+    }
+
+    /// The default ACS URL for a binding (`post` or `artifact`), or for the other binding if
+    /// there's none.
+    pub fn default_acs(&self, binding: &str) -> Option<&String> {
+        let (first, second) = if binding == "artifact" {
+            (&self.acs_artifact_urls, &self.acs_urls)
+        } else {
+            (&self.acs_urls, &self.acs_artifact_urls)
+        };
+        first.first().or(second.first())
+    }
+
+    /// The binding an ACS URL was registered with, if it's only registered for one.
+    pub fn acs_binding(&self, url: &str) -> Option<&'static str> {
+        match (self.acs_urls.iter().any(|a| a == url), self.acs_artifact_urls.iter().any(|a| a == url)) {
+            (true, false) => Some("post"),
+            (false, true) => Some("artifact"),
+            _ => None,
+        }
     }
 
     pub fn acs_by_index(&self, index: u32) -> Option<&String> {
@@ -199,7 +243,8 @@ impl ServiceProvider {
 
     /// Is `url` one of this SP's ACS URLs? SPs without any accept everything (lenient mode).
     pub fn allows_acs(&self, url: &str) -> bool {
-        self.acs_urls.is_empty() || self.acs_urls.iter().any(|a| a == url)
+        (self.acs_urls.is_empty() && self.acs_artifact_urls.is_empty())
+            || self.acs_urls.iter().chain(&self.acs_artifact_urls).any(|a| a == url)
     }
 
     /// The key that checks this SP's signed messages (RSA or DSA).
@@ -237,16 +282,22 @@ pub fn from_metadata(xml: &str, entity_id: Option<&str>) -> Result<ServiceProvid
         .ok_or("the metadata has no SPSSODescriptor")?;
     let sp = entity.find(NS_MD, "SPSSODescriptor").ok_or("no SPSSODescriptor")?;
 
-    let mut acs: Vec<(bool, u32, String)> = sp
+    // (not the default, index, URL, artifact binding), sorted so the default comes first.
+    let mut acs: Vec<(bool, u32, String, bool)> = sp
         .find_all(NS_MD, "AssertionConsumerService")
-        .filter(|a| a.get_attr("Binding") == Some(BINDING_POST))
         .filter_map(|a| {
+            let artifact = match a.get_attr("Binding")? {
+                BINDING_POST => false,
+                BINDING_ARTIFACT => true,
+                _ => return None,
+            };
             let index = a.get_attr("index").and_then(|i| i.trim().parse().ok()).unwrap_or(0);
             let default = a.get_attr("isDefault").map(str::trim) == Some("true");
-            Some((!default, index, a.get_attr("Location")?.trim().to_string()))
+            Some((!default, index, a.get_attr("Location")?.trim().to_string(), artifact))
         })
         .collect();
     acs.sort();
+    let response_binding = acs.first().filter(|a| a.3).map(|_| "artifact".to_string());
     let slo = |binding: &str| {
         sp.find_all(NS_MD, "SingleLogoutService").find(|s| s.get_attr("Binding") == Some(binding)).map(|s| {
             (
@@ -279,8 +330,10 @@ pub fn from_metadata(xml: &str, entity_id: Option<&str>) -> Result<ServiceProvid
     Ok(ServiceProvider {
         entity_id: entity.get_attr("entityID").ok_or("EntityDescriptor has no entityID")?.trim().to_string(),
         name: name.filter(|n| !n.is_empty()),
-        acs_indexes: acs.iter().map(|(_, i, url)| (*i, url.clone())).collect(),
-        acs_urls: acs.into_iter().map(|(_, _, url)| url).collect(),
+        acs_indexes: acs.iter().map(|(_, i, url, _)| (*i, url.clone())).collect(),
+        acs_urls: acs.iter().filter(|a| !a.3).map(|a| a.2.clone()).collect(),
+        acs_artifact_urls: acs.iter().filter(|a| a.3).map(|a| a.2.clone()).collect(),
+        response_binding,
         slo_url: slo.as_ref().map(|s| s.0.clone()),
         slo_response_url: slo.and_then(|s| s.1),
         slo_binding,
@@ -318,6 +371,13 @@ mod tests {
         assert_eq!(sp.entity_id, "http://sp.test/metadata");
         assert_eq!(sp.acs_urls, ["http://sp.test/acs1", "http://sp.test/acs2"]);
         assert_eq!(sp.acs_by_index(2).map(String::as_str), Some("http://sp.test/acs2"));
+        // HTTP-Artifact ACSs are kept apart; the default ACS (POST) sets the default binding.
+        assert_eq!(sp.acs_artifact_urls, ["http://sp.test/artifact"]);
+        assert_eq!(sp.acs_by_index(0).map(String::as_str), Some("http://sp.test/artifact"));
+        assert_eq!((sp.default_binding(), sp.acs_binding("http://sp.test/artifact")), ("post", Some("artifact")));
+        let artifact_first = from_metadata(&xml.replace(r#" isDefault="true""#, ""), None).unwrap();
+        assert_eq!(artifact_first.default_binding(), "artifact");
+        assert_eq!(artifact_first.default_acs("artifact").map(String::as_str), Some("http://sp.test/artifact"));
         assert_eq!((sp.slo_url.as_deref(), sp.slo_binding.as_deref()), (Some("http://sp.test/slo"), Some("post")));
         assert!(sp.want_authn_requests_signed && sp.sign_assertion == Some(true));
         assert!(sp.signing_key().unwrap().is_ok());

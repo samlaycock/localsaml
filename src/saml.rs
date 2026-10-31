@@ -225,6 +225,16 @@ pub enum Message {
     AuthnRequest(AuthnRequest),
     LogoutRequest(LogoutRequest),
     LogoutResponse(LogoutResponse),
+    ArtifactResolve(ArtifactResolve),
+}
+
+/// A service provider asking for the message behind an artifact (SOAP binding).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactResolve {
+    pub id: String,
+    pub issuer: Option<String>,
+    pub artifact: String,
+    pub signed: bool,
 }
 
 impl Message {
@@ -233,6 +243,7 @@ impl Message {
             Message::AuthnRequest(_) => "AuthnRequest",
             Message::LogoutRequest(_) => "LogoutRequest",
             Message::LogoutResponse(_) => "LogoutResponse",
+            Message::ArtifactResolve(_) => "ArtifactResolve",
         }
     }
 }
@@ -316,6 +327,15 @@ pub fn parse_element(root: &Element) -> Result<Message, String> {
             in_response_to: opt(&root, "InResponseTo"),
             destination: opt(&root, "Destination"),
             status: Status::from_element(root.find(NS_PROTOCOL, "Status")),
+            signed,
+        }),
+        "ArtifactResolve" => Message::ArtifactResolve(ArtifactResolve {
+            id,
+            issuer: issuer_of(&root),
+            artifact: root
+                .find(NS_PROTOCOL, "Artifact")
+                .map(Element::value)
+                .ok_or("ArtifactResolve has no Artifact")?,
             signed,
         }),
         other => return Err(format!("unexpected message <{other}>")),
@@ -869,5 +889,88 @@ mod tests {
         assert_eq!((req.id.as_str(), req.issuer.as_deref(), req.force_authn), ("_r1", Some("http://sp"), true));
         assert_eq!(req.name_id_format.as_deref(), Some(nameid::EMAIL));
         assert_eq!(decode_message(&b64_std(xml), false).unwrap(), xml);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Artifacts (HTTP-Artifact binding)
+// ---------------------------------------------------------------------------
+
+/// A type 0x0004 artifact (Bindings 3.6.4): the type code, the index of the
+/// ArtifactResolutionService to ask, the SHA-1 of the issuer's entity ID and a random handle.
+pub fn new_artifact(issuer: &str, endpoint_index: u16) -> String {
+    use sha1::Digest;
+    let mut bytes = vec![0x00, 0x04];
+    bytes.extend(endpoint_index.to_be_bytes());
+    bytes.extend(sha1::Sha1::digest(issuer.as_bytes()));
+    bytes.extend((0..20).map(|_| rand::random::<u8>()));
+    b64_std(bytes)
+}
+
+/// Check an artifact's shape and that it was issued by `issuer`.
+pub fn check_artifact(artifact: &str, issuer: &str) -> Result<(), String> {
+    use sha1::Digest;
+    let bytes = b64_std_decode_lenient(artifact).ok_or("the artifact is not base64")?;
+    if bytes.len() != 44 || bytes[..2] != [0x00, 0x04] {
+        return Err("not a type 0x0004 artifact".into());
+    }
+    if bytes[4..24] != sha1::Sha1::digest(issuer.as_bytes())[..] {
+        return Err("the artifact's SourceID isn't this identity provider's".into());
+    }
+    Ok(())
+}
+
+/// An ArtifactResponse carrying `message` (none when the artifact is unknown, used, or not the
+/// requester's), and its ID.
+pub fn artifact_response(
+    style: &Style,
+    issuer: &str,
+    in_response_to: &str,
+    message: Option<Element>,
+    now: i64,
+) -> (Element, String) {
+    let id = style.id_style.generate();
+    let a = |local: &str| Element::new(NS_ASSERTION, style.assertion_prefix, local);
+    let p = |local: &str| Element::new(NS_PROTOCOL, style.protocol_prefix, local);
+    let mut el = p("ArtifactResponse")
+        .attr("ID", &id)
+        .attr("Version", "2.0")
+        .attr("IssueInstant", iso8601(now))
+        .attr("InResponseTo", in_response_to)
+        .declare(style.protocol_prefix, NS_PROTOCOL)
+        .child(a("Issuer").attr_opt("Format", style.issuer_format.then_some(nameid::ENTITY)).text(issuer))
+        .child(Status::success().element(style))
+        .child_opt(message);
+    el.declare_namespaces();
+    (el, id)
+}
+
+/// An ArtifactResolve (what a service provider sends), and its ID.
+pub fn artifact_resolve(issuer: &str, destination: &str, artifact: &str, now: i64) -> (Element, String) {
+    let id = crate::util::saml_id("_");
+    let mut el = Element::new(NS_PROTOCOL, "samlp", "ArtifactResolve")
+        .attr("ID", &id)
+        .attr("Version", "2.0")
+        .attr("IssueInstant", iso8601(now))
+        .attr("Destination", destination)
+        .declare("samlp", NS_PROTOCOL)
+        .declare("saml", NS_ASSERTION)
+        .child(Element::new(NS_ASSERTION, "saml", "Issuer").text(issuer))
+        .child(Element::new(NS_PROTOCOL, "samlp", "Artifact").text(artifact));
+    el.declare_namespaces();
+    (el, id)
+}
+
+#[cfg(test)]
+mod artifact_tests {
+    use super::*;
+
+    #[test]
+    fn artifacts_name_their_issuer() {
+        let art = new_artifact("http://idp.test/metadata", 0);
+        assert_eq!(b64_std_decode_lenient(&art).unwrap().len(), 44);
+        assert!(check_artifact(&art, "http://idp.test/metadata").is_ok());
+        assert!(check_artifact(&art, "http://other.test/metadata").is_err());
+        assert!(check_artifact("AAAA", "http://idp.test/metadata").is_err());
     }
 }

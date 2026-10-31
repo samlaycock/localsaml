@@ -25,6 +25,13 @@ pub fn document(state: &AppState, tenant: &Tenant, signed: bool) -> Result<Strin
             Element::new(NS_DS, "ds", "X509Data").child(Element::new(NS_DS, "ds", "X509Certificate").text(cert)),
         )));
     }
+    idp = idp.child(
+        md("ArtifactResolutionService")
+            .attr("Binding", BINDING_SOAP)
+            .attr("Location", tenant.url("/artifact"))
+            .attr("index", "0")
+            .attr("isDefault", "true"),
+    );
     if let Some(slo) = tenant.slo_url() {
         for binding in [BINDING_REDIRECT, BINDING_POST, BINDING_SOAP] {
             idp = idp.child(md("SingleLogoutService").attr("Binding", binding).attr("Location", &slo));

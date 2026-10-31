@@ -1430,3 +1430,97 @@ async fn back_channel_logout_over_soap() {
     let (_, to_front) = redirected(&r, "SAMLResponse");
     assert_eq!(Status::from_element(to_front.find(P, "Status")).short(), "PartialLogout");
 }
+
+// ---------------------------------------------------------------------------
+// HTTP-Artifact
+// ---------------------------------------------------------------------------
+
+/// Resolve an artifact at the ArtifactResolutionService as `issuer`: the ArtifactResponse and
+/// the Response it carried, if any.
+async fn resolve(app: &Router, state: &AppState, issuer: &str, artifact: &str) -> (Element, Option<Element>) {
+    let (request, id) = saml::artifact_resolve(issuer, &format!("{BASE}/artifact"), artifact, wall_clock());
+    let r = post_body(app, Method::POST, "/artifact", "text/xml", &localsaml::soap::envelope(request)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let (_, answer) = localsaml::soap::unwrap(&r.body).unwrap();
+    assert!(answer.is(P, "ArtifactResponse"), "{}", r.body);
+    assert_eq!(answer.get_attr("InResponseTo"), Some(id.as_str()));
+    assert!(Status::from_element(answer.find(P, "Status")).is_success());
+    verify(state, &answer, answer.get_attr("ID").unwrap());
+    let inner = answer.find(P, "Response").cloned();
+    (answer, inner)
+}
+
+#[tokio::test]
+async fn artifact_binding() {
+    let art_sp = ServiceProvider {
+        entity_id: "http://art.test/sp".into(),
+        acs_artifact_urls: vec!["http://art.test/acs".into()],
+        ..Default::default()
+    };
+    let (app, state) = app_with(with_sps(vec![art_sp, sp(SP, ACS)]));
+
+    let md = parse(&get(&app, "/metadata").await.body).unwrap();
+    let ars = md.path(&[(saml::NS_MD, "IDPSSODescriptor"), (saml::NS_MD, "ArtifactResolutionService")]).unwrap();
+    assert_eq!(ars.get_attr("Location"), Some(format!("{BASE}/artifact").as_str()));
+
+    // ProtocolBinding HTTP-Artifact: the browser is redirected with an artifact, not a Response.
+    let mut jar = Jar::default();
+    let xml = authn_request("_art1", SP, Some(ACS), &format!(r#" ProtocolBinding="{}""#, saml::BINDING_ARTIFACT), "");
+    let page = get_jar(&app, &redirect("/sso", "SAMLRequest", &xml, Some("/home"), None), &mut jar).await;
+    let resp =
+        approve(&app, "", &page, "generic", json!({ "attributes": { "email": "a@example.com" } }), &mut jar).await;
+    assert_eq!(resp.status, StatusCode::SEE_OTHER, "{}", resp.body);
+    let loc = resp.location();
+    assert_eq!(format!("{}://{}{}", loc.scheme(), loc.host_str().unwrap(), loc.path()), ACS);
+    assert_eq!(query_param(&loc, "RelayState").as_deref(), Some("/home"));
+    let artifact = query_param(&loc, "SAMLart").unwrap();
+    assert_eq!(b64_std_decode_lenient(&artifact).unwrap().len(), 44);
+
+    // Only the SP it was issued for can resolve it, and only once.
+    let (_, none) = resolve(&app, &state, "http://art.test/sp", &artifact).await;
+    assert!(none.is_none());
+    let (answer, response) = resolve(&app, &state, SP, &artifact).await;
+    let response = response.expect("the Response");
+    assert_eq!(response.get_attr("InResponseTo"), Some("_art1"));
+    verify(&state, &answer, response.get_attr("ID").unwrap());
+    assert!(resolve(&app, &state, SP, &artifact).await.1.is_none());
+    // Garbage and front-channel resolution are refused.
+    assert!(resolve(&app, &state, SP, "AAQAAA==").await.1.is_none());
+    let (request, _) = saml::artifact_resolve(SP, "x", &artifact, wall_clock());
+    let r = get(&app, &redirect("/sso", "SAMLRequest", &request.to_xml(), None, None)).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+
+    // An SP whose only (or default) ACS is HTTP-Artifact gets artifacts for IdP-initiated logins.
+    let r = get_jar(&app, "/sso/initiate?sp=http%3A%2F%2Fart.test%2Fsp&dev_attributes=%7B%7D", &mut jar).await;
+    let loc = r.location();
+    assert!(loc.as_str().starts_with("http://art.test/acs?SAMLart="), "{loc}");
+    let (_, response) = resolve(&app, &state, "http://art.test/sp", &query_param(&loc, "SAMLart").unwrap()).await;
+    assert!(response.unwrap().get_attr("InResponseTo").is_none());
+
+    // The response API can mint artifacts too.
+    let minted = post_json(&app, "/dev/api/response", json!({ "sp": SP, "binding": "artifact" })).await.json();
+    let artifact = minted["artifact"]["artifact"].as_str().unwrap();
+    assert!(minted["artifact"]["url"].as_str().unwrap().starts_with(&format!("{ACS}?SAMLart=")));
+    let (_, response) = resolve(&app, &state, SP, artifact).await;
+    assert_eq!(response.unwrap().get_attr("ID"), minted["response_id"].as_str());
+}
+
+#[tokio::test]
+async fn the_test_sp_resolves_artifacts() {
+    let (app, _) = app();
+    let mut jar = Jar::default();
+    let r = get_jar(&app, "/sp/login?binding=redirect&response_binding=artifact&RelayState=%2Fx", &mut jar).await;
+    let loc = r.location();
+    let path_and_query = &loc.as_str()[BASE.len()..];
+    let page = get_jar(&app, path_and_query, &mut jar).await;
+    let resp =
+        approve(&app, "", &page, "generic", json!({ "attributes": { "email": "a@example.com" } }), &mut jar).await;
+    let loc = resp.location();
+    assert!(loc.as_str().starts_with(&format!("{BASE}/sp/acs?SAMLart=")), "{loc}");
+    let accepted = get_jar(&app, &loc.as_str()[BASE.len()..], &mut jar).await;
+    assert_eq!(accepted.title(), "Test SP: signed in · localsaml", "{}", accepted.body);
+    assert!(accepted.body.contains("ArtifactResponse signature"));
+    // A second use of the artifact is refused.
+    let again = get_jar(&app, &loc.as_str()[BASE.len()..], &mut jar).await;
+    assert_eq!(again.title(), "Test SP: rejected · localsaml");
+}

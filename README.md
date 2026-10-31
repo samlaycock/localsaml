@@ -95,6 +95,7 @@ To make localsaml look like a specific identity provider, use that template's is
 | Metadata | `/metadata` (`?signed=true` for signed metadata) |
 | Single sign-on (HTTP-Redirect, HTTP-POST) | `/sso` |
 | Single logout (HTTP-Redirect, HTTP-POST, SOAP) | `/slo` |
+| Artifact resolution (SOAP) | `/artifact` |
 | IdP-initiated SSO (non-standard) | `/sso/initiate?sp=<entity ID>[&RelayState=…][&acs=…]` |
 | IdP-initiated logout (non-standard) | `/slo/initiate[?sid=…][&return_to=…]` |
 | Signing certificate | `/certificate.pem` |
@@ -115,7 +116,7 @@ Every template issuer serves the same endpoints under `/p/<template>`, plus that
 
 ### Supported protocol features
 
-- **Bindings:** AuthnRequests and logout messages over HTTP-Redirect (DEFLATE, with query-string signatures) and HTTP-POST (with enveloped XML signatures). Responses are sent with HTTP-POST.
+- **Bindings:** AuthnRequests and logout messages over HTTP-Redirect (DEFLATE, with query-string signatures) and HTTP-POST (with enveloped XML signatures). Responses are sent with HTTP-POST, or with [HTTP-Artifact](#http-artifact) when the AuthnRequest's `ProtocolBinding` asks for it.
 - **AuthnRequests:** `AssertionConsumerServiceURL` or `AssertionConsumerServiceIndex`, `ForceAuthn`, `IsPassive` (a `NoPassive` status without a session), `NameIDPolicy/@Format` and `SPNameQualifier`, `RequestedAuthnContext` (the first requested class is used), `ProviderName`, and `Subject/NameID`: it pre-fills the login page and the assertion is always about that subject (Profiles 4.1.4.1). `login_hint` in the query pre-fills it too, as it does with Entra ID. A request whose `Destination` isn't where it was sent is discarded with a `Requester` error Response (Core 3.2.1). A stale `IssueInstant` or RelayState over 80 bytes is reported on the login page and in the inspector, not rejected. ACS, SLO and return URLs must be http(s). A request that can't be answered with a SAML error Response (no service provider or ACS to trust) gets an error page with HTTP 400, its title in the `x-localsaml-error` header.
 - **Request signatures:** when a service provider has a certificate (declared, or from its metadata), its signed requests are verified and an invalid signature is rejected. `want_authn_requests_signed` (or `AuthnRequestsSigned="true"` in its metadata) rejects unsigned AuthnRequests, and `want_logout_signed` unsigned logout messages (SAML Profiles 4.4.4.2 requires them signed; it's off by default so SPs that don't sign logout still work). Without a certificate, signatures are noted but not checked. RSA (SHA-1/256/512) and DSA (SHA-1/256) signatures are verified, including the DER-encoded DSA signatures Java stacks put in Redirect binding query strings. A query string with a SAML parameter twice is refused, so the message that's verified is always the one that's processed.
 - **Responses:** RSA-SHA256 by default (RSA-SHA512 and RSA-SHA1 too), with Exclusive XML Canonicalization and the certificate in `KeyInfo`. Whether the Response, the Assertion or both are signed follows the template, and can be overridden per service provider. Bearer subject confirmation, `Conditions` with an `AudienceRestriction`, an `AuthnStatement` with a `SessionIndex`, and an `AttributeStatement`.
@@ -125,7 +126,14 @@ Every template issuer serves the same endpoints under `/p/<template>`, plus that
 - **IdP-initiated SSO:** unsolicited Responses (no `InResponseTo`) to a service provider's default ACS URL, with a `RelayState`. The template aliases work too, e.g. Shibboleth's `/idp/profile/SAML2/Unsolicited/SSO?providerId=…` and PingFederate's `/idp/startSSO.ping?PartnerSpId=…`.
 - **[Single logout](#single-logout):** SP-initiated and IdP-initiated. Every other service provider in the session is sent a signed LogoutRequest in turn, then the initiator gets a LogoutResponse (`PartialLogout` if some didn't answer `Success`).
 
-**Not implemented:** the HTTP-Artifact binding and artifact resolution, ECP/PAOS, encrypted NameIDs and attributes, `Scoping`/IdP proxying, and attribute queries. A request asking for the Artifact binding gets an HTTP-POST Response, with a warning.
+**Not implemented:** ECP/PAOS, encrypted NameIDs and attributes, `Scoping`/IdP proxying, attribute queries, and AuthnRequests sent by artifact. A request asking for any other response binding gets an HTTP-POST Response, with a warning.
+
+### HTTP-Artifact
+
+- An AuthnRequest with `ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact"` gets its Response by artifact: the browser is redirected to the ACS with `SAMLart` (and `RelayState`), and the service provider resolves it with a SOAP `ArtifactResolve` to `/artifact` (the `ArtifactResolutionService` in the metadata). The answer is a signed `ArtifactResponse` carrying the Response, which is signed and encrypted as usual.
+- Artifacts are type 0x0004, with this issuer's SourceID. Each resolves once, within 5 minutes, and only for the service provider it was issued for; otherwise the `ArtifactResponse` is empty. A signed `ArtifactResolve` is verified against the service provider's certificate; an unsigned one is accepted.
+- Service providers whose default ACS in their metadata is HTTP-Artifact, or that set `response_binding = "artifact"`, get artifacts without asking, including for IdP-initiated logins (`/sso/initiate?…&binding=artifact` for any one).
+- The test SP offers HTTP-Artifact as a response binding, and `POST /dev/api/response` with `"binding": "artifact"` returns an artifact to resolve.
 
 ## Identity provider templates
 
@@ -188,7 +196,7 @@ curl -s -X POST http://localhost:9401/dev/api/response -H 'content-type: applica
 }'
 ```
 
-The response has `saml_response` (base64), `xml`, `pretty`, `acs_url`, `relay_state`, `name_id`, `attributes`, the IDs, what was signed and encrypted, and a ready-made `curl` command. Other options are `user`, `audience`, `name_id`, `name_id_format`, `defaults: false` (start from no attributes), `sign_assertion`, `signature_algorithm`, `encrypt`, `encryption_algorithm`, `authn_context`, `session_index`, `tamper` (a list of [defects](#injecting-faults)) and `status`/`status_message` (an error Response). Without `sp`, the Response is for the test SP.
+The response has `saml_response` (base64), `xml`, `pretty`, `acs_url`, `relay_state`, `name_id`, `attributes`, the IDs, what was signed and encrypted, and a ready-made `curl` command. Other options are `user`, `audience`, `name_id`, `name_id_format`, `defaults: false` (start from no attributes), `sign_assertion`, `signature_algorithm`, `encrypt`, `encryption_algorithm`, `authn_context`, `session_index`, `tamper` (a list of [defects](#injecting-faults)), `status`/`status_message` (an error Response) and `binding: "artifact"` (also returns an `artifact` to [resolve](#http-artifact), and its ACS `url`). Without `sp`, the Response is for the test SP.
 
 ### Declared users
 
@@ -342,6 +350,8 @@ entity_id = "http://localhost:3000/saml/metadata"
 acs_urls = ["http://localhost:3000/saml/acs"]   # enforced; the first is the default
 slo_url = "http://localhost:3000/saml/slo"      # notified on single logout
 slo_soap_url = "http://localhost:3000/saml/soap" # or back-channel, over SOAP
+# acs_artifact_urls = ["http://localhost:3000/saml/artifact"]  # HTTP-Artifact ACSs
+# response_binding = "artifact"                 # post (default) or artifact
 certificate = """-----BEGIN CERTIFICATE-----
 …
 -----END CERTIFICATE-----"""                     # verifies signed requests, encrypts assertions
@@ -349,7 +359,7 @@ encrypt_assertions = true
 sign_response = true                            # override the template
 ```
 
-- Settings can come from the service provider's metadata instead. Use `metadata_url` (fetched at startup, and again on the service provider's first request if it wasn't up yet), `metadata_file` or inline `metadata`. Explicit settings win. The metadata provides the entity ID, HTTP-POST ACS URLs and their indexes, the SLO endpoint and binding, signing and encryption certificates, `AuthnRequestsSigned`, `WantAssertionsSigned` and the NameID format.
+- Settings can come from the service provider's metadata instead. Use `metadata_url` (fetched at startup, and again on the service provider's first request if it wasn't up yet), `metadata_file` or inline `metadata`. Explicit settings win. The metadata provides the entity ID, HTTP-POST and HTTP-Artifact ACS URLs and their indexes (and the default ACS's binding), the SLO endpoint and binding, signing and encryption certificates, `AuthnRequestsSigned`, `WantAssertionsSigned` and the NameID format.
 - `POST /dev/api/service-providers` registers one at runtime, from metadata XML (the request body) or JSON with the same fields as above, including `metadata_url`. Registered service providers are saved in the state database. `GET` lists them all, `DELETE ?entity_id=…` removes one and `DELETE` without it removes every registered one. The `/dev` page has the same controls.
 
 Named identities go in `[[users]]`. See [Declared users](#declared-users).
@@ -357,7 +367,7 @@ Named identities go in `[[users]]`. See [Declared users](#declared-users).
 ### State
 
 - All state lives in `~/.localsaml/` (`--data-dir`): the signing key and certificate in `signing-key.pem` and `signing-cert.pem`, retired ones in `retired-keys/`, and everything else in the SQLite database `state.db`.
-- The database holds sessions, pending logins, logouts in progress and registered service providers, so a restart loses nothing. Expired rows are purged every minute.
+- The database holds sessions, pending logins, logouts in progress, unresolved artifacts and registered service providers, so a restart loses nothing. Expired rows are purged every minute.
 - The certificate is self-signed and valid for ten years. Delete `state.db` to start fresh. `--ephemeral-keys` generates a new key and certificate on every start (your service providers will need the new one).
 
 ### Docker

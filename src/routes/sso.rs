@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
@@ -17,7 +17,7 @@ use crate::inspector::SamlNote;
 use crate::presets::{self, Identity, Preset, SessionIndexStyle, nameid};
 use crate::saml::{self, AuthnRequest, Message, ResponseSpec, Status, Tamper};
 use crate::sp::ServiceProvider;
-use crate::state::{AppState, LastResponse, Participant, Pending, Session};
+use crate::state::{AppState, LastResponse, Participant, Pending, Session, StoredArtifact};
 use crate::store::Table;
 use crate::tenant::Tenant;
 use crate::util::{b64_std, merged_params, non_empty, parse_form, parse_json_object};
@@ -225,6 +225,11 @@ pub async fn endpoint(
         Message::LogoutResponse(resp) => {
             crate::routes::slo::logout_response(&state, &tenant, resp, &root, arrival).await
         }
+        Message::ArtifactResolve(_) => saml_error_page(
+            &tenant,
+            "ArtifactResolve over the wrong binding",
+            "Resolve artifacts with the SOAP binding: POST a SOAP envelope to the ArtifactResolutionService.",
+        ),
     }
 }
 
@@ -246,7 +251,7 @@ fn sp_param(params: &HashMap<String, String>) -> Option<String> {
 }
 
 /// The template to sign in with: the issuer's, or on the root issuer the SP's preferred one.
-fn preset_for(state: &AppState, tenant: &Tenant, sp: &ServiceProvider) -> &'static Preset {
+pub fn preset_for(state: &AppState, tenant: &Tenant, sp: &ServiceProvider) -> &'static Preset {
     match (tenant.preset, &sp.preset) {
         (None, Some(p)) => presets::get_or_generic(p),
         _ => tenant.default_preset(&state.config),
@@ -283,12 +288,22 @@ async fn authn_request(
         );
     }
 
+    // The request's ProtocolBinding, else the binding of the ACS it names, else the SP's default.
+    let requested_binding = match req.protocol_binding.as_deref() {
+        Some(saml::BINDING_ARTIFACT) => Some("artifact"),
+        Some(saml::BINDING_POST) => Some("post"),
+        _ => None,
+    };
     let acs_url = match (&req.acs_url, req.acs_index) {
         (Some(url), _) => {
             if !sp.allows_acs(url) {
                 return bad(
                     "Unregistered AssertionConsumerServiceURL",
-                    &format!("'{url}' isn't one of {}'s ACS URLs: {}.", sp.label(), sp.acs_urls.join(", ")),
+                    &format!(
+                        "'{url}' isn't one of {}'s ACS URLs: {}.",
+                        sp.label(),
+                        sp.acs_urls.iter().chain(&sp.acs_artifact_urls).cloned().collect::<Vec<_>>().join(", ")
+                    ),
                 );
             }
             url.clone()
@@ -302,7 +317,7 @@ async fn authn_request(
                 );
             }
         },
-        (None, None) => match sp.default_acs() {
+        (None, None) => match sp.default_acs(requested_binding.unwrap_or(sp.default_binding())) {
             Some(url) => url.clone(),
             None => {
                 return bad(
@@ -315,6 +330,8 @@ async fn authn_request(
             }
         },
     };
+    let response_binding =
+        requested_binding.or_else(|| sp.acs_binding(&acs_url)).unwrap_or(sp.default_binding()).to_string();
     if !crate::util::is_web_url(&acs_url) {
         return bad("Invalid AssertionConsumerServiceURL", &format!("'{acs_url}' is not an absolute http(s) URL."));
     }
@@ -323,6 +340,7 @@ async fn authn_request(
     let mut warnings = vec![];
     if let Some(b) = &req.protocol_binding
         && b != saml::BINDING_POST
+        && b != saml::BINDING_ARTIFACT
     {
         warnings.push(format!("ProtocolBinding {b} isn't supported; the Response is sent with HTTP-POST."));
     }
@@ -360,6 +378,7 @@ async fn authn_request(
         subject: req.subject.clone(),
         subject_format: req.subject_format.clone(),
         binding: arrival.binding.into(),
+        response_binding,
         signature: signature.describe(),
         warnings,
         tampers: vec![],
@@ -649,10 +668,7 @@ pub fn respond_status(
         Ok(i) => i,
         Err(e) => return error_page(tenant, StatusCode::INTERNAL_SERVER_ERROR, "Couldn't build the Response", &e),
     };
-    let mut resp = saml_post(&pending.acs_url, "SAMLResponse", &b64_std(&issued.xml), pending.relay_state.as_deref())
-        .into_response();
-    SamlNote::sent(&pending.sp, "Response", "post", &pending.acs_url, issued.pretty, Some(&status)).attach(&mut resp);
-    resp
+    deliver(state, tenant, pending, &issued.xml, issued.pretty, "Response", Some(&status), false)
 }
 
 /// Issue the Response for an authenticated user and post it to the service provider (or show it
@@ -771,43 +787,107 @@ pub fn complete(
         );
     }
 
-    let encoded = b64_std(&xml);
-    let mut resp = if review {
-        review_page(tenant, pending, &encoded, &pretty)
-    } else {
-        saml_post(&pending.acs_url, "SAMLResponse", &encoded, pending.relay_state.as_deref()).into_response()
-    };
     let kind = if pending.tampers.is_empty() {
         "Response".to_string()
     } else {
         format!("Response [{}]", pending.tampers.iter().map(|t| t.name()).collect::<Vec<_>>().join(", "))
     };
-    SamlNote::sent(&pending.sp, &kind, "post", &pending.acs_url, pretty, None).attach(&mut resp);
+    let mut resp = deliver(state, tenant, pending, &xml, pretty, &kind, None, review);
     set_cookie(&mut resp, &session_cookie(tenant, &sid, state.config.session_ttl));
     resp
 }
 
-fn review_page(tenant: &Tenant, pending: &Pending, encoded: &str, pretty: &str) -> Response {
-    let relay = pending
-        .relay_state
-        .as_ref()
-        .map(|r| format!(r#"<input type="hidden" name="RelayState" value="{}">"#, esc(r)))
-        .unwrap_or_default();
+/// How long an artifact can be resolved for.
+const ARTIFACT_TTL: i64 = 300;
+
+/// Keep a Response for the HTTP-Artifact binding and return the artifact standing for it.
+pub fn store_artifact(state: &AppState, tenant: &Tenant, sp: &str, xml: &str) -> String {
+    let artifact = saml::new_artifact(&tenant.entity_id, 0);
+    let stored = StoredArtifact { sp: sp.to_string(), xml: xml.to_string() };
+    state.store.put(Table::Artifacts, &artifact, &stored, Some(state.now() + ARTIFACT_TTL));
+    artifact
+}
+
+/// Send a Response to the service provider with the login's binding: auto-posted (HTTP-POST), or
+/// a redirect carrying an artifact the SP resolves over SOAP (HTTP-Artifact); or show it first.
+#[allow(clippy::too_many_arguments)]
+fn deliver(
+    state: &AppState,
+    tenant: &Tenant,
+    pending: &Pending,
+    xml: &str,
+    pretty: String,
+    kind: &str,
+    status: Option<&Status>,
+    review: bool,
+) -> Response {
+    let (mut resp, binding) = if pending.response_binding == "artifact" {
+        let artifact = store_artifact(state, tenant, &pending.sp, xml);
+        let mut url = url::Url::parse(&pending.acs_url).expect("the ACS URL was checked");
+        url.query_pairs_mut().append_pair("SAMLart", &artifact);
+        if let Some(r) = pending.relay_state.as_deref().filter(|r| !r.is_empty()) {
+            url.query_pairs_mut().append_pair("RelayState", r);
+        }
+        let resp = if review {
+            let send = format!(
+                r#"<a class="btn primary" href="{}">Send the artifact to the service provider</a>"#,
+                esc(url.as_str())
+            );
+            let detail = format!(
+                r#"<details><summary>Artifact</summary><pre class="code wrap">{}</pre></details>"#,
+                esc(&artifact)
+            );
+            review_page(
+                tenant,
+                pending,
+                "redirected (with an artifact the service provider resolves over SOAP) to",
+                &send,
+                &detail,
+                &pretty,
+            )
+        } else {
+            Redirect::to(url.as_str()).into_response()
+        };
+        (resp, "artifact")
+    } else {
+        let encoded = b64_std(xml);
+        let resp = if review {
+            let relay = pending
+                .relay_state
+                .as_ref()
+                .map(|r| format!(r#"<input type="hidden" name="RelayState" value="{}">"#, esc(r)))
+                .unwrap_or_default();
+            let send = format!(
+                r#"<form method="POST" action="{acs}" class="actions"><input type="hidden" name="SAMLResponse" value="{encoded}">{relay}<button class="btn primary" type="submit">Send to the service provider</button></form>"#,
+                acs = esc(&pending.acs_url),
+                encoded = esc(&encoded),
+            );
+            let detail = format!(
+                r#"<details><summary>Base64 SAMLResponse</summary><pre class="code wrap">{}</pre></details>"#,
+                esc(&encoded)
+            );
+            review_page(tenant, pending, "posted to", &send, &detail, &pretty)
+        } else {
+            saml_post(&pending.acs_url, "SAMLResponse", &encoded, pending.relay_state.as_deref()).into_response()
+        };
+        (resp, "post")
+    };
+    SamlNote::sent(&pending.sp, kind, binding, &pending.acs_url, pretty, status).attach(&mut resp);
+    resp
+}
+
+fn review_page(tenant: &Tenant, pending: &Pending, how: &str, send: &str, detail: &str, pretty: &str) -> Response {
     let body = format!(
         r#"<section class="card">
   <div class="eyebrow">Review</div>
   <h1>Response for <span class="accent">{sp}</span></h1>
-  <p class="muted">This is what will be posted to <code>{acs}</code>. Nothing has been sent yet.</p>
-  <form method="POST" action="{acs}" class="actions">
-    <input type="hidden" name="SAMLResponse" value="{encoded}">{relay}
-    <button class="btn primary" type="submit">Send to the service provider</button>
-  </form>
+  <p class="muted">This is what will be {how} <code>{acs}</code>. Nothing has been sent yet.</p>
+  {send}
   {xml}
-  <details><summary>Base64 SAMLResponse</summary><pre class="code wrap">{encoded}</pre></details>
+  {detail}
 </section>"#,
         sp = esc(pending.sp_name.as_deref().unwrap_or(&pending.sp)),
         acs = esc(&pending.acs_url),
-        encoded = esc(encoded),
         xml = xml_block("SAML Response", pretty),
     );
     page(tenant, "Review response", &body).into_response()
@@ -881,7 +961,10 @@ async fn start_idp_initiated(
             }
         },
     };
-    let acs_url = match non_empty(params, "acs").or_else(|| sp.default_acs().cloned()) {
+    let binding = non_empty(params, "binding").filter(|b| b == "post" || b == "artifact");
+    let acs_url = match non_empty(params, "acs")
+        .or_else(|| sp.default_acs(binding.as_deref().unwrap_or(sp.default_binding())).cloned())
+    {
         Some(a) if !crate::util::is_web_url(&a) => {
             return bad("Invalid ACS URL", &format!("'{a}' is not an absolute http(s) URL."));
         }
@@ -891,6 +974,9 @@ async fn start_idp_initiated(
             return bad("No ACS URL", &format!("{} has no ACS URL to send an unsolicited Response to.", sp.label()));
         }
     };
+    let response_binding = binding
+        .or_else(|| sp.acs_binding(&acs_url).map(String::from))
+        .unwrap_or_else(|| sp.default_binding().to_string());
     let preset = preset_for(state, tenant, &sp);
     let pending = Pending {
         id: uuid::Uuid::new_v4().to_string(),
@@ -913,6 +999,7 @@ async fn start_idp_initiated(
         subject: None,
         subject_format: None,
         binding: "idp-initiated".into(),
+        response_binding,
         signature: "no request (IdP-initiated)".into(),
         warnings: vec![],
         tampers: vec![],

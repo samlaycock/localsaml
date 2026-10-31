@@ -209,6 +209,9 @@ pub struct Pending {
     pub subject_format: Option<String>,
     /// `redirect`, `post` or `idp-initiated`.
     pub binding: String,
+    /// How the Response goes back: `post`, or `artifact` (HTTP-Artifact binding).
+    #[serde(default = "post")]
+    pub response_binding: String,
     /// How the request was signed, for the login page.
     pub signature: String,
     /// Things about the request worth knowing that didn't stop it.
@@ -247,4 +250,16 @@ pub struct Initiator {
     pub entity_id: String,
     pub request_id: String,
     pub relay_state: Option<String>,
+}
+
+fn post() -> String {
+    "post".into()
+}
+
+/// A Response kept for one resolution by artifact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredArtifact {
+    /// The service provider it was issued to: only it may resolve it.
+    pub sp: String,
+    pub xml: String,
 }

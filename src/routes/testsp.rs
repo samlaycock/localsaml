@@ -18,7 +18,9 @@ use crate::dsig::{self, NS_DS, QuerySignature};
 use crate::html::{esc, page, saml_post, xml_block};
 use crate::presets::{authn, nameid};
 use crate::routes::sso::{cookie_value, set_cookie};
-use crate::saml::{self, BINDING_POST, BINDING_REDIRECT, Message, NS_ASSERTION, NS_MD, NS_PROTOCOL, Status};
+use crate::saml::{
+    self, BINDING_ARTIFACT, BINDING_POST, BINDING_REDIRECT, Message, NS_ASSERTION, NS_MD, NS_PROTOCOL, Status,
+};
 use crate::sp::ServiceProvider;
 use crate::state::AppState;
 use crate::tenant::Tenant;
@@ -40,6 +42,7 @@ pub fn service_provider(state: &AppState, tenant: &Tenant) -> ServiceProvider {
         entity_id: entity_id(tenant),
         name: Some("localsaml test SP".into()),
         acs_urls: vec![tenant.url("/sp/acs")],
+        acs_artifact_urls: vec![tenant.url("/sp/acs")],
         slo_url: Some(tenant.url("/sp/slo")),
         certificate: Some(state.keys.with_current(|k| k.cert_b64())),
         source: "builtin".into(),
@@ -112,6 +115,7 @@ pub async fn home(tenant: Tenant, headers: HeaderMap) -> Response {
   <h2>SP-initiated login</h2>
   <div class="opts">
     <label>Binding<select name="binding"><option value="redirect">HTTP-Redirect</option><option value="post">HTTP-POST</option></select></label>
+    <label>Response binding<select name="response_binding"><option value="post">HTTP-POST</option><option value="artifact">HTTP-Artifact</option></select></label>
     <label>NameIDPolicy format<select name="name_id_format">{formats}</select></label>
     <label>Requested AuthnContext<select name="authn_context">{contexts}</select></label>
     <label>RelayState<input name="RelayState" value="/welcome"></label>
@@ -157,7 +161,14 @@ pub async fn login(State(state): State<AppState>, tenant: Tenant, RawQuery(q): R
         .attr("IssueInstant", iso8601(wall_clock()))
         .attr("Destination", &sso)
         .attr("AssertionConsumerServiceURL", tenant.url("/sp/acs"))
-        .attr("ProtocolBinding", BINDING_POST)
+        .attr(
+            "ProtocolBinding",
+            if params.get("response_binding").map(String::as_str) == Some("artifact") {
+                BINDING_ARTIFACT
+            } else {
+                BINDING_POST
+            },
+        )
         .attr_opt("ForceAuthn", flag("force_authn").then_some("true"))
         .attr_opt("IsPassive", flag("is_passive").then_some("true"))
         .declare("samlp", NS_PROTOCOL)
@@ -471,22 +482,95 @@ fn validate(state: &AppState, tenant: &Tenant, xml: &str, expected_request: Opti
     out
 }
 
-pub async fn acs(State(state): State<AppState>, tenant: Tenant, headers: HeaderMap, body: Bytes) -> Response {
-    let form = parse_form(&body);
-    let Some(encoded) = form.get("SAMLResponse") else {
+/// Resolve an artifact the way a service provider would: a signed ArtifactResolve over SOAP to
+/// the identity provider's ArtifactResolutionService (handled in-process here). Returns the
+/// Response it stood for, and checks on the exchange.
+async fn resolve_artifact(state: &AppState, tenant: &Tenant, artifact: &str) -> (Checks, Result<String, String>) {
+    let mut checks = Checks::default();
+    let style = &tenant.default_preset(&state.config).style;
+    let (mut resolve, id) =
+        saml::artifact_resolve(&entity_id(tenant), &tenant.url("/artifact"), artifact, wall_clock());
+    let alg = state.config.signature_algorithm;
+    if let Err(e) = state.keys.with_current(|k| saml::sign_message(&mut resolve, &id, k, style, alg)) {
+        return (checks, Err(e));
+    }
+    let envelope = crate::soap::envelope(resolve);
+    let resp = crate::routes::backchannel::dispatch(state, tenant, &Bytes::from(envelope)).await;
+    let body = match axum::body::to_bytes(resp.into_body(), 4 << 20).await {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(e) => return (checks, Err(format!("reading the ArtifactResponse: {e}"))),
+    };
+    let (_, answer) = match crate::soap::unwrap(&body) {
+        Ok(a) => a,
+        Err(e) => return (checks, Err(e)),
+    };
+    if !answer.is(NS_PROTOCOL, "ArtifactResponse") {
+        return (checks, Err(format!("expected samlp:ArtifactResponse, got <{}>", answer.qname())));
+    }
+    checks.info("Artifact", format!("resolved over SOAP with ArtifactResolve {id}"));
+    let answer_id = answer.get_attr("ID").unwrap_or_default();
+    match dsig::verify(&answer, answer_id, &state.keys.public_keys()) {
+        Ok(v) => checks.ok("ArtifactResponse signature", format!("valid ({})", v.alg.name())),
+        Err(e) => checks.fail("ArtifactResponse signature", e),
+    }
+    let irt = answer.get_attr("InResponseTo").unwrap_or_default();
+    checks.check(irt == id, "ArtifactResponse InResponseTo", irt);
+    let status = Status::from_element(answer.find(NS_PROTOCOL, "Status"));
+    if !status.is_success() {
+        return (checks, Err(format!("ArtifactResponse status {}", status.short())));
+    }
+    let Some(inner_id) = answer.find(NS_PROTOCOL, "Response").and_then(|r| r.get_attr("ID")) else {
+        return (
+            checks,
+            Err("the ArtifactResponse carries no Response: the artifact is unknown, expired or already used".into()),
+        );
+    };
+    let Some((inner, scope)) = answer.find_by_id_scoped(inner_id) else {
+        return (checks, Err("the ArtifactResponse carries no Response".into()));
+    };
+    let mut inner = inner.clone();
+    inner.declare_namespaces_in(&scope);
+    (checks, Ok(inner.to_xml()))
+}
+
+pub async fn acs(
+    State(state): State<AppState>,
+    tenant: Tenant,
+    headers: HeaderMap,
+    RawQuery(q): RawQuery,
+    body: Bytes,
+) -> Response {
+    let form = crate::util::merged_params(q.as_deref(), &body);
+    let (pre, xml) = if let Some(artifact) = form.get("SAMLart") {
+        resolve_artifact(&state, &tenant, artifact).await
+    } else if let Some(encoded) = form.get("SAMLResponse") {
+        (Checks::default(), saml::decode_message(encoded, false))
+    } else {
         return crate::html::error_page(
             &tenant,
             StatusCode::BAD_REQUEST,
             "No SAMLResponse",
-            "Post a SAMLResponse here with the HTTP-POST binding.",
+            "Post a SAMLResponse here (HTTP-POST binding), or send a SAMLart (HTTP-Artifact binding).",
         );
     };
-    let xml = match saml::decode_message(encoded, false) {
-        Ok(x) => x,
-        Err(e) => return crate::html::error_page(&tenant, StatusCode::BAD_REQUEST, "Undecodable SAMLResponse", &e),
-    };
     let expected = cookie_value(&headers, &request_cookie_name(&tenant));
-    let outcome = validate(&state, &tenant, &xml, expected.as_deref());
+    let mut outcome = match xml {
+        Ok(xml) => validate(&state, &tenant, &xml, expected.as_deref()),
+        Err(e) => {
+            let mut checks = Checks::default();
+            checks.fail("Response", e);
+            Outcome {
+                checks,
+                name_id: None,
+                session_index: None,
+                attributes: vec![],
+                response_xml: String::new(),
+                assertion_xml: None,
+                assertion_id: None,
+            }
+        }
+    };
+    outcome.checks.0.splice(0..0, pre.0);
     let passed = outcome.checks.passed();
     if passed && let Some(id) = &outcome.assertion_id {
         seen().lock().unwrap().insert(id.clone());
@@ -684,10 +768,10 @@ pub async fn slo(State(state): State<AppState>, tenant: Tenant, RawQuery(q): Raw
             set_cookie(&mut resp, &clear);
             resp
         }
-        Message::AuthnRequest(_) => crate::html::error_page(
+        Message::AuthnRequest(_) | Message::ArtifactResolve(_) => crate::html::error_page(
             &tenant,
             StatusCode::BAD_REQUEST,
-            "Unexpected AuthnRequest",
+            &format!("Unexpected {}", message.kind()),
             "This is the test SP's logout endpoint.",
         ),
     }
@@ -718,6 +802,12 @@ pub async fn metadata(State(state): State<AppState>, tenant: Tenant) -> Response
                         .attr("Location", tenant.url("/sp/acs"))
                         .attr("index", "0")
                         .attr("isDefault", "true"),
+                )
+                .child(
+                    md("AssertionConsumerService")
+                        .attr("Binding", BINDING_ARTIFACT)
+                        .attr("Location", tenant.url("/sp/acs"))
+                        .attr("index", "1"),
                 ),
         );
     entity.declare_namespaces();

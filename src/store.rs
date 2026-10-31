@@ -21,10 +21,13 @@ pub enum Table {
     Logouts,
     /// Service providers registered through the dev API (declared ones are copied in at startup).
     ServiceProviders,
+    /// Responses waiting to be resolved by artifact (HTTP-Artifact binding).
+    Artifacts,
 }
 
 impl Table {
-    const ALL: [Table; 4] = [Table::Pending, Table::Sessions, Table::Logouts, Table::ServiceProviders];
+    const ALL: [Table; 5] =
+        [Table::Pending, Table::Sessions, Table::Logouts, Table::ServiceProviders, Table::Artifacts];
 
     fn name(self) -> &'static str {
         match self {
@@ -32,6 +35,7 @@ impl Table {
             Table::Sessions => "sessions",
             Table::Logouts => "logouts",
             Table::ServiceProviders => "service_providers",
+            Table::Artifacts => "artifacts",
         }
     }
 }

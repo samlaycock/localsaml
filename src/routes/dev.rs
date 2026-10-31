@@ -60,6 +60,9 @@ pub struct MintRequest {
     pub audience: Option<String>,
     pub in_response_to: Option<String>,
     pub relay_state: Option<String>,
+    /// `artifact`: also store the Response for the HTTP-Artifact binding, and return an artifact
+    /// the service provider resolves at the ArtifactResolutionService (once, within 5 minutes).
+    pub binding: Option<String>,
     pub name_id: Option<String>,
     pub name_id_format: Option<String>,
     /// Merged over the template defaults; `null` removes one.
@@ -152,7 +155,7 @@ pub async fn mint(state: &AppState, tenant: &Tenant, req: MintRequest) -> Result
     let acs_url = req
         .acs_url
         .clone()
-        .or_else(|| sp.default_acs().cloned())
+        .or_else(|| sp.default_acs("post").cloned())
         .ok_or_else(|| invalid(format!("{} has no ACS URL; pass acs_url", sp.label())))?;
     if !crate::util::is_web_url(&acs_url) {
         return Err(invalid(format!("acs_url '{acs_url}' is not an absolute http(s) URL")));
@@ -209,6 +212,11 @@ pub async fn mint(state: &AppState, tenant: &Tenant, req: MintRequest) -> Result
         status,
         tampers: req.tamper.clone(),
     };
+    let artifact = match req.binding.as_deref() {
+        None | Some("post") => false,
+        Some("artifact") => true,
+        Some(b) => return Err(invalid(format!("binding must be 'post' or 'artifact', not '{b}'"))),
+    };
     let issued = state
         .keys
         .with_current(|key| saml::build_response(key, &spec))
@@ -219,8 +227,18 @@ pub async fn mint(state: &AppState, tenant: &Tenant, req: MintRequest) -> Result
     if let Some(r) = &relay {
         curl.push_str(&format!(" --data-urlencode 'RelayState={}'", r.replace('\'', "'\\''")));
     }
+    let artifact = artifact.then(|| {
+        let artifact = crate::routes::sso::store_artifact(state, tenant, &sp.entity_id, &issued.xml);
+        let mut url = url::Url::parse(&acs_url).expect("the ACS URL was checked");
+        url.query_pairs_mut().append_pair("SAMLart", &artifact);
+        if let Some(r) = &relay {
+            url.query_pairs_mut().append_pair("RelayState", r);
+        }
+        json!({ "artifact": artifact, "url": url.as_str(), "resolution_url": tenant.url("/artifact") })
+    });
     Ok(json!({
         "saml_response": encoded,
+        "artifact": artifact,
         "acs_url": acs_url,
         "relay_state": relay,
         "issuer": tenant.entity_id,
@@ -285,6 +303,7 @@ pub async fn api_response_get(State(state): State<AppState>, tenant: Tenant, Raw
             "audience" => req.audience = Some(v),
             "in_response_to" => req.in_response_to = Some(v),
             "relay_state" | "RelayState" => req.relay_state = Some(v),
+            "binding" => req.binding = Some(v),
             "name_id" => req.name_id = Some(v),
             "name_id_format" => req.name_id_format = Some(v),
             "defaults" => req.defaults = Some(yes),
