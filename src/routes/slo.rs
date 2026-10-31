@@ -107,8 +107,15 @@ pub async fn logout_request(
         Ok(sp) => sp,
         Err(e) => return bad("Unknown service provider", &e),
     };
-    if let SigCheck::Invalid(e) = check_signature(&sp, root, &req.id, arrival.query_signature.as_ref()) {
-        return bad("Invalid LogoutRequest signature", &e);
+    match check_signature(&sp, root, &req.id, arrival.query_signature.as_ref()) {
+        SigCheck::Invalid(e) => return bad("Invalid LogoutRequest signature", &e),
+        SigCheck::Unsigned if sp.want_logout_signed => {
+            return bad(
+                "Unsigned LogoutRequest",
+                &format!("{} must sign its logout messages (want_logout_signed).", sp.label()),
+            );
+        }
+        _ => {}
     }
     let target = faults::Target { endpoint: Endpoint::Slo, issuer: tenant.key(), sp: Some(&sp.entity_id) };
     if let Some(fault) = state.faults.take(&target) {
@@ -268,9 +275,13 @@ pub async fn logout_response(
     let outcome = if resp.in_response_to.as_deref() != Some(&request_id) {
         "failed: InResponseTo doesn't match the LogoutRequest".to_string()
     } else if let Some(sp) = find_sp(state, tenant, &waiting).await
-        && let SigCheck::Invalid(e) = check_signature(&sp, root, &resp.id, arrival.query_signature.as_ref())
+        && let Some(problem) = match check_signature(&sp, root, &resp.id, arrival.query_signature.as_ref()) {
+            SigCheck::Invalid(e) => Some(format!("invalid signature ({e})")),
+            SigCheck::Unsigned if sp.want_logout_signed => Some("unsigned, and want_logout_signed is on".into()),
+            _ => None,
+        }
     {
-        format!("failed: invalid signature ({e})")
+        format!("failed: {problem}")
     } else if resp.status.is_success() {
         "logged out".to_string()
     } else {

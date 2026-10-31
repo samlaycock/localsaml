@@ -1279,3 +1279,32 @@ async fn onelogin_sends_every_parameter() {
     let doc = parse(r["xml"].as_str().unwrap()).unwrap();
     assert_eq!(attr_values(doc.find(A, "Assertion").unwrap(), "memberOf"), [""]);
 }
+
+#[tokio::test]
+async fn logout_messages_can_be_required_signed() {
+    let strict = |name: &str| ServiceProvider {
+        certificate: Some(sp_key().cert_b64()),
+        want_logout_signed: true,
+        ..slo_sp(name)
+    };
+    let (app, _) = app_with(with_sps(vec![strict("a"), strict("b")]));
+    let mut jar = Jar::default();
+    let a = quick_login(&app, "", "http://a.test/sp", &mut jar, "").await;
+    quick_login(&app, "", "http://b.test/sp", &mut jar, "").await;
+    let request = logout_request("_ls1", "http://a.test/sp", &a.name_id().0);
+
+    // Unsigned: refused, and the session stays.
+    let r = get_jar(&app, &redirect("/slo", "SAMLRequest", &request, None, None), &mut jar).await;
+    assert_eq!(r.headers["x-localsaml-error"], "Unsigned LogoutRequest");
+    assert_eq!(get(&app, "/dev/api/sessions").await.json().as_array().unwrap().len(), 1);
+
+    // Signed: B is asked, but its unsigned answer doesn't count, so A hears PartialLogout.
+    let r = get_jar(&app, &redirect("/slo", "SAMLRequest", &request, None, Some(sp_key())), &mut jar).await;
+    let (loc, to_b) = redirected(&r, "SAMLRequest");
+    let answer = logout_response("_lr2", "http://b.test/sp", to_b.get_attr("ID").unwrap());
+    let r =
+        get(&app, &redirect("/slo", "SAMLResponse", &answer, query_param(&loc, "RelayState").as_deref(), None)).await;
+    let (_, to_a) = redirected(&r, "SAMLResponse");
+    let status = Status::from_element(to_a.find(P, "Status"));
+    assert_eq!(status.short(), "PartialLogout");
+}

@@ -27,6 +27,7 @@ slo_url = "http://localhost:3000/saml/slo"
 # slo_binding = "redirect"           # redirect | post
 # certificate = "-----BEGIN CERTIFICATE-----..."   # verifies signed AuthnRequests
 # want_authn_requests_signed = false
+# want_logout_signed = false         # reject unsigned LogoutRequests and LogoutResponses
 # encryption_certificate = "..."     # defaults to certificate
 # encrypt_assertions = true          # default: the template's (Shibboleth encrypts when it can)
 # encryption_algorithm = "aes256-gcm"  # aes256-gcm | aes128-gcm | aes256-cbc | aes128-cbc

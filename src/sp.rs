@@ -55,6 +55,10 @@ pub struct ServiceProvider {
     /// Reject AuthnRequests that aren't signed (metadata: `AuthnRequestsSigned`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub want_authn_requests_signed: bool,
+    /// Reject LogoutRequests and LogoutResponses that aren't signed (SAML Profiles 4.4.4.2 wants
+    /// front-channel logout messages signed; off by default for convenience).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub want_logout_signed: bool,
     /// NameID format to use when the request doesn't ask for one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name_id_format: Option<String>,
