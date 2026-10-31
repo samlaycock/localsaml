@@ -273,6 +273,10 @@ document.addEventListener('click', async (e) => {
       `</${q('Subject')}>`,
     ];
     const entries = Object.entries(identity.attributes);
+    // Templates that send every parameter (OneLogin) send the missing ones empty.
+    if (p.send_empty_attributes) {
+      for (const a of p.attributes) if (!(a.name in identity.attributes)) entries.push([a.name, '']);
+    }
     if (entries.length) {
       lines.push(`<${q('AttributeStatement')}>`);
       for (const [name, value] of entries) {

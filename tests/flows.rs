@@ -1270,3 +1270,12 @@ async fn dsa_signed_requests_are_verified() {
         .replace("SAMLRequest=", "SAMLRequest=x");
     assert_ne!(get(&app, &tampered).await.headers.get("x-localsaml-error"), None);
 }
+
+#[tokio::test]
+async fn onelogin_sends_every_parameter() {
+    let (app, _) = app();
+    // Drop a parameter: OneLogin still sends it, empty.
+    let r = post_json(&app, "/p/onelogin/dev/api/response", json!({ "attributes": { "memberOf": null } })).await.json();
+    let doc = parse(r["xml"].as_str().unwrap()).unwrap();
+    assert_eq!(attr_values(doc.find(A, "Assertion").unwrap(), "memberOf"), [""]);
+}

@@ -636,10 +636,15 @@ fn attribute_statement(preset: &Preset, identity: &Identity) -> Option<Element> 
     // The template's attributes in its order, then any others.
     let known = preset.attributes.iter().map(|a| a.name).filter(|n| identity.attributes.contains_key(*n));
     let others = identity.attributes.keys().map(String::as_str).filter(|n| preset.attribute(n).is_none());
-    for name in known.chain(others) {
-        let values = identity.values(name);
+    let known: Vec<&str> =
+        if preset.send_empty_attributes { preset.attributes.iter().map(|a| a.name).collect() } else { known.collect() };
+    for name in known.into_iter().chain(others) {
+        let mut values = identity.values(name);
         if values.is_empty() {
-            continue;
+            if !preset.send_empty_attributes || preset.attribute(name).is_none() {
+                continue;
+            }
+            values.push(String::new());
         }
         let known = preset.attribute(name);
         let attribute = || {
