@@ -1,5 +1,9 @@
 #!/bin/sh
 set -e
+# The URL the harness reaches Apache at (the published port); site.conf defaults to localhost:9412.
+if [ -n "$SHIB_URL" ]; then
+  sed -i "s#http://localhost:9412#$SHIB_URL#g" /etc/apache2/sites-available/000-default.conf
+fi
 cp /interop/shibboleth2.xml /interop/attribute-map.xml /interop/*.pem /etc/shibboleth/
 cp /interop/idp-*.xml /etc/shibboleth/
 mkdir -p /run/shibboleth /var/log/shibboleth

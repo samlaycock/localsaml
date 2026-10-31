@@ -8,7 +8,9 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"html"
@@ -19,9 +21,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/beevik/etree"
 	"github.com/crewjam/saml"
 	"github.com/crewjam/saml/samlsp"
 	dsig "github.com/russellhaering/goxmldsig"
+	"github.com/russellhaering/goxmldsig/etreeutils"
 )
 
 type spConfig struct {
@@ -43,6 +47,8 @@ type command struct {
 	SAMLResponse string   `json:"saml_response"`
 	RequestIDs   []string `json:"request_ids"`
 	NameID       string   `json:"name_id"`
+	SessionIndex string   `json:"session_index"`
+	SAMLRequest  string   `json:"saml_request"`
 	Query        string   `json:"query"`
 }
 
@@ -173,6 +179,9 @@ func run(c command) (result, error) {
 		r["id"] = req.ID
 		return r, nil
 
+	case "handle_logout_request":
+		return handleLogoutRequest(sp, c)
+
 	case "parse_logout_response":
 		if c.Binding == "redirect" {
 			return result{}, sp.ValidateLogoutResponseRedirect(c.SAMLResponse)
@@ -180,6 +189,99 @@ func run(c command) (result, error) {
 		return result{}, sp.ValidateLogoutResponseForm(c.SAMLResponse)
 	}
 	return nil, fmt.Errorf("unknown op %q", c.Op)
+}
+
+// handleLogoutRequest validates a LogoutRequest localsaml posted (propagating another SP's logout)
+// and answers it with a signed LogoutResponse over the POST binding. crewjam/saml has no API to
+// validate a LogoutRequest as a service provider (only LogoutResponses), so this checks it the way
+// crewjam checks those: an enveloped signature by a signing certificate in the IdP's metadata.
+func handleLogoutRequest(sp *saml.ServiceProvider, c command) (result, error) {
+	raw, err := base64.StdEncoding.DecodeString(c.SAMLRequest)
+	if err != nil {
+		return nil, fmt.Errorf("base64: %w", err)
+	}
+	doc := etree.NewDocument()
+	if err := doc.ReadFromBytes(raw); err != nil {
+		return nil, err
+	}
+	if err := verifyIDPSignature(sp, doc.Root()); err != nil {
+		return nil, err
+	}
+	var req saml.LogoutRequest
+	if err := xml.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	switch {
+	case req.Issuer == nil || req.Issuer.Value != sp.IDPMetadata.EntityID:
+		return nil, fmt.Errorf("Issuer %+v, expected %s", req.Issuer, sp.IDPMetadata.EntityID)
+	case req.Destination != sp.SloURL.String():
+		return nil, fmt.Errorf("Destination %s", req.Destination)
+	case req.NotOnOrAfter != nil && !saml.TimeNow().Before(*req.NotOnOrAfter):
+		return nil, fmt.Errorf("expired at %s", req.NotOnOrAfter)
+	case req.NameID == nil || req.NameID.Value != c.NameID:
+		return nil, fmt.Errorf("NameID %+v, expected %s", req.NameID, c.NameID)
+	case c.SessionIndex != "" && (req.SessionIndex == nil || req.SessionIndex.Value != c.SessionIndex):
+		return nil, fmt.Errorf("SessionIndex %+v, expected %s", req.SessionIndex, c.SessionIndex)
+	}
+	// crewjam only signs when SignatureMethod is set; the SAML profiles want the answer signed.
+	sp.SignatureMethod = dsig.RSASHA256SignatureMethod
+	page, err := sp.MakePostLogoutResponse(req.ID, c.RelayState)
+	if err != nil {
+		return nil, err
+	}
+	r := postForm(page)
+	r["id"] = req.ID
+	r["name_id"] = req.NameID.Value
+	if req.SessionIndex != nil {
+		r["session_index"] = req.SessionIndex.Value
+	}
+	return r, nil
+}
+
+// verifyIDPSignature checks el's enveloped signature against the IdP metadata's signing
+// certificates, like crewjam's (unexported) ServiceProvider.validateSignature.
+func verifyIDPSignature(sp *saml.ServiceProvider, el *etree.Element) error {
+	var certs []*x509.Certificate
+	for _, d := range sp.IDPMetadata.IDPSSODescriptors {
+		for _, k := range d.KeyDescriptors {
+			if k.Use != "" && k.Use != "signing" {
+				continue
+			}
+			for _, x := range k.KeyInfo.X509Data.X509Certificates {
+				der, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(x.Data), ""))
+				if err != nil {
+					return err
+				}
+				cert, err := x509.ParseCertificate(der)
+				if err != nil {
+					return err
+				}
+				certs = append(certs, cert)
+			}
+		}
+	}
+	if len(certs) == 0 {
+		return errors.New("no signing certificate in the IdP metadata")
+	}
+	if el.FindElement("./Signature") == nil {
+		return errors.New("the LogoutRequest is not signed")
+	}
+	v := dsig.NewDefaultValidationContext(&dsig.MemoryX509CertificateStore{Roots: certs})
+	v.IdAttribute = "ID"
+	ctx, err := etreeutils.NSBuildParentContext(el)
+	if err == nil {
+		ctx, err = ctx.SubContext(el)
+	}
+	if err == nil {
+		el, err = etreeutils.NSDetatch(ctx, el)
+	}
+	if err == nil {
+		_, err = v.Validate(el)
+	}
+	if err != nil {
+		return fmt.Errorf("cannot validate signature on %s: %w", el.Tag, err)
+	}
+	return nil
 }
 
 func main() {

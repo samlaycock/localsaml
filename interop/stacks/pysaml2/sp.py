@@ -128,6 +128,39 @@ def run(c):
         if not status.endswith(":Success"):
             raise Exception(f"status {status}")
         return {"in_response_to": resp.response.in_response_to, "status": status}
+    if op == "handle_logout_request":
+        # A LogoutRequest from localsaml (Redirect binding), propagating another SP's logout.
+        # pysaml2 decides whether a Redirect-binding request needs a query signature from its *IdP*
+        # setting want_authn_requests_signed, even when it acts as an SP; without it, it doesn't
+        # check the signature at all.
+        if c.get("require_signature", True):
+            sp.config.setattr("idp", "want_authn_requests_signed", True)
+        req = sp.parse_logout_request(
+            c["saml_request"],
+            BINDING_HTTP_REDIRECT,
+            relay_state=c.get("relay_state"),
+            sigalg=c.get("sigalg"),
+            signature=c.get("signature"),
+        )
+        if req is None:
+            raise Exception("pysaml2 returned no logout request")
+        msg = req.message
+        if msg.issuer.text.strip() != idp:
+            raise Exception(f"Issuer {msg.issuer.text}")
+        if msg.destination != c["sp"]["slo"]:
+            raise Exception(f"Destination {msg.destination}")
+        if msg.name_id is None or msg.name_id.text != c["name_id"]:
+            raise Exception(f"NameID {msg.name_id and msg.name_id.text}, expected {c['name_id']}")
+        indexes = [s.text for s in msg.session_index or []]
+        if c.get("session_index") and c["session_index"] not in indexes:
+            raise Exception(f"SessionIndex {indexes}, expected {c['session_index']}")
+        response = sp.create_logout_response(msg, [BINDING_HTTP_REDIRECT], sign=False)
+        rinfo = sp.response_args(msg, [BINDING_HTTP_REDIRECT])
+        info = sp.apply_binding(
+            rinfo["binding"], str(response), rinfo["destination"], c.get("relay_state"),
+            response=True, sign=True, sigalg=SIG_RSA_SHA256,
+        )
+        return {"id": msg.id, "name_id": msg.name_id.text, "session_index": indexes, "url": location(info)}
     raise Exception(f"unknown op {op}")
 
 

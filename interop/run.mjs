@@ -12,6 +12,11 @@
 //                                # which service-provider stacks to run (default: all). pysaml2,
 //                                # crewjam and shibboleth run in Docker and are skipped when Docker
 //                                # isn't available, unless --require-stacks (CI) is given.
+//   node run.mjs --port 9511 --shibboleth-port 9512
+//                                # other ports for localsaml and the Shibboleth SP (default 9411, 9412)
+//   node run.mjs --image-tag dev # tag for the stacks' Docker images (default latest)
+//   node run.mjs --no-image-build
+//                                # use the stacks' images as they are (CI builds them with a cache)
 
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
@@ -19,6 +24,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 
 import { SAML } from '@node-saml/node-saml';
 import * as samlify from 'samlify';
@@ -41,6 +47,8 @@ const ONLY = option('--only');
 const STACKS = (option('--stacks') || 'node,pysaml2,crewjam,shibboleth').split(',').map((x) => x.trim()).filter(Boolean);
 const REQUIRE_STACKS = flag('--require-stacks');
 const VERBOSE = flag('--verbose');
+const IMAGE_TAG = option('--image-tag') || 'latest';
+const BUILD_IMAGES = !flag('--no-image-build');
 const PORT = Number(option('--port') || 9411);
 const BASE = `http://localhost:${PORT}`;
 
@@ -522,7 +530,7 @@ async function runIssuer(issuer, keys) {
       const query = location.slice(location.indexOf('?') + 1);
       const { loggedOut } = await saml.validateRedirectAsync(Object.fromEntries(new URLSearchParams(query)), query);
       assert(loggedOut, 'not logged out');
-      const status = (Buffer.from(new URLSearchParams(query).get('SAMLResponse'), 'base64'));
+      assert(!/PartialLogout/.test(redirectXml(query)), 'node-saml got a PartialLogout status');
       return 'samlify logged out, node-saml got its LogoutResponse';
     });
     await check(name, 'samlify', 'SP-initiated SLO (samlify parses the LogoutResponse)', async () => {
@@ -576,55 +584,120 @@ function attrQuery(name, value) {
   return `${encodeURIComponent(name)}=${encodeURIComponent(value)}`;
 }
 
-/** Key rotation: Responses issued before and after verify against the new metadata. */
-async function rotation(issuers, keys) {
+/**
+ * Key rotation, run last: it changes the signing key under every issuer. Responses issued before and
+ * after `POST /dev/api/rotate-keys` must verify against the refreshed metadata, and an SP still
+ * holding the old certificate (pinned, or with stale metadata) must reject the new ones.
+ */
+async function rotation(issuers, keys, { node, helpers, shibboleth }) {
   const issuer = issuers.find((i) => i.id === 'root') || issuers[0];
-  const sp = spEntity('node-saml');
-  const mint = async () => ({ SAMLResponse: (await json(`${issuer.base}/dev/api/response?sp=${encodeURIComponent(sp.entityId)}`)).saml_response });
-  const before = await mint();
+  const shibTarget = `${SHIB}/secure/`;
+  const mint = async (entityId) => {
+    const extra = entityId === `${SHIB}/shibboleth` ? `&relay_state=${encodeURIComponent(shibTarget)}` : '';
+    const r = await json(`${issuer.base}/dev/api/response?sp=${encodeURIComponent(entityId)}${extra}`);
+    return { SAMLResponse: r.saml_response, RelayState: r.relay_state, acs: r.acs_url };
+  };
+  const entities = {
+    ...(node ? { 'node-saml': spEntity('node-saml').entityId, samlify: spEntity('samlify').entityId } : {}),
+    ...Object.fromEntries(Object.keys(helpers).map((x) => [x, spEntity(x).entityId])),
+    ...(shibboleth ? { shibboleth: `${SHIB}/shibboleth` } : {}),
+  };
+  const before = {};
+  for (const [lib, entityId] of Object.entries(entities)) before[lib] = await mint(entityId);
   const oldMd = issuer.md;
   await json(`${BASE}/dev/api/rotate-keys`, { method: 'POST' });
   const newMd = await metadataOf(issuer.base);
-  const after = await mint();
-  const saml = (md) => nodeSaml({ ...issuer, md }, sp, keys, { validateInResponseTo: 'never' });
-  await check(issuer.id, 'node-saml', 'rotation: new metadata lists both certificates', async () => {
-    assert(newMd.certs.length === oldMd.certs.length + 1, `${newMd.certs.length} certificates`);
-    assert(newMd.certs[1] === oldMd.certs[0], 'the old certificate is not second');
-    return `${newMd.certs.length} certificates`;
-  });
-  await check(issuer.id, 'node-saml', 'rotation: pre-rotation Response verifies with new metadata', async () => {
-    await saml(newMd).validatePostResponseAsync(before);
-    return 'accepted';
-  });
-  await check(issuer.id, 'node-saml', 'rotation: post-rotation Response verifies with new metadata', async () => {
-    await saml(newMd).validatePostResponseAsync(after);
-    return 'accepted';
-  });
-  await check(issuer.id, 'node-saml', 'rotation: post-rotation Response rejected by a pinned old cert', async () =>
-    rejects(() => saml(oldMd).validatePostResponseAsync(after)));
-  await check(issuer.id, 'samlify', 'rotation: post-rotation Response verifies with new metadata', async () => {
-    const { idp, sp: s } = samlifyPair(issuer, spEntity('samlify'), keys, { metadata: newMd.xml });
-    const r = { SAMLResponse: (await json(`${issuer.base}/dev/api/response?sp=${encodeURIComponent(`${SP_HOST}/samlify`)}`)).saml_response };
-    await s.parseLoginResponse(idp, 'post', { body: r });
-    return 'accepted';
-  });
+  const after = {};
+  for (const [lib, entityId] of Object.entries(entities)) after[lib] = await mint(entityId);
+
+  if (node) {
+    const saml = (md) => nodeSaml({ ...issuer, md }, spEntity('node-saml'), keys, { validateInResponseTo: 'never' });
+    await check(issuer.id, 'node-saml', 'rotation: new metadata lists both certificates', async () => {
+      assert(newMd.certs.length === oldMd.certs.length + 1, `${newMd.certs.length} certificates`);
+      assert(newMd.certs[1] === oldMd.certs[0], 'the old certificate is not second');
+      return `${newMd.certs.length} certificates`;
+    });
+    await check(issuer.id, 'node-saml', 'rotation: pre-rotation Response verifies with new metadata', async () => {
+      await saml(newMd).validatePostResponseAsync(before['node-saml']);
+      return 'accepted';
+    });
+    await check(issuer.id, 'node-saml', 'rotation: post-rotation Response verifies with new metadata', async () => {
+      await saml(newMd).validatePostResponseAsync(after['node-saml']);
+      return 'accepted';
+    });
+    await check(issuer.id, 'node-saml', 'rotation: post-rotation Response rejected by a pinned old cert', async () =>
+      rejects(() => saml(oldMd).validatePostResponseAsync(after['node-saml'])));
+    await check(issuer.id, 'samlify', 'rotation: post-rotation Response verifies with new metadata', async () => {
+      const { idp, sp: s } = samlifyPair(issuer, spEntity('samlify'), keys, { metadata: newMd.xml });
+      await s.parseLoginResponse(idp, 'post', { body: { SAMLResponse: after.samlify.SAMLResponse } });
+      return 'accepted';
+    });
+  }
+
+  // pysaml2 and crewjam are given the metadata with each call: the refreshed one, or the old one
+  // (an SP pinned to the old certificate).
+  for (const [stack, helper] of Object.entries(helpers)) {
+    const parse = (md, posted) => helper.call(helperCommand({ ...issuer, md }, spEntity(stack), keys, { op: 'parse_response', saml_response: posted.SAMLResponse, request_ids: [] }));
+    await check(issuer.id, stack, 'rotation: pre-rotation Response verifies with new metadata', async () => {
+      await parse(newMd, before[stack]);
+      return 'accepted';
+    });
+    await check(issuer.id, stack, 'rotation: post-rotation Response verifies with new metadata', async () => {
+      await parse(newMd, after[stack]);
+      return 'accepted';
+    });
+    await check(issuer.id, stack, 'rotation: post-rotation Response rejected by a pinned old cert', async () =>
+      rejects(() => parse(oldMd, after[stack])));
+  }
+
+  // Shibboleth SP still has the old metadata loaded, so it's pinned to the old certificate until the
+  // metadata file is replaced. It remembers the IDs of Responses it has seen (even rejected ones),
+  // so each Response is posted once.
+  if (shibboleth) {
+    const deliver = async (minted) => {
+      const b = new Browser();
+      const res = await b.post(minted.acs, { SAMLResponse: minted.SAMLResponse, RelayState: minted.RelayState });
+      const accepted = res.status === 302 && res.headers.get('location') === shibTarget && !!(await shibSession(b, '')).attrs.nameid;
+      return { accepted, res };
+    };
+    await check(issuer.id, 'shibboleth', 'rotation: post-rotation Response rejected by a pinned old cert', async () => {
+      const { accepted, res } = await deliver(after.shibboleth);
+      if (accepted) throw new Error('accepted a Response it should have rejected');
+      const reason = shibReason(await res.text());
+      assert(/sign|trust/i.test(reason), `rejected, but not for its signature: ${reason}`);
+      return `rejected: ${reason}`;
+    });
+    shibboleth.updateMetadata(issuer.id, newMd.xml);
+    await check(issuer.id, 'shibboleth', 'rotation: pre-rotation Response verifies with new metadata', async () => {
+      const { accepted, res } = await deliver(before.shibboleth);
+      assert(accepted, `not accepted: ${res.status} ${res.headers.get('location') || shibError(await res.text())}`);
+      return 'accepted';
+    });
+    await check(issuer.id, 'shibboleth', 'rotation: post-rotation Response verifies with new metadata', async () => {
+      const { accepted, res } = await deliver(await mint(`${SHIB}/shibboleth`));
+      assert(accepted, `not accepted: ${res.status} ${res.headers.get('location') || shibError(await res.text())}`);
+      return 'accepted';
+    });
+  }
 }
 
 // ---------------------------------------------------------------- Docker stacks
 // pysaml2 (xmlsec1), crewjam/saml (goxmldsig) and Shibboleth SP (OpenSAML C++ / xml-security-c)
 // verify signatures and decrypt independently of xml-crypto, which node-saml and samlify share.
 
-const STACK_IMAGES = {
-  pysaml2: 'localsaml-interop-pysaml2',
-  crewjam: 'localsaml-interop-crewjam',
-  shibboleth: 'localsaml-interop-shibboleth',
-};
+const STACK_IMAGES = Object.fromEntries(['pysaml2', 'crewjam', 'shibboleth'].map((x) => [x, `localsaml-interop-${x}:${IMAGE_TAG}`]));
 
 function dockerAvailable() {
   return spawnSync('docker', ['info'], { stdio: 'ignore' }).status === 0;
 }
 
 function buildImage(stack) {
+  if (!BUILD_IMAGES) {
+    if (spawnSync('docker', ['image', 'inspect', STACK_IMAGES[stack]], { stdio: 'ignore' }).status !== 0) {
+      throw new Error(`--no-image-build, but there's no ${STACK_IMAGES[stack]} image`);
+    }
+    return;
+  }
   console.log(`building the ${stack} image…`);
   execFileSync('docker', ['build', '-q', '-t', STACK_IMAGES[stack], path.join(here, 'stacks', stack)], { stdio: ['ignore', 'ignore', 'inherit'] });
 }
@@ -671,20 +744,71 @@ class StackProcess {
 
 const first = (v) => (Array.isArray(v) ? v[0] : v);
 const decodeB64 = (b64) => Buffer.from(b64, 'base64').toString();
+const SUCCESS = 'urn:oasis:names:tc:SAML:2.0:status:Success';
+
+/** A pysaml2 or crewjam command for an SP of `issuer` (the helpers keep no state between commands). */
+function helperCommand(issuer, sp, keys, extra = {}) {
+  return {
+    idp_metadata: issuer.md.xml,
+    sp: { entity_id: sp.entityId, acs: sp.acs, slo: sp.slo, key: keys.key, cert: keys.cert, name_id_format: EMAIL },
+    want_assertions_signed: issuer.preset.sign_assertion,
+    want_response_signed: issuer.preset.sign_response,
+    ...extra,
+  };
+}
+
+/** The Redirect-binding SAMLResponse in `query`, as XML. */
+function redirectXml(query) {
+  return zlib.inflateRawSync(Buffer.from(new URLSearchParams(query).get('SAMLResponse'), 'base64')).toString();
+}
+
+/** The top-level StatusCode of a Redirect-binding SAMLResponse in `query`. */
+function redirectStatus(query) {
+  return (redirectXml(query).match(/<(?:\w+:)?StatusCode[^>]*Value="([^"]+)"/) || [])[1];
+}
+
+/** An auto-posting HTML form: where it posts, and its fields. */
+function htmlForm(html) {
+  const action = (html.match(/<form[^>]*action="([^"]*)"/i) || [])[1];
+  const fields = Object.fromEntries([...html.matchAll(/name="(SAMLRequest|SAMLResponse|RelayState)" value="([^"]*)"/g)].map((m) => [m[1], unescapeHtml(m[2])]));
+  return { action: action && unescapeHtml(action), fields };
+}
+
+/**
+ * IdP-propagated logout with node-saml as the initiator. Browser `b` already has a localsaml session
+ * with another SP; node-saml joins it, then logs out. Returns localsaml's answer to node-saml's
+ * LogoutRequest (which should carry a LogoutRequest for the other SP), and `finish`, which takes
+ * localsaml's answer to the other SP's LogoutResponse: node-saml must get a signed Success
+ * LogoutResponse there. A failed or badly signed answer from the other SP would make it PartialLogout.
+ */
+async function nodeSamlLogsOut(issuer, keys, b) {
+  const nsp = spEntity('node-saml');
+  const saml = nodeSaml(issuer, nsp, keys);
+  const url = await saml.getAuthorizeUrlAsync('', {});
+  const { profile } = await saml.validatePostResponseAsync(await postedMessage(await b.get(`${url}&dev_user=alice`)));
+  const res = await b.get(await saml.getLogoutUrlAsync(profile, 'rs-initiator', {}));
+  return { res, finish: (last) => nodeSamlLoggedOut(saml, nsp, b, last) };
+}
+
+async function nodeSamlLoggedOut(saml, nsp, b, res) {
+  const location = res.headers.get('location');
+  assert(location && location.startsWith(nsp.slo), `expected node-saml's LogoutResponse at ${nsp.slo}, got ${res.status} ${location || errorText(await res.text())}`);
+  const query = location.slice(location.indexOf('?') + 1);
+  const { loggedOut } = await saml.validateRedirectAsync(Object.fromEntries(new URLSearchParams(query)), query);
+  assert(loggedOut, 'node-saml is not logged out');
+  // localsaml reports a partial logout as Success with a PartialLogout second-level status.
+  const status = redirectStatus(query);
+  assert(status === SUCCESS && !/PartialLogout/.test(redirectXml(query)), `node-saml's LogoutResponse has status ${status}${/PartialLogout/.test(redirectXml(query)) ? ' / PartialLogout' : ''}`);
+  assert(new URLSearchParams(query).get('RelayState') === 'rs-initiator', `RelayState ${new URLSearchParams(query).get('RelayState')}`);
+  assert(![...b.cookies.keys()].some((k) => k.startsWith('localsaml_sid_')), 'the IdP session cookie is still set');
+}
 
 /** pysaml2 and crewjam: the same scenarios through their JSON command interface. */
 async function runHelperStack(stack, helper, issuer, keys) {
   const name = issuer.id;
   const p = issuer.preset;
   const emailAttr = p.email_attribute;
-  const spCfg = (sp) => ({ entity_id: sp.entityId, acs: sp.acs, slo: sp.slo, key: keys.key, cert: keys.cert, name_id_format: EMAIL });
-  const base = (sp, extra = {}) => ({
-    idp_metadata: issuer.md.xml,
-    sp: spCfg(sp),
-    want_assertions_signed: p.sign_assertion,
-    want_response_signed: p.sign_response,
-    ...extra,
-  });
+  const base = (sp, extra = {}) => helperCommand(issuer, sp, keys, extra);
   const sp = spEntity(stack);
   const devAttrs = (email) => ({ [emailAttr]: email, interopList: ['a', 'b'], ...(p.name_id_from ? { [p.name_id_from]: email } : {}) });
   const expectEmail = (tag) => `${tag}-${stack}-${name}@example.com`;
@@ -792,6 +916,73 @@ async function runHelperStack(stack, helper, issuer, keys) {
       assert(![...b.cookies.keys()].some((k) => k.startsWith('localsaml_sid_')), 'the IdP session cookie is still set');
       return 'LogoutResponse verified';
     });
+
+    // IdP-propagated logout: this stack is the *other* SP in the browser's session. node-saml logs
+    // out, localsaml sends this stack a LogoutRequest (Redirect binding for pysaml2, POST for
+    // crewjam), the stack validates it (signature, Issuer, Destination, NameID, SessionIndex) and
+    // answers with a signed LogoutResponse, and node-saml gets a Success LogoutResponse.
+    // `changeAnswer` alters the stack's LogoutResponse after signing (RelayState for pysaml2's
+    // Redirect binding, IssueInstant in crewjam's POSTed XML).
+    const propagate = async (email, changeAnswer = false) => {
+      const b = new Browser();
+      const { req, res } = await start(b, 'redirect', true, { dev_attributes: JSON.stringify(devAttrs(email)) });
+      const r = await parse(sp, await postedMessage(res), [req.id]);
+      assert(r.session_index, 'the assertion has no SessionIndex');
+      const { res: res2, finish } = await nodeSamlLogsOut(issuer, keys, b);
+      let received;
+      let last;
+      if (stack === 'crewjam') {
+        const { action, fields } = htmlForm(await res2.text());
+        assert(action === sp.slo && fields.SAMLRequest, `expected a posted LogoutRequest to ${sp.slo}, got ${res2.status} ${action}`);
+        received = { saml_request: fields.SAMLRequest, relay_state: fields.RelayState, name_id: r.name_id, session_index: r.session_index };
+        const handled = await helper.call(base(sp, { op: 'handle_logout_request', ...received }));
+        const form = { ...handled.form };
+        if (changeAnswer) form.SAMLResponse = Buffer.from(decodeB64(form.SAMLResponse).replace(/IssueInstant="(\d{4})/, (_, y) => `IssueInstant="${Number(y) - 1}`)).toString('base64');
+        last = await b.post(handled.action, form);
+      } else {
+        const location = res2.headers.get('location');
+        assert(location && location.startsWith(`${sp.slo}?`), `expected a LogoutRequest to ${sp.slo}, got ${res2.status} ${location || errorText(await res2.text())}`);
+        const q = Object.fromEntries(new URLSearchParams(location.slice(location.indexOf('?') + 1)));
+        assert(q.Signature && q.SigAlg, 'the Redirect LogoutRequest is not signed');
+        received = { saml_request: q.SAMLRequest, relay_state: q.RelayState, sigalg: q.SigAlg, signature: q.Signature, name_id: r.name_id, session_index: r.session_index };
+        const handled = await helper.call(base(sp, { op: 'handle_logout_request', ...received }));
+        last = await b.get(changeAnswer ? handled.url.replace(/([?&]RelayState=)([^&]*)/, '$1$2x') : handled.url);
+      }
+      return { r, received, last, finish };
+    };
+    let received;
+    await check(name, stack, 'IdP-propagated SLO (node-saml initiates, this SP is asked to log out)', async () => {
+      const x = await propagate(expectEmail('propagated'));
+      await x.finish(x.last);
+      received = x.received;
+      return `${stack} validated the LogoutRequest (NameID ${x.r.name_id}), node-saml got Success`;
+    });
+    await check(name, stack, 'IdP-propagated SLO: LogoutRequest changed after signing is rejected', async () => {
+      assert(received, 'no LogoutRequest was captured');
+      // Only the signature covers what's changed (IssueInstant in the XML, or RelayState in the query).
+      let tampered;
+      if (stack === 'crewjam') {
+        const xml = decodeB64(received.saml_request);
+        const changed = xml.replace(/IssueInstant="(\d{4})/, (_, y) => `IssueInstant="${Number(y) - 1}`);
+        assert(changed !== xml, 'no IssueInstant to change');
+        tampered = { ...received, saml_request: Buffer.from(changed).toString('base64') };
+      } else {
+        tampered = { ...received, relay_state: `${received.relay_state}x` };
+      }
+      const detail = await rejects(() => helper.call(base(sp, { op: 'handle_logout_request', ...tampered })));
+      assert(/sign/i.test(detail), `rejected, but not for its signature: ${detail}`);
+      return detail;
+    });
+    // localsaml checks the other SP's signature too: a changed LogoutResponse makes it a PartialLogout.
+    await check(name, stack, 'IdP-propagated SLO: changed LogoutResponse gives the initiator PartialLogout', async () => {
+      const { last } = await propagate(expectEmail('propagated-changed'), true);
+      const nsp = spEntity('node-saml');
+      const location = last.headers.get('location');
+      assert(location && location.startsWith(nsp.slo), `expected node-saml's LogoutResponse at ${nsp.slo}, got ${last.status} ${location || errorText(await last.text())}`);
+      const xml = redirectXml(location.slice(location.indexOf('?') + 1));
+      assert(/PartialLogout/.test(xml), `node-saml's LogoutResponse has status ${redirectStatus(location.slice(location.indexOf('?') + 1))}, expected a PartialLogout second-level status`);
+      return (xml.match(/StatusMessage>([^<]*)/) || [, 'PartialLogout'])[1];
+    });
   }
 
   const mint = async (query = '') => ({
@@ -813,7 +1004,8 @@ async function runHelperStack(stack, helper, issuer, keys) {
 // ---------------------------------------------------------------- Shibboleth SP
 
 function shibConfig(issuers) {
-  const metadata = issuers.map((i) => `      <MetadataProvider type="XML" validate="false" path="idp-${i.id}.xml"/>`).join('\n');
+  // reloadChanges: the key-rotation checks replace a metadata file to show the SP the new certificate.
+  const metadata = issuers.map((i) => `      <MetadataProvider type="XML" validate="false" reloadChanges="true" path="idp-${i.id}.xml"/>`).join('\n');
   const sessions = (handlerURL) => `<Sessions lifetime="28800" timeout="3600" relayState="ss:mem" checkAddress="false" handlerURL="${handlerURL}" handlerSSL="false" cookieProps="http" redirectLimit="none">
       <SSO>SAML2</SSO>
       <Logout>SAML2 Local</Logout>
@@ -879,11 +1071,14 @@ async function startShibboleth(issuers, presets, keys) {
   const name = `localsaml-interop-shibboleth-${process.pid}`;
   spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore' });
   // No --rm: if it fails to start, its logs are still there to report.
-  execFileSync('docker', ['run', '-d', '--name', name, '-p', `${SHIB_PORT}:80`, '-v', `${dir}:/interop:ro`, STACK_IMAGES.shibboleth], { stdio: 'ignore' });
+  execFileSync('docker', ['run', '-d', '--name', name, '-p', `${SHIB_PORT}:80`, '-e', `SHIB_URL=${SHIB}`, '-v', `${dir}:/interop:ro`, STACK_IMAGES.shibboleth], { stdio: 'ignore' });
   const logs = () => spawnSync('docker', ['logs', name], { encoding: 'utf8' }).stderr + spawnSync('docker', ['exec', name, 'cat', '/var/log/shibboleth/shibd.log'], { encoding: 'utf8' }).stdout;
+  /** Replace an issuer's metadata (shibd reloads it on its next use). */
+  const updateMetadata = (id, xml) => execFileSync('docker', ['exec', '-i', name, 'sh', '-c',
+    `cat > /etc/shibboleth/idp-${id}.xml.new && mv /etc/shibboleth/idp-${id}.xml.new /etc/shibboleth/idp-${id}.xml`], { input: xml });
   for (let i = 0; i < 150; i++) {
     try {
-      if ((await fetch(`${SHIB}/Shibboleth.sso/Metadata`)).ok) return { stop: () => spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore' }), logs };
+      if ((await fetch(`${SHIB}/Shibboleth.sso/Metadata`)).ok) return { stop: () => spawnSync('docker', ['rm', '-f', name], { stdio: 'ignore' }), logs, updateMetadata };
     } catch { /* not up yet */ }
     await new Promise((r) => setTimeout(r, 200));
   }
@@ -896,6 +1091,12 @@ async function startShibboleth(issuers, presets, keys) {
 function shibError(html) {
   const text = unescapeHtml(html.replace(/<style[\s\S]*?<\/style>/g, '').replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
   return text.slice(0, 220);
+}
+
+/** The error type and message on a Shibboleth error page (sessionError.html). */
+function shibReason(html) {
+  const m = html.match(/<p class="error">([\s\S]*?)<\/p>\s*<p>([\s\S]*?)<\/p>/);
+  return m ? `${unescapeHtml(m[1].replace(/ at \(.*$/s, '')).trim()}: ${unescapeHtml(m[2]).trim()}` : shibError(html);
 }
 
 async function shibSession(b, app) {
@@ -911,7 +1112,7 @@ async function shibSession(b, app) {
   }
 }
 
-async function runShibboleth(issuer) {
+async function runShibboleth(issuer, keys) {
   const name = issuer.id;
   const p = issuer.preset;
   const emailAttr = p.email_attribute;
@@ -982,6 +1183,71 @@ async function runShibboleth(issuer) {
       const s = await shibSession(b, '');
       assert(!s.attrs.nameid, 'the Shibboleth session is still active');
       return 'logged out at both ends';
+    });
+
+    // IdP-propagated logout: Shibboleth SP is the *other* SP in the browser's session. node-saml
+    // logs out, localsaml redirects the browser to Shibboleth's SLO endpoint with a signed
+    // LogoutRequest; Shibboleth must accept it (it requires a verified signature on a LogoutRequest
+    // and matches its NameID to the session), end its session and answer localsaml.
+    const shibSlo = `${SHIB}/Shibboleth.sso/SLO/Redirect`;
+    await check(name, 'shibboleth', 'IdP-propagated SLO (node-saml initiates, this SP is asked to log out)', async () => {
+      const b = new Browser();
+      const email = expectEmail('propagated');
+      await login(b, { email });
+      const { res, finish } = await nodeSamlLogsOut(issuer, keys, b);
+      const location = res.headers.get('location');
+      assert(location && location.startsWith(`${shibSlo}?`), `expected a LogoutRequest to ${shibSlo}, got ${res.status} ${location || errorText(await res.text())}`);
+      assert(/[?&]Signature=/.test(location), 'the Redirect LogoutRequest is not signed');
+      const answer = await b.get(location);
+      const back = answer.headers.get('location');
+      let binding;
+      if (back) {
+        assert(back.startsWith(BASE) && /[?&]SAMLResponse=/.test(back), `expected a LogoutResponse to localsaml, got ${answer.status} ${back}`);
+        binding = 'Redirect';
+        await finish(await b.get(back));
+      } else {
+        const html = await answer.text();
+        const { action, fields } = htmlForm(html);
+        assert(action && action.startsWith(BASE) && fields.SAMLResponse, `expected a LogoutResponse to localsaml, got ${answer.status} ${shibError(html)}`);
+        binding = 'POST';
+        await finish(await b.post(action, fields));
+      }
+      const s = await shibSession(b, '');
+      assert(!s.attrs.nameid, 'the Shibboleth session is still active');
+      return `Shibboleth ended its session, answered over ${binding}; node-saml got Success`;
+    });
+    await check(name, 'shibboleth', 'IdP-propagated SLO: changed LogoutResponse gives the initiator PartialLogout', async () => {
+      const b = new Browser();
+      await login(b, { email: expectEmail('propagated-changed') });
+      const { res } = await nodeSamlLogsOut(issuer, keys, b);
+      const answer = await b.get(res.headers.get('location'));
+      const back = answer.headers.get('location');
+      assert(back && back.startsWith(BASE) && /[?&]RelayState=/.test(back), `expected a Redirect LogoutResponse with RelayState to localsaml, got ${answer.status} ${back || shibError(await answer.text())}`);
+      const last = await b.get(back.replace(/([?&]RelayState=)([^&]*)/, '$1$2x'));
+      const nsp = spEntity('node-saml');
+      const location = last.headers.get('location');
+      assert(location && location.startsWith(nsp.slo), `expected node-saml's LogoutResponse at ${nsp.slo}, got ${last.status} ${location || errorText(await last.text())}`);
+      const xml = redirectXml(location.slice(location.indexOf('?') + 1));
+      assert(/PartialLogout/.test(xml), `node-saml's LogoutResponse has status ${redirectStatus(location.slice(location.indexOf('?') + 1))}, expected a PartialLogout second-level status`);
+      return (xml.match(/StatusMessage>([^<]*)/) || [, 'PartialLogout'])[1];
+    });
+    await check(name, 'shibboleth', 'IdP-propagated SLO: LogoutRequest changed after signing is rejected', async () => {
+      // A separate logout: Shibboleth's replay cache may remember the request's ID even when it
+      // rejects the request.
+      const b = new Browser();
+      await login(b, { email: expectEmail('propagated-tampered') });
+      const { res } = await nodeSamlLogsOut(issuer, keys, b);
+      const location = res.headers.get('location');
+      assert(location && location.startsWith(`${shibSlo}?`) && /[?&]RelayState=/.test(location), `expected a LogoutRequest with RelayState to ${shibSlo}, got ${res.status} ${location}`);
+      const answer = await b.get(location.replace(/([?&]RelayState=)([^&]*)/, '$1$2x'));
+      const back = answer.headers.get('location');
+      const html = back ? '' : await answer.text();
+      assert(!(back && back.startsWith(BASE)) && !htmlForm(html).fields.SAMLResponse, `Shibboleth answered the changed LogoutRequest: ${answer.status} ${back || ''}`);
+      const s = await shibSession(b, '');
+      assert(s.attrs.nameid, 'the Shibboleth session ended anyway');
+      const reason = shibReason(html);
+      assert(/sign/i.test(reason), `rejected, but not for its signature: ${reason}`);
+      return `rejected: ${reason}`;
     });
   }
 
@@ -1059,12 +1325,10 @@ async function main() {
       process.stderr.write(`${issuer.id}… `);
       if (STACKS.includes('node')) await runIssuer(issuer, keys);
       for (const [stack, helper] of Object.entries(helpers)) await runHelperStack(stack, helper, issuer, keys);
-      if (shibboleth) await runShibboleth(issuer);
+      if (shibboleth) await runShibboleth(issuer, keys);
     }
-    if (STACKS.includes('node')) {
-      process.stderr.write('rotation…\n');
-      await rotation(issuers, keys);
-    }
+    process.stderr.write('rotation…\n');
+    await rotation(issuers, keys, { node: STACKS.includes('node'), helpers, shibboleth });
   } finally {
     server.child.kill();
     for (const helper of Object.values(helpers)) helper.close();
