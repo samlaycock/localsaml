@@ -83,15 +83,69 @@ pub async fn find_sp(state: &AppState, tenant: &Tenant, entity_id: &str) -> Opti
     None
 }
 
-/// The service provider for a message's issuer: known, or (unless strict) one made up from the
-/// request.
+/// The service provider for a message's issuer: known, discovered from metadata at its entity ID,
+/// or (lenient only) one made up from the request, whose ACS URLs can't be verified.
 pub async fn resolve_sp(state: &AppState, tenant: &Tenant, issuer: &str) -> Result<ServiceProvider, String> {
-    match find_sp(state, tenant, issuer).await {
-        Some(sp) => Ok(sp),
-        None if state.config.strict_service_providers => Err(format!(
-            "'{issuer}' isn't a declared or registered service provider, and strict_service_providers is on. Declare it in localsaml.toml or register it with POST /dev/api/service-providers."
+    if let Some(sp) = find_sp(state, tenant, issuer).await {
+        return Ok(sp);
+    }
+    if state.config.lenient {
+        return Ok(ServiceProvider { entity_id: issuer.into(), source: "request".into(), ..Default::default() });
+    }
+    discover_sp(state, issuer).await.map_err(|e| {
+        format!(
+            "'{issuer}' isn't a declared or registered service provider, so localsaml can't verify the ACS URLs its requests name (Profiles 4.1.4.1), and its metadata couldn't be read from its entity ID: {e}. Declare it in localsaml.toml, register it with POST /dev/api/service-providers, or run with lenient = true."
+        )
+    })
+}
+
+/// An unknown service provider whose entity ID is a URL serving its metadata: register it from
+/// that metadata.
+async fn discover_sp(state: &AppState, entity_id: &str) -> Result<ServiceProvider, String> {
+    if !crate::util::is_web_url(entity_id) {
+        return Err("its entity ID isn't an http(s) URL".into());
+    }
+    let mut sp =
+        ServiceProvider { entity_id: entity_id.into(), metadata_url: Some(entity_id.into()), ..Default::default() };
+    sp.load_remote_metadata().await?;
+    if sp.entity_id != entity_id {
+        return Err(format!("the metadata there is for '{}'", sp.entity_id));
+    }
+    sp.validate().map_err(|e| e.to_string())?;
+    state.register_service_provider(&sp);
+    sp.source = "discovered".into();
+    Ok(sp)
+}
+
+/// May a response go to `url` for this SP? Only to a registered ACS, unless lenient (where an
+/// SP without any accepts the request's).
+pub fn acs_allowed(state: &AppState, sp: &ServiceProvider, url: &str) -> bool {
+    if state.config.lenient { sp.allows_acs(url) } else { sp.registers_acs(url) }
+}
+
+/// Is a message the spec requires to be authenticated (logout messages, ArtifactResolve)
+/// authenticated by a verified signature? Lenient mode also takes unsigned ones (unless
+/// `required`), and signed ones it can't verify. `Err` says why not.
+pub fn authenticated(
+    state: &AppState,
+    sp: &ServiceProvider,
+    check: &SigCheck,
+    kind: &str,
+    required: bool,
+) -> Result<(), String> {
+    match check {
+        SigCheck::Verified(_) => Ok(()),
+        SigCheck::Invalid(e) => Err(format!("Invalid {kind} signature: {e}")),
+        SigCheck::Unsigned if state.config.lenient && !required => Ok(()),
+        SigCheck::Unverified(_) if state.config.lenient => Ok(()),
+        SigCheck::Unsigned => Err(format!(
+            "Unsigned {kind}: {} must sign it, so localsaml can authenticate it{}",
+            sp.label(),
+            if state.config.lenient { " (want_logout_signed)" } else { "" }
         )),
-        None => Ok(ServiceProvider { entity_id: issuer.into(), source: "request".into(), ..Default::default() }),
+        SigCheck::Unverified(_) => {
+            Err(format!("Unverifiable {kind} signature: {} has no certificate to authenticate it with", sp.label()))
+        }
     }
 }
 
@@ -364,7 +418,7 @@ async fn authn_request(
     };
     let acs_url = match (&req.acs_url, req.acs_index) {
         (Some(url), _) => {
-            if !sp.allows_acs(url) {
+            if !acs_allowed(state, &sp, url) {
                 return bad(
                     "Unregistered AssertionConsumerServiceURL",
                     &format!(
@@ -451,7 +505,7 @@ async fn authn_request(
         &req.requested_authn_decls,
         req.authn_context_comparison.as_deref(),
     );
-    let pending = Pending {
+    let mut pending = Pending {
         id: uuid::Uuid::new_v4().to_string(),
         created: state.now(),
         tenant: tenant.key().into(),
@@ -479,6 +533,20 @@ async fn authn_request(
         tampers: vec![],
         request_xml: Some(root.to_pretty()),
     };
+    // RelayState over 80 bytes isn't valid (Bindings 3.4.3, 3.5.3), and returning it would make
+    // localsaml send one: a Requester error, without it.
+    if let Some(r) = pending.relay_state.as_ref().filter(|r| r.len() > 80 && !state.config.lenient) {
+        let message = format!("RelayState is {} bytes; the bindings allow at most 80", r.len());
+        pending.relay_state = None;
+        return respond_status(
+            state,
+            tenant,
+            preset,
+            &sp,
+            &pending,
+            Status::parse("Requester", Some(message)).unwrap(),
+        );
+    }
     // Refusing to answer: a RequestDenied Response if the ACS is one registered for the SP
     // (Bindings 3.4.6, 3.5.6); otherwise there's nowhere trustworthy to send one.
     if let Some((title, detail)) = refusal {
@@ -795,6 +863,45 @@ pub fn delivery(state: &AppState, preset: &Preset, sp: &ServiceProvider) -> Resu
     })
 }
 
+/// What the spec requires of how a Response with an assertion is delivered (relaxed when lenient):
+/// - HTTP-POST and ECP: each assertion signed, or the Response (Profiles 4.1.3.5, 4.2.5).
+/// - HTTP-Artifact: a confidential resolution (Profiles 4.1.4.4). Without TLS, the assertion is
+///   encrypted for the SP instead.
+pub fn spec_delivery(
+    state: &AppState,
+    tenant: &Tenant,
+    preset: &Preset,
+    sp: &ServiceProvider,
+    binding: &str,
+    d: &mut Delivery,
+) -> Result<(), String> {
+    if state.config.lenient {
+        return Ok(());
+    }
+    if binding != "artifact" && !d.sign_response && !d.sign_assertion {
+        return Err(format!(
+            "neither the Response nor the assertion would be signed for {}, but assertions delivered by HTTP-POST or ECP must be (Profiles 4.1.3.5). Set sign_response or sign_assertion, or run with lenient = true.",
+            sp.label()
+        ));
+    }
+    if binding == "artifact" && !tenant.base.starts_with("https://") && d.encrypt.is_none() {
+        let refuse = |why: &str| {
+            Err(format!(
+                "a Response sent by HTTP-Artifact must be resolved confidentially (Profiles 4.1.4.4), and localsaml isn't served over https, so its assertion has to be encrypted, but {why}. Serve localsaml over https, or run with lenient = true."
+            ))
+        };
+        if sp.encrypt_assertions == Some(false) {
+            return refuse(&format!("encrypt_assertions is off for {}", sp.label()));
+        }
+        match sp.encryption_key() {
+            Some(Ok(key)) => d.encrypt = Some((key, sp.encryption_algorithm.unwrap_or(preset.encryption))),
+            Some(Err(e)) => return refuse(&format!("{}'s encryption certificate is unusable ({e})", sp.label())),
+            None => return refuse(&format!("{} has no encryption certificate", sp.label())),
+        }
+    }
+    Ok(())
+}
+
 /// Send a Response with an error status to the service provider.
 pub fn respond_status(
     state: &AppState,
@@ -931,6 +1038,9 @@ pub fn complete(
                     Ok(e) => d.encrypt_name_id = Some(e),
                     Err(e) => return saml_error_page(tenant, "Can't send the Response", &e),
                 }
+            }
+            if let Err(e) = spec_delivery(state, tenant, preset, sp, &pending.response_binding, &mut d) {
+                return saml_error_page(tenant, "Can't send the Response", &e);
             }
             let authn_context = pending
                 .authn_context
@@ -1150,21 +1260,17 @@ async fn start_idp_initiated(
     let sp = match find_sp(state, tenant, entity_id).await {
         Some(sp) => sp,
         None => match non_empty(params, "acs") {
-            // Unknown SPs work too, given an ACS URL (unless strict).
-            Some(acs) if !state.config.strict_service_providers => ServiceProvider {
+            // Lenient: unknown SPs work too, given an ACS URL (which can't be verified).
+            Some(acs) if state.config.lenient => ServiceProvider {
                 entity_id: entity_id.into(),
                 acs_urls: vec![acs],
                 source: "request".into(),
                 ..Default::default()
             },
-            _ => {
-                return bad(
-                    "Unknown service provider",
-                    &format!(
-                        "'{entity_id}' isn't declared or registered. Declare it, or pass its ACS URL as acs=… (unless strict_service_providers is on)."
-                    ),
-                );
-            }
+            _ => match resolve_sp(state, tenant, entity_id).await {
+                Ok(sp) => sp,
+                Err(e) => return bad("Unknown service provider", &e),
+            },
         },
     };
     let binding = non_empty(params, "binding").filter(|b| b == "post" || b == "artifact");
@@ -1174,12 +1280,21 @@ async fn start_idp_initiated(
         Some(a) if !crate::util::is_web_url(&a) => {
             return bad("Invalid ACS URL", &format!("'{a}' is not an absolute http(s) URL."));
         }
-        Some(a) if sp.allows_acs(&a) => a,
+        Some(a) if acs_allowed(state, &sp, &a) => a,
         Some(a) => return bad("Unregistered ACS URL", &format!("'{a}' isn't one of {}'s ACS URLs.", sp.label())),
         None => {
             return bad("No ACS URL", &format!("{} has no ACS URL to send an unsolicited Response to.", sp.label()));
         }
     };
+    let relay_state = non_empty(params, "RelayState")
+        .or_else(|| non_empty(params, "TargetResource"))
+        .or(sp.default_relay_state.clone());
+    if let Some(r) = relay_state.as_ref().filter(|r| r.len() > 80 && !state.config.lenient) {
+        return bad(
+            "RelayState too long",
+            &format!("RelayState is {} bytes; the bindings allow at most 80 (Bindings 3.5.3).", r.len()),
+        );
+    }
     let response_binding = if non_empty(params, "acs").is_some() {
         binding.or_else(|| sp.acs_binding(&acs_url).map(String::from))
     } else {
@@ -1196,9 +1311,7 @@ async fn start_idp_initiated(
         acs_url,
         audience: sp.audience(),
         request_id: None,
-        relay_state: non_empty(params, "RelayState")
-            .or_else(|| non_empty(params, "TargetResource"))
-            .or(sp.default_relay_state.clone()),
+        relay_state,
         force_authn: false,
         is_passive: false,
         name_id_format: None,

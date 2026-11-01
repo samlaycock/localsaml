@@ -317,7 +317,9 @@ function samlifyPair(issuer, sp, keys, { signed = true, encrypted = issuer.prese
   // (it requires the two flags to agree). localsaml verifies signed requests whatever its metadata
   // says, so present it as an IdP that wants them.
   if (signed) metadata = metadata.replace('WantAuthnRequestsSigned="false"', 'WantAuthnRequestsSigned="true"');
-  const idp = samlify.IdentityProvider({ metadata, isAssertionEncrypted: encrypted });
+  // samlify signs the logout messages it sends only when the IdP's settings ask for them; the
+  // SAML profiles require them signed (4.4.4.1, 4.4.4.2), and localsaml checks.
+  const idp = samlify.IdentityProvider({ metadata, isAssertionEncrypted: encrypted, wantLogoutRequestSigned: true, wantLogoutResponseSigned: true });
   const s = samlify.ServiceProvider({
     entityID: sp.entityId,
     authnRequestsSigned: signed,
@@ -911,7 +913,8 @@ async function runHelperStack(stack, helper, issuer, keys) {
       const email = expectEmail('slo');
       const { req, res } = await start(b, 'redirect', true, { dev_attributes: JSON.stringify(devAttrs(email)) });
       const r = await parse(sp, await postedMessage(res), [req.id]);
-      const logout = await helper.call(base(sp, { op: 'logout', name_id: r.name_id, name_id_format: r.name_id_format, session_index: r.session_index, relay_state: 'bye' }));
+      // Logout messages MUST be authenticated (Profiles 4.4.4.1), so the stack signs its request.
+      const logout = await helper.call(base(sp, { op: 'logout', sign: true, name_id: r.name_id, name_id_format: r.name_id_format, session_index: r.session_index, relay_state: 'bye' }));
       let answer;
       if (logout.url) {
         const out = await b.get(logout.url);
@@ -1223,26 +1226,28 @@ async function runShibboleth(issuer, keys) {
       return `nameid ${email}`;
     });
   }
-  await check(name, 'shibboleth', 'SP-initiated, HTTP-Artifact Response resolved over SOAP', async () => {
+  await check(name, 'shibboleth', 'SP-initiated, HTTP-Artifact Response (encrypted assertion) resolved over SOAP', async () => {
     const b = new Browser();
     const email = expectEmail('artifact');
-    const target = `${SHIB}/secure/`;
+    // Without TLS, localsaml encrypts an artifact's assertion (Profiles 4.1.4.4 wants the
+    // resolution confidential), so this is the application that takes encrypted assertions.
+    const target = `${SHIB}/enc/secure/`;
     // Shibboleth's own metadata says which ACS index is HTTP-Artifact.
-    const spMd = await (await fetch(`${SHIB}/Shibboleth.sso/Metadata`)).text();
+    const spMd = await (await fetch(`${SHIB}/enc/Shibboleth.sso/Metadata`)).text();
     const acsIndex = (spMd.match(/<md:AssertionConsumerService[^>]*Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact"[^>]*index="(\d+)"/) || [])[1];
     assert(acsIndex, 'Shibboleth SP has no HTTP-Artifact ACS');
-    let res = await b.get(`${SHIB}/Shibboleth.sso/Login?entityID=${encodeURIComponent(issuer.md.entityId)}&target=${encodeURIComponent(target)}&acsIndex=${acsIndex}`);
+    let res = await b.get(`${SHIB}/enc/Shibboleth.sso/Login?entityID=${encodeURIComponent(issuer.md.entityId)}&target=${encodeURIComponent(target)}&acsIndex=${acsIndex}`);
     const location = res.headers.get('location');
     assert(location && location.startsWith(BASE), `expected a redirect to localsaml, got ${res.status} ${location || shibError(await res.text())}`);
     const request = inflateRedirect(location);
     assert(request.includes('bindings:HTTP-Artifact'), `the AuthnRequest doesn't ask for HTTP-Artifact: ${request.slice(0, 300)}`);
     res = await b.get(`${location}&${new URLSearchParams({ dev_attributes: JSON.stringify(devAttrs(email)), dev_name_id: email })}`);
     const acs = res.headers.get('location') || '';
-    assert(res.status === 303 && acs.startsWith(`${SHIB}/Shibboleth.sso/SAML2/Artifact?SAMLart=`), `expected a redirect with an artifact, got ${res.status} ${acs || res.headers.get('x-localsaml-error')}: ${request.slice(0, 400)}`);
+    assert(res.status === 303 && acs.startsWith(`${SHIB}/enc/Shibboleth.sso/SAML2/Artifact?SAMLart=`), `expected a redirect with an artifact, got ${res.status} ${acs || res.headers.get('x-localsaml-error')}: ${request.slice(0, 400)}`);
     res = await b.get(acs);
     const back = res.headers.get('location');
     assert(res.status === 302 && back === target, `Shibboleth didn't accept the artifact: ${res.status} ${back || shibReason(await res.text())}`);
-    checkSession(await shibSession(b, ''), email);
+    checkSession(await shibSession(b, '/enc'), email);
     // localsaml resolves each artifact once: a replay gets an empty ArtifactResponse.
     const replay = await new Browser().get(acs);
     assert(replay.status !== 302, `a replayed artifact was accepted: ${replay.status} ${replay.headers.get('location')}`);

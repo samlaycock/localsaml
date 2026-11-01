@@ -15,7 +15,7 @@ use serde_json::{Map, Value, json};
 use crate::html::{data_script, esc, page};
 use crate::keys::SigAlg;
 use crate::presets::{self, Preset};
-use crate::routes::sso::{current_session, delivery, editor_data, find_sp, finish_name_id_for};
+use crate::routes::sso::{current_session, delivery, editor_data, finish_name_id_for};
 use crate::saml::{self, ResponseSpec, Status, Tamper};
 use crate::sp::{ServiceProvider, from_metadata};
 use crate::state::{AppState, Session};
@@ -97,15 +97,7 @@ pub async fn mint(state: &AppState, tenant: &Tenant, req: MintRequest) -> Result
         None => None,
     };
     let sp = match &req.sp {
-        Some(entity) => match find_sp(state, tenant, entity).await {
-            Some(sp) => sp,
-            None if state.config.strict_service_providers => {
-                return Err(invalid(format!(
-                    "'{entity}' isn't a declared or registered service provider (strict mode)"
-                )));
-            }
-            None => ServiceProvider { entity_id: entity.clone(), source: "request".into(), ..Default::default() },
-        },
+        Some(entity) => crate::routes::sso::resolve_sp(state, tenant, entity).await.map_err(invalid)?,
         None => crate::routes::testsp::service_provider(state, tenant),
     };
     let fallback = match (tenant.preset, &sp.preset) {
@@ -195,6 +187,15 @@ pub async fn mint(state: &AppState, tenant: &Tenant, req: MintRequest) -> Result
         None => None,
     };
     let now = state.now();
+    let artifact = match req.binding.as_deref() {
+        None | Some("post") => false,
+        Some("artifact") => true,
+        Some(b) => return Err(invalid(format!("binding must be 'post' or 'artifact', not '{b}'"))),
+    };
+    // An artifact is resolved confidentially, or its assertion is encrypted (Profiles 4.1.4.4).
+    if artifact {
+        crate::routes::sso::spec_delivery(state, tenant, preset, &sp, "artifact", &mut d).map_err(invalid)?;
+    }
     let spec = ResponseSpec {
         preset,
         issuer: tenant.entity_id.clone(),
@@ -226,11 +227,6 @@ pub async fn mint(state: &AppState, tenant: &Tenant, req: MintRequest) -> Result
         status,
         tampers: req.tamper.clone(),
         attribute_query: false,
-    };
-    let artifact = match req.binding.as_deref() {
-        None | Some("post") => false,
-        Some("artifact") => true,
-        Some(b) => return Err(invalid(format!("binding must be 'post' or 'artifact', not '{b}'"))),
     };
     let issued = state
         .keys
@@ -843,7 +839,7 @@ pub async fn page_handler(State(state): State<AppState>, tenant: Tenant, headers
 <section class="card result" id="dev-result" hidden></section>
 <section class="card" id="sps">
   <div class="eyebrow">Service providers</div>
-  <p class="muted">Any service provider is accepted (unless <code>strict_service_providers</code> is on), with the ACS URL from its AuthnRequest. Declare one in <code>localsaml.toml</code>, or register it here from its metadata, to enforce its ACS URLs, verify its signed requests, encrypt for it and log it out. Scripts can use <code>POST {sps_api}</code>.</p>
+  <p class="muted">localsaml answers the service providers listed here, and ones whose metadata it can fetch from their entity ID{lenient_note}. Declare one in <code>localsaml.toml</code>, or register it here from its metadata, so its ACS URLs can be verified, its signatures checked, assertions encrypted for it and it can be logged out. Scripts can use <code>POST {sps_api}</code>.</p>
   {sp_list}
   <div class="opts sp-form">
     <label class="wide">Metadata URL or XML<textarea id="dev-sp-metadata" rows="3" placeholder="http://localhost:3000/saml/metadata, or paste &lt;EntityDescriptor …&gt;"></textarea></label>
@@ -920,6 +916,11 @@ pub async fn page_handler(State(state): State<AppState>, tenant: Tenant, headers
         tampers = tampers,
         sp_options = sp_ids.iter().map(|s| format!(r#"<option value="{}">"#, esc(s))).collect::<String>(),
         sps_api = esc(&tenant.url("/dev/api/service-providers")),
+        lenient_note = if state.config.lenient {
+            " (and, in lenient mode, any other, with the ACS URL from its AuthnRequest)"
+        } else {
+            ""
+        },
         sp_list = sp_list(&state, &tenant),
         subject = esc(&cert.subject),
         not_before = esc(&cert.not_before),

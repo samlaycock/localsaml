@@ -28,14 +28,13 @@ A run takes about 15 seconds once localsaml is built (the kit runs under amd64 e
 
 | Mode | Passed | Failed |
 |---|---|---|
-| strict (`./run.sh`) | 23 | 5 (all expected) |
-| lenient (`LENIENT=1 ./run.sh`) | 23 | 5 |
+| strict (`./run.sh`) | 25 | 3 (all expected) |
+| lenient (`LENIENT=1 ./run.sh`) | 25 | 3 |
 
-All of SSO over both bindings, with and without RelayState and ACS URLs, passes, and so do the Destination checks (a request whose `Destination` isn't where it was received gets a `Requester` error) and the `Subject` checks (an AuthnRequest naming a subject the user didn't sign in as gets an error Response, Profiles 4.1.4.1). So does single logout from one service provider and from two (propagation, RelayState, and an SP that fails to log out). The expected failures, with reasons, are in [`expected-failures.tsv`](expected-failures.tsv):
+All of SSO over both bindings, with and without RelayState and ACS URLs, passes, and so do the Destination checks (a request whose `Destination` isn't where it was received gets a `Requester` error) the `Subject` checks (an AuthnRequest naming a subject the user didn't sign in as gets an error Response, Profiles 4.1.4.1), and the RelayState checks (RelayState over 80 bytes gets a `Requester` error, Bindings 3.4.3). So does single logout from one service provider and from two (propagation, RelayState, and an SP that fails to log out). The expected failures, with reasons, are in [`expected-failures.tsv`](expected-failures.tsv):
 
-- **The kit expects what no IdP can do, or what the spec asks of the sender (5 tests).**
+- **The kit expects what no IdP can do (3 tests).**
   - It wants a SAML error Response to an AuthnRequest that's empty or can't be decoded, so has no service provider or ACS to send it to. localsaml shows an error page, with HTTP 200 because Bindings 3.4.6/3.5.6 say SAML failures MUST NOT use HTTP error codes (the `x-localsaml-error` header tells scripts it's an error). The kit's lenient mode only accepts such a page with an HTTP error code, so it fails these in both modes.
-  - It wants RelayState over 80 bytes rejected; that limit is a rule for the sender. localsaml accepts it and warns on the login page.
 
 ### DSA signatures
 

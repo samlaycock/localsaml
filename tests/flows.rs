@@ -38,14 +38,19 @@ fn app_with(config: Config) -> (Router, AppState) {
 }
 
 fn app() -> (Router, AppState) {
-    app_with(Config::default())
+    app_with(with_sps(vec![]))
 }
 
 fn sp(entity: &str, acs: &str) -> ServiceProvider {
     ServiceProvider { entity_id: entity.into(), acs_urls: vec![acs.into()], ..Default::default() }
 }
 
-fn with_sps(sps: Vec<ServiceProvider>) -> Config {
+/// The service providers to declare, plus the tests' usual one (`SP`, at `ACS`, signing with the
+/// SPs' key): localsaml only answers declared service providers unless it's lenient.
+fn with_sps(mut sps: Vec<ServiceProvider>) -> Config {
+    if !sps.iter().any(|s| s.entity_id == SP) {
+        sps.push(ServiceProvider { certificate: Some(sp_key().cert_b64()), ..sp(SP, ACS) });
+    }
     Config { service_providers: sps, ..Default::default() }
 }
 
@@ -465,7 +470,7 @@ async fn declared_service_providers_are_enforced() {
     assert!(r.body.contains("http://cert.test/acs"), "{}", r.title());
 
     // Strict mode: unknown service providers are refused.
-    let (app, _) = app_with(Config { strict_service_providers: true, ..Default::default() });
+    let (app, _) = app_with(Config::default());
     let r = get(&app, &redirect("/sso", "SAMLRequest", &simple_request("_s1"), None, None)).await;
     assert_eq!((r.status, r.title().as_str()), (StatusCode::OK, "Unknown service provider · localsaml"));
 }
@@ -500,7 +505,7 @@ async fn service_providers_from_inline_metadata_in_the_config_file() {
 
 #[tokio::test]
 async fn passive_and_forced_authentication() {
-    let (app, _) = app_with(Config { silent_sso: true, ..Default::default() });
+    let (app, _) = app_with(Config { silent_sso: true, ..with_sps(vec![]) });
     let mut jar = Jar::default();
     let passive = authn_request("_ip1", SP, Some(ACS), r#" IsPassive="true""#, "");
     let p = posted(&get_jar(&app, &redirect("/sso", "SAMLRequest", &passive, None, None), &mut jar).await);
@@ -539,7 +544,7 @@ async fn name_id_for(app: &Router, prefix: &str, sp: &str, format: &str) -> (Str
 
 #[tokio::test]
 async fn name_id_policies() {
-    let (app, _) = app();
+    let (app, _) = app_with(with_sps(vec![sp("http://other.test/sp", ACS)]));
     // Keycloak's NameID is a username; asking for an email address uses the email attribute.
     assert_eq!(
         name_id_for(&app, "/p/keycloak", SP, nameid::EMAIL).await,
@@ -581,7 +586,7 @@ fn alice() -> localsaml::users::User {
 
 #[tokio::test]
 async fn dev_parameters_sign_in_immediately() {
-    let (app, _) = app_with(Config { users: vec![alice()], ..Default::default() });
+    let (app, _) = app_with(Config { users: vec![alice()], ..with_sps(vec![]) });
     let base = redirect("/sso", "SAMLRequest", &simple_request("_d1"), None, None);
 
     let p = posted(&get(&app, &format!("{base}&dev_user=alice")).await);
@@ -618,7 +623,7 @@ async fn dev_parameters_sign_in_immediately() {
 
 #[tokio::test]
 async fn auto_login_uses_the_login_hint() {
-    let (app, _) = app_with(Config { auto_login: true, users: vec![alice()], ..Default::default() });
+    let (app, _) = app_with(Config { auto_login: true, users: vec![alice()], ..with_sps(vec![]) });
     let base = redirect("/sso", "SAMLRequest", &simple_request("_al1"), None, None);
     let p = posted(&get(&app, &format!("{base}&login_hint=alice")).await);
     assert_eq!(p.name_id().0, "alice@acme.dev");
@@ -651,10 +656,17 @@ async fn idp_initiated_logins() {
     assert!(p.doc.get_attr("InResponseTo").is_none());
     verify(&state, &p.doc, &p.id());
 
-    // Unknown SPs need an ACS URL.
+    // Unknown SPs are refused, even with an ACS URL: it can't be verified (Profiles 4.1.4.1).
     let r = get(&app, "/sso/initiate?sp=http%3A%2F%2Fnew.test%2Fsp").await;
     assert_eq!(r.title(), "Unknown service provider · localsaml");
-    let p = quick_login(&app, "", "http://new.test/sp", &mut Jar::default(), "&acs=http%3A%2F%2Fnew.test%2Facs").await;
+    let r =
+        get(&app, "/sso/initiate?sp=http%3A%2F%2Fnew.test%2Fsp&acs=http%3A%2F%2Fnew.test%2Facs&dev_attributes=%7B%7D")
+            .await;
+    assert_eq!(r.title(), "Unknown service provider · localsaml");
+    // Lenient mode takes the ACS URL on trust.
+    let (lenient, _) = app_with(Config { lenient: true, ..Default::default() });
+    let p =
+        quick_login(&lenient, "", "http://new.test/sp", &mut Jar::default(), "&acs=http%3A%2F%2Fnew.test%2Facs").await;
     assert_eq!(p.action, "http://new.test/acs");
 
     // No SP: a picker.
@@ -670,7 +682,7 @@ async fn idp_initiated_logins() {
     assert_eq!(p.doc.find(A, "Issuer").unwrap().value(), "http://www.okta.com/exk1fcia6d6EMsf331d8");
 
     // Strict mode refuses unknown SPs even with an ACS URL.
-    let (app, _) = app_with(Config { strict_service_providers: true, ..Default::default() });
+    let (app, _) = app_with(Config::default());
     let r = get(&app, "/sso/initiate?sp=http%3A%2F%2Fnew.test%2Fsp&acs=http%3A%2F%2Fnew.test%2Facs").await;
     assert_eq!((r.status, r.title().as_str()), (StatusCode::OK, "Unknown service provider · localsaml"));
 }
@@ -684,6 +696,8 @@ fn slo_sp(name: &str) -> ServiceProvider {
         entity_id: format!("http://{name}.test/sp"),
         acs_urls: vec![format!("http://{name}.test/acs")],
         slo_url: Some(format!("http://{name}.test/slo")),
+        // Logout messages must be signed (Profiles 4.4.4.1); the tests sign with the SPs' key.
+        certificate: Some(sp_key().cert_b64()),
         ..Default::default()
     }
 }
@@ -722,7 +736,7 @@ async fn sp_initiated_logout_propagates_to_the_other_service_providers() {
             "SAMLRequest",
             &logout_request("_lo1", "http://a.test/sp", &a.name_id().0),
             Some("a-relay"),
-            None,
+            Some(sp_key()),
         ),
         &mut jar,
     )
@@ -746,7 +760,7 @@ async fn sp_initiated_logout_propagates_to_the_other_service_providers() {
             "SAMLResponse",
             &logout_response("_lr1", "http://b.test/sp", &to_b_id),
             Some(&logout_id),
-            None,
+            Some(sp_key()),
         ),
     )
     .await;
@@ -762,8 +776,8 @@ async fn sp_initiated_logout_propagates_to_the_other_service_providers() {
 async fn logout_without_a_session_and_idp_initiated_logout() {
     let (app, _) = app_with(with_sps(vec![slo_sp("a")]));
     // Nothing to log out of is still a success.
-    let r = get(&app, &redirect("/slo", "SAMLRequest", &logout_request("_n1", "http://a.test/sp", "jane"), None, None))
-        .await;
+    let request = logout_request("_n1", "http://a.test/sp", "jane");
+    let r = get(&app, &redirect("/slo", "SAMLRequest", &request, None, Some(sp_key()))).await;
     let (_, resp) = redirected(&r, "SAMLResponse");
     assert_eq!(resp.get_attr("InResponseTo"), Some("_n1"));
     assert!(Status::from_element(resp.find(P, "Status")).is_success());
@@ -777,7 +791,13 @@ async fn logout_without_a_session_and_idp_initiated_logout() {
     let id = req.get_attr("ID").unwrap().to_string();
     let done = get(
         &app,
-        &redirect("/slo", "SAMLResponse", &logout_response("_r2", "http://a.test/sp", &id), Some(&relay), None),
+        &redirect(
+            "/slo",
+            "SAMLResponse",
+            &logout_response("_r2", "http://a.test/sp", &id),
+            Some(&relay),
+            Some(sp_key()),
+        ),
     )
     .await;
     assert_eq!(done.title(), "Signed out · localsaml");
@@ -940,7 +960,7 @@ async fn registering_service_providers() {
 
     let list = get(&app, "/dev/api/service-providers").await.json();
     let ids: Vec<&str> = list.as_array().unwrap().iter().map(|s| s["entity_id"].as_str().unwrap()).collect();
-    assert_eq!(ids, [format!("{BASE}/sp").as_str(), "http://reg.test/sp", "http://json.test/sp"]);
+    assert_eq!(ids, [format!("{BASE}/sp").as_str(), SP, "http://reg.test/sp", "http://json.test/sp"]);
 
     // A registered SP's ACS URLs are enforced.
     let xml = authn_request("_r1", "http://reg.test/sp", Some("http://evil.test/acs"), "", "");
@@ -979,7 +999,7 @@ async fn sessions_api() {
 
 #[tokio::test]
 async fn inspector_records_decoded_messages_and_errors() {
-    let (app, _) = app_with(Config { strict_service_providers: true, ..Default::default() });
+    let (app, _) = app_with(Config::default());
     let mut jar = Jar::default();
     let test_sp = format!("{BASE}/sp");
     let xml = authn_request("_i1", &test_sp, Some(&format!("{BASE}/sp/acs")), "", "");
@@ -1021,7 +1041,7 @@ async fn inspector_records_decoded_messages_and_errors() {
 async fn shibboleth_encrypts_and_entra_signs_only_the_assertion() {
     let mut with_cert = sp("http://enc.test/sp", "http://enc.test/acs");
     with_cert.certificate = Some(sp_key().cert_b64());
-    let (app, state) = app_with(with_sps(vec![with_cert]));
+    let (app, state) = app_with(with_sps(vec![with_cert, sp("http://nocert.test/sp", "http://nocert.test/acs")]));
 
     let p = quick_login(&app, "/p/shibboleth", "http://enc.test/sp", &mut Jar::default(), "").await;
     assert!(p.doc.find(A, "Assertion").is_none());
@@ -1034,7 +1054,7 @@ async fn shibboleth_encrypts_and_entra_signs_only_the_assertion() {
     assert_eq!(name_id.get_attr("Format"), Some(nameid::TRANSIENT));
     assert_eq!(attr_values(&assertion, "urn:oid:0.9.2342.19200300.100.1.3"), ["jane@example.edu"]);
     // An SP without a certificate gets a plain assertion.
-    let p = quick_login(&app, "/p/shibboleth", SP, &mut Jar::default(), &format!("&acs={}", enc(ACS))).await;
+    let p = quick_login(&app, "/p/shibboleth", "http://nocert.test/sp", &mut Jar::default(), "").await;
     assert!(p.doc.find(A, "Assertion").is_some());
 
     let p = quick_login(&app, "/p/entra", SP, &mut Jar::default(), &format!("&acs={}", enc(ACS))).await;
@@ -1184,7 +1204,7 @@ async fn requests_are_held_to_the_spec() {
 
 #[tokio::test]
 async fn auto_login_answers_passive_requests() {
-    let (app, _) = app_with(Config { auto_login: true, ..Default::default() });
+    let (app, _) = app_with(Config { auto_login: true, ..with_sps(vec![]) });
     let xml = authn_request("_pa", SP, Some(ACS), r#" IsPassive="true""#, "");
     assert!(posted(&get(&app, &redirect("/sso", "SAMLRequest", &xml, None, None)).await).status().is_success());
 }
@@ -1323,9 +1343,13 @@ async fn logout_messages_can_be_required_signed() {
     quick_login(&app, "", "http://b.test/sp", &mut jar, "").await;
     let request = logout_request("_ls1", "http://a.test/sp", &a.name_id().0);
 
-    // Unsigned: refused, and the session stays.
+    // Unsigned: refused with RequestDenied (Profiles 4.4.4.1, Bindings 3.4.6), and the session
+    // stays.
     let r = get_jar(&app, &redirect("/slo", "SAMLRequest", &request, None, None), &mut jar).await;
-    assert_eq!(r.headers["x-localsaml-error"], "Unsigned LogoutRequest");
+    let (_, refused) = redirected(&r, "SAMLResponse");
+    let status = Status::from_element(refused.find(P, "Status"));
+    assert_eq!(status.short(), "RequestDenied");
+    assert!(status.message.unwrap().starts_with("Unsigned LogoutRequest"));
     assert_eq!(get(&app, "/dev/api/sessions").await.json().as_array().unwrap().len(), 1);
 
     // Signed: B is asked, but its unsigned answer doesn't count, so A hears PartialLogout.
@@ -1337,6 +1361,18 @@ async fn logout_messages_can_be_required_signed() {
     let (_, to_a) = redirected(&r, "SAMLResponse");
     let status = Status::from_element(to_a.find(P, "Status"));
     assert_eq!(status.short(), "PartialLogout");
+
+    // Lenient mode takes unsigned logout messages, unless the SP sets want_logout_signed.
+    let lax = ServiceProvider { want_logout_signed: false, ..strict("c") };
+    let (app, _) = app_with(Config { lenient: true, ..with_sps(vec![lax, strict("d")]) });
+    for (sp, ok) in [("c", true), ("d", false)] {
+        let mut jar = Jar::default();
+        let p = quick_login(&app, "", &format!("http://{sp}.test/sp"), &mut jar, "").await;
+        let request = logout_request("_lx", &format!("http://{sp}.test/sp"), &p.name_id().0);
+        let r = get_jar(&app, &redirect("/slo", "SAMLRequest", &request, None, None), &mut jar).await;
+        let (_, answer) = redirected(&r, "SAMLResponse");
+        assert_eq!(Status::from_element(answer.find(P, "Status")).is_success(), ok, "{sp}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,7 +1398,9 @@ async fn soap_sp(name: &str, status: &'static str) -> (ServiceProvider, Arc<std:
                 let id = message.get_attr("ID").unwrap().to_string();
                 let style = &localsaml::presets::generic().style;
                 let st = Status::parse(status, None).unwrap();
-                let (resp, _) = saml::logout_response_to(style, &issuer, None, Some(&id), &st, wall_clock());
+                let (mut resp, rid) = saml::logout_response_to(style, &issuer, None, Some(&id), &st, wall_clock());
+                // The responder authenticates itself by signing (Profiles 4.4.4.2).
+                saml::sign_message(&mut resp, &rid, sp_key(), style, SigAlg::RsaSha256).unwrap();
                 ([(header::CONTENT_TYPE, "text/xml")], localsaml::soap::envelope(resp))
             }
         }),
@@ -1374,6 +1412,7 @@ async fn soap_sp(name: &str, status: &'static str) -> (ServiceProvider, Arc<std:
         entity_id: entity,
         acs_urls: vec![format!("http://{name}.test/acs")],
         slo_soap_url: Some(url),
+        certificate: Some(sp_key().cert_b64()),
         ..Default::default()
     };
     (sp, received)
@@ -1416,7 +1455,7 @@ async fn back_channel_logout_over_soap() {
             "SAMLRequest",
             &logout_request("_bc1", "http://front.test/sp", &front.name_id().0),
             None,
-            None,
+            Some(sp_key()),
         ),
         &mut jar,
     )
@@ -1429,7 +1468,8 @@ async fn back_channel_logout_over_soap() {
     let mut jar = Jar::default();
     let p = quick_login(&app, "", "http://one.test/sp", &mut jar, "").await;
     quick_login(&app, "", "http://two.test/sp", &mut jar, "").await;
-    let request = parse(&logout_request("_bc2", "http://one.test/sp", &p.name_id().0)).unwrap();
+    let request =
+        parse(&signed_xml(&logout_request("_bc2", "http://one.test/sp", &p.name_id().0), "_bc2", sp_key())).unwrap();
     let r = post_body(&app, Method::POST, "/slo", "text/xml", &localsaml::soap::envelope(request)).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     let (envelope, answer) = localsaml::soap::unwrap(&r.body).unwrap();
@@ -1452,7 +1492,7 @@ async fn back_channel_logout_over_soap() {
             "SAMLRequest",
             &logout_request("_bc3", "http://front.test/sp", &front.name_id().0),
             None,
-            None,
+            Some(sp_key()),
         ),
         &mut jar,
     )
@@ -1465,15 +1505,20 @@ async fn back_channel_logout_over_soap() {
 // HTTP-Artifact
 // ---------------------------------------------------------------------------
 
-/// Resolve an artifact at the ArtifactResolutionService as `issuer`: the ArtifactResponse and
-/// the Response it carried, if any.
+/// Resolve an artifact at the ArtifactResolutionService as `issuer`, signed with the SPs' key:
+/// the ArtifactResponse and the Response it carried, if any.
 async fn resolve(app: &Router, state: &AppState, issuer: &str, artifact: &str) -> (Element, Option<Element>) {
-    let (request, id) = saml::artifact_resolve(issuer, &format!("{BASE}/artifact"), artifact, wall_clock());
+    let (mut request, id) = saml::artifact_resolve(issuer, &format!("{BASE}/artifact"), artifact, wall_clock());
+    saml::sign_message(&mut request, &id, sp_key(), &localsaml::presets::generic().style, SigAlg::RsaSha256).unwrap();
+    resolve_message(app, state, request, &id).await
+}
+
+async fn resolve_message(app: &Router, state: &AppState, request: Element, id: &str) -> (Element, Option<Element>) {
     let r = post_body(app, Method::POST, "/artifact", "text/xml", &localsaml::soap::envelope(request)).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     let (_, answer) = localsaml::soap::unwrap(&r.body).unwrap();
     assert!(answer.is(P, "ArtifactResponse"), "{}", r.body);
-    assert_eq!(answer.get_attr("InResponseTo"), Some(id.as_str()));
+    assert_eq!(answer.get_attr("InResponseTo"), Some(id));
     assert!(Status::from_element(answer.find(P, "Status")).is_success());
     verify(state, &answer, answer.get_attr("ID").unwrap());
     let inner = answer.find(P, "Response").cloned();
@@ -1485,9 +1530,10 @@ async fn artifact_binding() {
     let art_sp = ServiceProvider {
         entity_id: "http://art.test/sp".into(),
         acs_artifact_urls: vec!["http://art.test/acs".into()],
+        certificate: Some(sp_key().cert_b64()),
         ..Default::default()
     };
-    let (app, state) = app_with(with_sps(vec![art_sp, sp(SP, ACS)]));
+    let (app, state) = app_with(with_sps(vec![art_sp]));
 
     let md = parse(&get(&app, "/metadata").await.body).unwrap();
     let ars = md.path(&[(saml::NS_MD, "IDPSSODescriptor"), (saml::NS_MD, "ArtifactResolutionService")]).unwrap();
@@ -1506,12 +1552,18 @@ async fn artifact_binding() {
     let artifact = query_param(&loc, "SAMLart").unwrap();
     assert_eq!(b64_std_decode_lenient(&artifact).unwrap().len(), 44);
 
+    // Without TLS, the assertion is encrypted for the SP (Profiles 4.1.4.4 wants the resolution
+    // confidential). An unsigned resolution isn't authenticated (Bindings 3.6.5.2): no message,
+    // and the artifact isn't used up.
+    let (unsigned, uid) = saml::artifact_resolve(SP, &format!("{BASE}/artifact"), &artifact, wall_clock());
+    assert!(resolve_message(&app, &state, unsigned, &uid).await.1.is_none());
     // Only the SP it was issued for can resolve it, and only once.
     let (_, none) = resolve(&app, &state, "http://art.test/sp", &artifact).await;
     assert!(none.is_none());
     let (answer, response) = resolve(&app, &state, SP, &artifact).await;
     let response = response.expect("the Response");
     assert_eq!(response.get_attr("InResponseTo"), Some("_art1"));
+    assert!(response.find(A, "EncryptedAssertion").is_some());
     verify(&state, &answer, response.get_attr("ID").unwrap());
     assert!(resolve(&app, &state, SP, &artifact).await.1.is_none());
     // Garbage and front-channel resolution are refused.
@@ -1958,4 +2010,74 @@ async fn requested_authn_context_comparisons() {
     let decl = "<saml:AuthnContextDeclRef>urn:decl</saml:AuthnContextDeclRef>";
     let p = login(authn_request("_ac3", SP, Some(ACS), "", &context("exact", decl))).await;
     assert_eq!(p.status().short(), "NoAuthnContext");
+}
+
+// ---------------------------------------------------------------------------
+// Strict by default (the spec's MUSTs), and lenient mode
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn strict_by_default() {
+    // An SP whose entity ID is its metadata URL, on a real port.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let entity = format!("http://{}/metadata", listener.local_addr().unwrap());
+    let md = format!(
+        r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="{entity}"><md:SPSSODescriptor protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol"><md:AssertionConsumerService Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" Location="http://disc.test/acs" index="0"/></md:SPSSODescriptor></md:EntityDescriptor>"#
+    );
+    let server = Router::new().route("/metadata", axum::routing::get(move || async move { md }));
+    tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+
+    let no_acs = ServiceProvider { entity_id: "http://noacs.test/sp".into(), ..Default::default() };
+    let unsigned = ServiceProvider {
+        sign_response: Some(false),
+        sign_assertion: Some(false),
+        ..sp("http://unsigned.test/sp", "http://unsigned.test/acs")
+    };
+    let no_cert = ServiceProvider { certificate: None, ..slo_sp("nocert") };
+    let (app, _) = app_with(with_sps(vec![no_acs, unsigned, no_cert]));
+    let quick = |xml: &str| format!("{}&dev_attributes=%7B%7D", redirect("/sso", "SAMLRequest", xml, None, None));
+
+    // Discovered from its metadata: its ACS is verified, and other URLs are refused.
+    let p = posted(&get(&app, &quick(&authn_request("_d1", &entity, Some("http://disc.test/acs"), "", ""))).await);
+    assert!(p.status().is_success());
+    let r = get(&app, &quick(&authn_request("_d2", &entity, Some("http://evil.test/acs"), "", ""))).await;
+    assert_eq!(r.headers["x-localsaml-error"], "Unregistered AssertionConsumerServiceURL");
+    let list = get(&app, "/dev/api/service-providers").await.json();
+    assert!(list.as_array().unwrap().iter().any(|s| s["entity_id"] == entity.as_str()));
+    // Unknown, and nothing to discover.
+    let r = get(&app, &quick(&authn_request("_d3", "urn:unknown", Some("http://x.test/acs"), "", ""))).await;
+    assert_eq!(r.headers["x-localsaml-error"], "Unknown service provider");
+    // Declared without ACS URLs: the request's can't be verified.
+    let r = get(&app, &quick(&authn_request("_d4", "http://noacs.test/sp", Some("http://x.test/acs"), "", ""))).await;
+    assert_eq!(r.headers["x-localsaml-error"], "Unregistered AssertionConsumerServiceURL");
+
+    // RelayState over 80 bytes: a Requester error, without the RelayState (Bindings 3.4.3).
+    let long = "r".repeat(81);
+    let uri =
+        format!("{}&dev_attributes=%7B%7D", redirect("/sso", "SAMLRequest", &simple_request("_r1"), Some(&long), None));
+    let p = posted(&get(&app, &uri).await);
+    assert_eq!((p.status().code.as_str(), p.relay.as_deref()), (saml::status::REQUESTER, None));
+
+    // Nothing signed would leave a POSTed assertion unprotected (Profiles 4.1.3.5).
+    let r = get(&app, "/sso/initiate?sp=http%3A%2F%2Funsigned.test%2Fsp&dev_attributes=%7B%7D").await;
+    assert_eq!(r.headers["x-localsaml-error"], "Can't send the Response");
+
+    // A signed LogoutRequest from an SP without a certificate can't be authenticated.
+    let mut jar = Jar::default();
+    let p = quick_login(&app, "", "http://nocert.test/sp", &mut jar, "").await;
+    let request = logout_request("_l1", "http://nocert.test/sp", &p.name_id().0);
+    let r = get_jar(&app, &redirect("/slo", "SAMLRequest", &request, None, Some(sp_key())), &mut jar).await;
+    let (_, answer) = redirected(&r, "SAMLResponse");
+    let status = Status::from_element(answer.find(P, "Status"));
+    assert_eq!(status.short(), "RequestDenied");
+    assert!(status.message.unwrap().starts_with("Unverifiable LogoutRequest signature"));
+
+    // Lenient mode relaxes all of it.
+    let (lenient, _) = app_with(Config { lenient: true, ..with_sps(vec![]) });
+    let p =
+        posted(&get(&lenient, &quick(&authn_request("_d5", "urn:unknown", Some("http://x.test/acs"), "", ""))).await);
+    assert!(p.status().is_success());
+    let uri =
+        format!("{}&dev_attributes=%7B%7D", redirect("/sso", "SAMLRequest", &simple_request("_r2"), Some(&long), None));
+    assert_eq!(posted(&get(&lenient, &uri).await).relay.as_deref(), Some(long.as_str()));
 }

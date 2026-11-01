@@ -9,7 +9,7 @@ use axum::response::Response;
 use crate::inspector::SamlNote;
 use crate::presets::{Identity, Preset};
 use crate::routes::sso::{
-    SigCheck, check_signature, delivery, finish_name_id_for, name_id_encryption, preset_for, resolve_sp,
+    SigCheck, authenticated, check_signature, delivery, finish_name_id_for, name_id_encryption, preset_for, resolve_sp,
 };
 use crate::saml::{self, ArtifactResolve, AttributeQuery, Message, ResponseSpec, Status};
 use crate::soap;
@@ -59,11 +59,13 @@ async fn artifact_resolve(state: &AppState, tenant: &Tenant, envelope: &Element,
         Ok(sp) => sp,
         Err(e) => return soap::fault(true, &e),
     };
-    if let SigCheck::Invalid(e) = check_signature(&sp, envelope, &req.id, None) {
-        return soap::fault(true, &format!("invalid ArtifactResolve signature: {e}"));
-    }
-    // An unknown, used or someone else's artifact gets an ArtifactResponse without a message.
-    let message = match saml::check_artifact(&req.artifact, &tenant.entity_id) {
+    // The requester must be authenticated before it gets a message meant for it (Bindings
+    // 3.6.5.2). Unauthenticated, unknown, used or someone else's: an ArtifactResponse without a
+    // message, still with Success (Bindings 3.6.6), and the artifact isn't used up.
+    let signature = check_signature(&sp, envelope, &req.id, None);
+    let message = match authenticated(state, &sp, &signature, "ArtifactResolve", false)
+        .and_then(|()| saml::check_artifact(&req.artifact, &tenant.entity_id))
+    {
         Err(e) => Err(e),
         Ok(()) => match state.store.get::<StoredArtifact>(Table::Artifacts, &req.artifact) {
             None => Err("unknown, expired or already resolved".to_string()),

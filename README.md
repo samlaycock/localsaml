@@ -73,17 +73,30 @@ new SamlStrategy({
   entryPoint: "http://localhost:9401/sso",
   logoutUrl: "http://localhost:9401/slo",
   idpCert: await (await fetch("http://localhost:9401/certificate.pem")).text(),
-  issuer: "http://localhost:3000/saml/metadata",  // your SP's entity ID: anything
+  issuer: "http://localhost:3000/saml/metadata",  // your SP's entity ID
   callbackUrl: "http://localhost:3000/saml/acs",
 }, verify, verify);
 ```
 
-Any service provider entity ID and ACS URL is accepted unless you [declare service providers](#service-providers). When your app redirects to the login page, pick a template, adjust the attributes and sign in. The Response is posted back to your ACS URL.
+localsaml follows the SAML specification, which says an identity provider MUST verify that the ACS URL in a request belongs to the service provider (Profiles 4.1.4.1). So it answers service providers whose ACS URLs it knows. There are three ways to get there:
+
+- **Declare it** in `localsaml.toml` (or register it on the `/dev` page or over the API). See [Service providers](#service-providers):
+
+  ```toml
+  [[service_providers]]
+  entity_id = "http://localhost:3000/saml/metadata"
+  acs_urls = ["http://localhost:3000/saml/acs"]
+  ```
+
+- **Serve its metadata at its entity ID.** When the entity ID is a URL that returns the service provider's metadata (`http://localhost:3000/saml/metadata` above), localsaml fetches it on the first request and registers the service provider from it.
+- **Run with `--lenient`** (`LOCALSAML_LENIENT=1`, or `lenient = true`), which accepts any service provider and ACS URL, and relaxes the other requirements listed under [Lenient mode](#lenient-mode). It's convenient, but it isn't what a real identity provider does.
+
+When your app redirects to the login page, pick a template, adjust the attributes and sign in. The Response is posted back to your ACS URL.
 
 To try a login before your app exists, open http://localhost:9401/sp ([the test SP](#the-test-sp)). To get a signed Response without a browser:
 
 ```sh
-curl -s 'http://localhost:9401/dev/api/response?sp=http://localhost:3000/saml/metadata&acs_url=http://localhost:3000/saml/acs&email=me@example.com' | jq -r .saml_response
+curl -s 'http://localhost:9401/dev/api/response?sp=http://localhost:3000/saml/metadata&email=me@example.com' | jq -r .saml_response
 ```
 
 To make localsaml look like a specific identity provider, use that template's issuer, for example `http://localhost:9401/p/okta/metadata`. See [Identity provider templates](#identity-provider-templates).
@@ -119,7 +132,7 @@ Every template issuer serves the same endpoints under `/p/<template>`, plus that
 
 - **Bindings:** AuthnRequests and logout messages over HTTP-Redirect (DEFLATE, with query-string signatures) and HTTP-POST (with enveloped XML signatures). Responses are sent with HTTP-POST, or with [HTTP-Artifact](#http-artifact) when the AuthnRequest's `ProtocolBinding` asks for it.
 - **AuthnRequests:** `AssertionConsumerServiceURL` or `AssertionConsumerServiceIndex`, `ForceAuthn`, `IsPassive` (a `NoPassive` status without a session), `NameIDPolicy/@Format` and `SPNameQualifier`, `RequestedAuthnContext` (Core 3.3.2.2.1: `exact` and `minimum` get the most preferred class, `maximum` the strongest one listed, and `better` the next class up in localsaml's order, Password < PasswordProtectedTransport < Kerberos < X509 < MFA; when none can be satisfied, or only `AuthnContextDeclRef`s are given, the answer is a `NoAuthnContext` error Response), `ProviderName`, and `Subject/NameID`: it pre-fills the login page as the NameID, and signing in as anyone else gets an `UnknownPrincipal` error Response with no assertion (Profiles 4.1.4.1). `login_hint` in the query pre-fills it too, as it does with Entra ID. `Scoping`: localsaml never proxies, so an `IDPList` that doesn't name it gets a `NoSupportedIDP` error Response; `RequesterID`s are shown on the login page. A request whose `Destination` isn't where it was sent is discarded with a `Requester` error Response (Core 3.2.1). A stale `IssueInstant` or RelayState over 80 bytes is reported on the login page and in the inspector, not rejected. ACS, SLO and return URLs must be http(s). A request localsaml refuses (an invalid signature, or an unsigned one from a service provider that requires signed requests) gets a `RequestDenied` error Response when its ACS is registered for that service provider (Bindings 3.4.6). A request that can't be answered with a SAML error Response (no service provider or ACS to trust) gets an error page. It's HTTP 200, because the bindings forbid HTTP error codes for SAML failures, with its title in the `x-localsaml-error` header.
-- **Request signatures:** when a service provider has a certificate (declared, or from its metadata), its signed requests are verified and an invalid signature is rejected. `want_authn_requests_signed` (or `AuthnRequestsSigned="true"` in its metadata) rejects unsigned AuthnRequests, and `want_logout_signed` unsigned logout messages (SAML Profiles 4.4.4.2 requires them signed; it's off by default so SPs that don't sign logout still work). Without a certificate, signatures are noted but not checked. RSA (SHA-1/256/512) and DSA (SHA-1/256) signatures are verified, including the DER-encoded DSA signatures Java stacks put in Redirect binding query strings. A query string with a SAML parameter twice is refused, so the message that's verified is always the one that's processed.
+- **Request signatures:** when a service provider has a certificate (declared, or from its metadata), its signed requests are verified and an invalid signature is rejected. AuthnRequests may be unsigned (Profiles 4.1.4.1), unless `want_authn_requests_signed` (or `AuthnRequestsSigned="true"` in its metadata) says otherwise; a signed one from a service provider without a certificate is noted but can't be checked. Logout messages and artifact resolutions MUST be authenticated (Profiles 4.4.4.1, 4.4.4.2; Bindings 3.6.5.2), so they need a signature that verifies against the service provider's certificate. RSA (SHA-1/256/512) and DSA (SHA-1/256) signatures are verified, including the DER-encoded DSA signatures Java stacks put in Redirect binding query strings. A query string with a SAML parameter twice is refused, so the message that's verified is always the one that's processed.
 - **Responses:** RSA-SHA256 by default (RSA-SHA512 and RSA-SHA1 too), with Exclusive XML Canonicalization and the certificate in `KeyInfo`. Whether the Response, the Assertion or both are signed follows the template, and can be overridden per service provider. Bearer subject confirmation, `Conditions` with an `AudienceRestriction`, an `AuthnStatement` with a `SessionIndex`, and an `AttributeStatement`.
 - **Encrypted assertions:** `EncryptedAssertion` with AES-256-GCM (default), AES-128-GCM, AES-256-CBC or AES-128-CBC, and RSA-OAEP key transport, for service providers with an encryption certificate.
 - **Encrypted NameIDs:** an `EncryptedID` instead of the NameID (with the key inside the EncryptedData, so service providers that decrypt it on its own can), for service providers with `encrypt_name_id = true` or whose AuthnRequest asks for `NameIDPolicy Format="urn:oasis:names:tc:SAML:2.0:nameid-format:encrypted"` (`InvalidNameIDPolicy` if there's no encryption certificate). LogoutRequests to them carry an `EncryptedID` too, and LogoutRequests with one, encrypted for localsaml's certificate, are decrypted.
@@ -136,8 +149,8 @@ Every template issuer serves the same endpoints under `/p/<template>`, plus that
 
 ### HTTP-Artifact
 
-- An AuthnRequest with `ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact"` gets its Response by artifact: the browser is redirected to the ACS with `SAMLart` (and `RelayState`), and the service provider resolves it with a SOAP `ArtifactResolve` to `/artifact` (the `ArtifactResolutionService` in the metadata). The answer is a signed `ArtifactResponse` carrying the Response, which is signed and encrypted as usual.
-- Artifacts are type 0x0004, with this issuer's SourceID. Each resolves once, within 5 minutes, and only for the service provider it was issued for; otherwise the `ArtifactResponse` is empty. A signed `ArtifactResolve` is verified against the service provider's certificate; an unsigned one is accepted.
+- An AuthnRequest with `ProtocolBinding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Artifact"` gets its Response by artifact: the browser is redirected to the ACS with `SAMLart` (and `RelayState`), and the service provider resolves it with a SOAP `ArtifactResolve` to `/artifact` (the `ArtifactResolutionService` in the metadata). The answer is a signed `ArtifactResponse` carrying the Response, which is signed and encrypted as usual. Profiles 4.1.4.4 wants the resolution confidential, so unless localsaml is served over https (its base URL), the assertion is encrypted for the service provider, which needs an encryption certificate (and `encrypt_assertions` not set to `false`).
+- Artifacts are type 0x0004, with this issuer's SourceID. Each resolves once, within 5 minutes, and only for the service provider it was issued for, whose `ArtifactResolve` must be signed (Bindings 3.6.5.2). Otherwise the `ArtifactResponse` is empty (still with a `Success` status, as Bindings 3.6.6 requires), and the artifact isn't used up.
 - Service providers whose default ACS in their metadata is HTTP-Artifact, or that set `response_binding = "artifact"`, get artifacts without asking, including for IdP-initiated logins (`/sso/initiate?…&binding=artifact` for any one).
 - The test SP offers HTTP-Artifact as a response binding, and `POST /dev/api/response` with `"binding": "artifact"` returns an artifact to resolve.
 
@@ -348,7 +361,7 @@ Settings come from CLI flags, `LOCALSAML_*` environment variables, or a `localsa
 
 ### Service providers
 
-Undeclared service providers are accepted with whatever their AuthnRequest says, unless `strict_service_providers = true`. Declared ones get more:
+localsaml answers declared and registered service providers, and ones it can discover from metadata served at their entity ID (unless it's [lenient](#lenient-mode)). Declaring one looks like this:
 
 ```toml
 [[service_providers]]
@@ -370,6 +383,21 @@ sign_response = true                            # override the template
 
 - Settings can come from the service provider's metadata instead. Use `metadata_url` (fetched at startup, and again on the service provider's first request if it wasn't up yet), `metadata_file` or inline `metadata`. Explicit settings win. The metadata provides the entity ID, HTTP-POST, HTTP-Artifact and PAOS ACS URLs and their indexes (and the default ACS's binding), the SLO endpoint and binding, signing and encryption certificates, `AuthnRequestsSigned`, `WantAssertionsSigned` and the NameID format.
 - `POST /dev/api/service-providers` registers one at runtime, from metadata XML (the request body) or JSON with the same fields as above, including `metadata_url`. Registered service providers are saved in the state database. `GET` lists them all, `DELETE ?entity_id=…` removes one and `DELETE` without it removes every registered one. The `/dev` page has the same controls.
+
+### Lenient mode
+
+By default localsaml does what the SAML 2.0 specification requires of an identity provider. `--lenient` (`LOCALSAML_LENIENT=1`, `lenient = true`) relaxes the requirements that get in the way of quick experiments:
+
+| Lenient mode allows | Which breaks |
+|---|---|
+| Service providers it doesn't know, with any ACS URL their requests name | Profiles 4.1.4.1: the ACS URL MUST be verified as the service provider's |
+| Unsigned logout messages (unless the service provider sets `want_logout_signed`), and signed ones it can't verify | Profiles 4.4.4.1, 4.4.4.2: logout requesters and responders MUST authenticate themselves |
+| Unsigned (or unverifiable) `ArtifactResolve`s | Bindings 3.6.5.2: the artifact's issuer MUST authenticate the requester |
+| Responses whose assertions aren't signed (when a service provider sets `sign_response` and `sign_assertion` to `false`) | Profiles 4.1.3.5: assertions delivered by HTTP-POST MUST be signed |
+| RelayState over 80 bytes (returned as it came) | Bindings 3.4.3, 3.5.3: RelayState MUST NOT exceed 80 bytes |
+| HTTP-Artifact without TLS or an encrypted assertion | Profiles 4.1.4.4: the artifact's resolution MUST be confidential |
+
+Deliberate defects (`dev_tamper`, faults, the response API's options) aren't affected: they're asked for.
 
 Named identities go in `[[users]]`. See [Declared users](#declared-users).
 

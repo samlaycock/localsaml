@@ -42,9 +42,11 @@ pub struct ServerArgs {
     /// Reuse an existing session without showing the login page, like a production IdP.
     #[arg(long, env = "LOCALSAML_SILENT_SSO")]
     pub silent_sso: bool,
-    /// Only accept service providers declared in the config file or registered over the API.
-    #[arg(long)]
-    pub strict_service_providers: bool,
+    /// Relax the spec's requirements for convenience: accept undeclared service providers'
+    /// ACS URLs, unsigned logout messages and artifact resolutions, unsigned Responses,
+    /// RelayState over 80 bytes, and artifacts without a confidential resolution.
+    #[arg(long, env = "LOCALSAML_LENIENT")]
+    pub lenient: bool,
     /// Identity provider template used on the root issuer (generic, entra, okta, ...).
     #[arg(long, env = "LOCALSAML_DEFAULT_PRESET")]
     pub default_preset: Option<String>,
@@ -76,7 +78,7 @@ struct FileConfig {
     entity_id: Option<String>,
     auto_login: Option<bool>,
     silent_sso: Option<bool>,
-    strict_service_providers: Option<bool>,
+    lenient: Option<bool>,
     default_preset: Option<String>,
     data_dir: Option<PathBuf>,
     ephemeral_keys: Option<bool>,
@@ -97,7 +99,8 @@ pub struct Config {
     pub entity_id: Option<String>,
     pub auto_login: bool,
     pub silent_sso: bool,
-    pub strict_service_providers: bool,
+    /// Relax the spec's requirements for convenience (see `ServerArgs::lenient`).
+    pub lenient: bool,
     pub default_preset: String,
     pub data_dir: Option<PathBuf>,
     pub ephemeral_keys: bool,
@@ -122,7 +125,7 @@ impl Default for Config {
             entity_id: None,
             auto_login: false,
             silent_sso: false,
-            strict_service_providers: false,
+            lenient: false,
             default_preset: "generic".into(),
             data_dir: None,
             ephemeral_keys: false,
@@ -191,7 +194,7 @@ impl Config {
             entity_id: args.entity_id.clone().or(file.entity_id),
             auto_login: args.auto_login || file.auto_login.unwrap_or(false),
             silent_sso: args.silent_sso || file.silent_sso.unwrap_or(false),
-            strict_service_providers: args.strict_service_providers || file.strict_service_providers.unwrap_or(false),
+            lenient: args.lenient || file.lenient.unwrap_or(false),
             default_preset,
             data_dir,
             ephemeral_keys: args.ephemeral_keys || file.ephemeral_keys.unwrap_or(false),

@@ -1,5 +1,6 @@
-//! Service providers: declared in `localsaml.toml`, registered over the dev API, or (unless
-//! `strict_service_providers` is on) accepted ad hoc from whatever an AuthnRequest says.
+//! Service providers: declared in `localsaml.toml`, registered over the dev API, discovered from
+//! metadata at their entity ID, or (lenient mode only) accepted ad hoc from whatever an
+//! AuthnRequest says.
 //! Settings can come from SP metadata (`metadata_url`, `metadata_file` or `metadata`).
 
 use std::collections::BTreeMap;
@@ -76,8 +77,8 @@ pub struct ServiceProvider {
     /// Reject AuthnRequests that aren't signed (metadata: `AuthnRequestsSigned`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub want_authn_requests_signed: bool,
-    /// Reject LogoutRequests and LogoutResponses that aren't signed (SAML Profiles 4.4.4.2 wants
-    /// front-channel logout messages signed; off by default for convenience).
+    /// Reject LogoutRequests and LogoutResponses that aren't signed even in lenient mode (by
+    /// default they always must be: Profiles 4.4.4.1, 4.4.4.2).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub want_logout_signed: bool,
     /// NameID format to use when the request doesn't ask for one.

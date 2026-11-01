@@ -13,7 +13,7 @@ use crate::html::{esc, page, saml_error_page, saml_post};
 use crate::inspector::{Message, SamlNote};
 use crate::presets::{Preset, Style};
 use crate::routes::sso::{
-    Arrival, SigCheck, check_signature, clear_session_cookie, current_session, find_sp, resolve_sp, set_cookie,
+    Arrival, authenticated, check_signature, clear_session_cookie, current_session, find_sp, resolve_sp, set_cookie,
 };
 use crate::saml::{self, LogoutRequest, LogoutRequestSpec, LogoutResponse, Status};
 use crate::sp::ServiceProvider;
@@ -125,15 +125,20 @@ pub async fn logout_request(
         Ok(sp) => sp,
         Err(e) => return bad("Unknown service provider", &e),
     };
-    match check_signature(&sp, root, &req.id, arrival.query_signature.as_ref()) {
-        SigCheck::Invalid(e) => return bad("Invalid LogoutRequest signature", &e),
-        SigCheck::Unsigned if sp.want_logout_signed => {
-            return bad(
-                "Unsigned LogoutRequest",
-                &format!("{} must sign its logout messages (want_logout_signed).", sp.label()),
-            );
+    // The requester MUST authenticate itself (Profiles 4.4.4.1): refused with RequestDenied
+    // (Bindings 3.4.6), at the SP's own SingleLogoutService.
+    let signature = check_signature(&sp, root, &req.id, arrival.query_signature.as_ref());
+    if let Err(e) = authenticated(state, &sp, &signature, "LogoutRequest", sp.want_logout_signed) {
+        if sp.slo_url.is_none() {
+            return bad(e.split(':').next().unwrap_or("Refused LogoutRequest"), &e);
         }
-        _ => {}
+        let status = Status::parse("RequestDenied", Some(e)).unwrap();
+        return respond(state, tenant, &sp, &req.id, None, status);
+    }
+    // RelayState over 80 bytes isn't valid (Bindings 3.4.3): a Requester error, without it.
+    if let Some(r) = arrival.relay_state.as_ref().filter(|r| r.len() > 80 && !state.config.lenient) {
+        let message = format!("RelayState is {} bytes; the bindings allow at most 80", r.len());
+        return respond(state, tenant, &sp, &req.id, None, Status::parse("Requester", Some(message)).unwrap());
     }
     if let Err(e) = decrypt_name_id(state, &mut req, root) {
         let status = Status::parse("Requester", Some(e)).unwrap();
@@ -322,12 +327,15 @@ pub async fn logout_response(
     let outcome = if resp.in_response_to.as_deref() != Some(&request_id) {
         "failed: InResponseTo doesn't match the LogoutRequest".to_string()
     } else if let Some(sp) = find_sp(state, tenant, &waiting).await
-        && let Some(problem) = match check_signature(&sp, root, &resp.id, arrival.query_signature.as_ref()) {
-            SigCheck::Invalid(e) => Some(format!("invalid signature ({e})")),
-            SigCheck::Unsigned if sp.want_logout_signed => Some("unsigned, and want_logout_signed is on".into()),
-            _ => None,
-        }
+        && let Err(problem) = authenticated(
+            state,
+            &sp,
+            &check_signature(&sp, root, &resp.id, arrival.query_signature.as_ref()),
+            "LogoutResponse",
+            sp.want_logout_signed,
+        )
     {
+        // The responder MUST authenticate itself (Profiles 4.4.4.2).
         format!("failed: {problem}")
     } else if resp.status.is_success() {
         "logged out".to_string()
@@ -451,10 +459,9 @@ pub async fn back_channel(
                     let signature = check_signature(sp, &envelope, &resp.id, None);
                     if resp.in_response_to.as_deref() != Some(&id) {
                         "failed: InResponseTo doesn't match the LogoutRequest".to_string()
-                    } else if let SigCheck::Invalid(e) = signature {
-                        format!("failed: invalid signature ({e})")
-                    } else if matches!(signature, SigCheck::Unsigned) && sp.want_logout_signed {
-                        "failed: unsigned, and want_logout_signed is on".into()
+                    } else if let Err(e) = authenticated(state, sp, &signature, "LogoutResponse", sp.want_logout_signed)
+                    {
+                        format!("failed: {e}")
                     } else if resp.status.is_success() {
                         "logged out (SOAP)".into()
                     } else {
@@ -525,12 +532,9 @@ pub async fn soap_logout_request(
         Ok(sp) => sp,
         Err(e) => return fault(true, &e),
     };
-    match check_signature(&sp, envelope, &req.id, None) {
-        SigCheck::Invalid(e) => return fault(true, &format!("invalid LogoutRequest signature: {e}")),
-        SigCheck::Unsigned if sp.want_logout_signed => {
-            return fault(true, &format!("{} must sign its logout messages (want_logout_signed)", sp.label()));
-        }
-        _ => {}
+    let signature = check_signature(&sp, envelope, &req.id, None);
+    if let Err(e) = authenticated(state, &sp, &signature, "LogoutRequest", sp.want_logout_signed) {
+        return fault(true, &e);
     }
     if let Err(e) = decrypt_name_id(state, &mut req, envelope) {
         return fault(true, &e);
