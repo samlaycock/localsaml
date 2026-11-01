@@ -15,7 +15,7 @@ A local SAML 2.0 identity provider for offline development and testing. It's a s
 - **Built for automated tests.** Sign in from Playwright or Cypress with a single query parameter, or turn on auto-login. [Fault injection](#injecting-faults) returns SAML error statuses and deliberately broken responses (bad signatures, wrong audience, expired, replayed). A [shifted clock](#shifting-the-clock) tests your skew handling, and [declared users](#declared-users) give a team and its CI the same named identities.
 
 > [!WARNING]
-> localsaml is for development and testing only. It accepts any service provider by default, lets anyone sign in or mint assertions as any identity, and serves unauthenticated endpoints for minting responses and rotating keys. Its signing key is not a secret, and its dev API answers cross-origin requests, so any page you visit while it runs could mint assertions or change its settings. Never expose it to the internet or trust it to protect real data.
+> localsaml is for development and testing only. It lets anyone sign in or mint assertions as any identity, and serves unauthenticated endpoints for minting responses, registering service providers and rotating keys. Its signing key is not a secret, and its dev API answers cross-origin requests, so any page you visit while it runs could mint assertions or change its settings. Never expose it to the internet or trust it to protect real data.
 
 ## Contents
 
@@ -41,6 +41,15 @@ docker run --rm -p 9401:9401 -v localsaml:/data ghcr.io/samlaycock/localsaml
 ```
 
 The image is tagged `:<version>`, `:<major>.<minor>` (and `:<major>` from 1.0) and `:latest`. It runs as a non-root user and keeps its state in the `/data` volume. Pass flags after the image name, e.g. `docker run … ghcr.io/samlaycock/localsaml --auto-login`.
+
+localsaml only answers [service providers it knows](#quick-start). With Docker, mount your `localsaml.toml` and point `--config` at it, or register your service provider on the `/dev` page (registrations are kept in the `/data` volume):
+
+```sh
+docker run --rm -p 9401:9401 -v localsaml:/data -v "$PWD/localsaml.toml:/etc/localsaml.toml:ro" \
+  ghcr.io/samlaycock/localsaml --config /etc/localsaml.toml
+```
+
+Inside the container, `localhost` is the container itself. That's fine for the URLs your browser follows (ACS URLs, SLO redirects), but anything localsaml fetches itself must use an address the container can reach, such as `http://host.docker.internal:3000/…` (add `--add-host=host.docker.internal:host-gateway` on Linux). That covers `metadata_url`, SOAP endpoints for back-channel logout, and metadata discovery at an entity ID.
 
 **From source** (needs a recent stable Rust toolchain):
 
