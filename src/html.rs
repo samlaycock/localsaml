@@ -95,9 +95,10 @@ pub fn data_script(v: &Value) -> String {
 }
 
 pub fn error_page(tenant: &Tenant, status: StatusCode, title: &str, detail: &str) -> Response {
+    // SAML errors are HTTP 200 (see `saml_error_page`), so only show a status that is an error.
+    let label = if status.is_success() { "Error".to_string() } else { format!("Error {}", status.as_u16()) };
     let body = format!(
-        r#"<section class="card narrow"><div class="eyebrow error">Error {}</div><h1>{}</h1><p>{}</p></section>"#,
-        status.as_u16(),
+        r#"<section class="card narrow"><div class="eyebrow error">{label}</div><h1>{}</h1><p>{}</p></section>"#,
         esc(title),
         esc(detail)
     );
@@ -106,14 +107,10 @@ pub fn error_page(tenant: &Tenant, status: StatusCode, title: &str, detail: &str
     resp
 }
 
-/// An error page for a SAML message that can't be answered with a SAML message (no trustworthy
-/// service provider or ACS to send an error Response to). It's an HTTP 400: SAML Bindings 3.4.6
-/// and 3.5.6 discourage HTTP error codes, but there's no SAML exchange left to stay inside, and
-/// conformance tools and service providers alike treat a 4xx as the refusal. The title is also
-/// in the `x-localsaml-error` header, for scripts.
-/// A SAML message that can't be answered with a SAML error Response. HTTP 200: the bindings
-/// forbid HTTP error codes for SAML failures (Bindings 3.4.6, 3.5.6); the `x-localsaml-error`
-/// header names the problem for tools.
+/// An error page for a SAML message that can't be answered with a SAML error Response (no
+/// trustworthy service provider or ACS to send one to). HTTP 200: the bindings forbid HTTP error
+/// codes for SAML failures (Bindings 3.4.6, 3.5.6); the `x-localsaml-error` header names the
+/// problem for tools.
 pub fn saml_error_page(tenant: &Tenant, title: &str, detail: &str) -> Response {
     let mut resp = error_page(tenant, StatusCode::OK, title, detail);
     if let Ok(v) =

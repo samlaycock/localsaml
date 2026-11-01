@@ -313,6 +313,9 @@ document.addEventListener('click', async (e) => {
     if (last && last.identity && !offered.has(key(last))) items.push({ kind: 'last', label: 'Last used', entry: last });
     saved().forEach((s, i) => s.identity && items.push({ kind: 'saved', label: s.name, entry: s, index: i }));
 
+    // An AuthnRequest naming a Subject only gets an assertion about that subject (Profiles 4.1.4.1).
+    const subject = data.subject && data.subject.nameId;
+    const mismatch = (identity) => subject && identity && identity.name_id && identity.name_id !== subject;
     const cards = items.map((item) => {
       const p = byId[item.entry.preset] || presets[0];
       const who = describe({ preset: p.id, ...item.entry.identity });
@@ -321,7 +324,10 @@ document.addEventListener('click', async (e) => {
         h('div', { class: 'quick-meta' },
           h('span', { class: 'quick-label' }, named ? item.label : h('span', {}, h('em', {}, item.label), ` · ${who}`)),
           h('span', { class: 'quick-provider' }, h('span', { class: 'dot' }), p.name, named && item.label !== who ? ` · ${who}` : null,
-            item.kind === 'user' ? h('span', { class: 'quick-tag', title: 'Declared in localsaml.toml' }, 'config') : null)),
+            item.kind === 'user' ? h('span', { class: 'quick-tag', title: 'Declared in localsaml.toml' }, 'config') : null,
+            mismatch(item.entry.identity)
+              ? h('span', { class: 'quick-tag warn', title: `Its NameID is ${item.entry.identity.name_id}` }, 'not the requested subject')
+              : null)),
         h('div', { class: 'quick-actions' },
           h('button', { type: 'button', class: 'btn small primary', onclick: () => useIdentity(item.entry) }, isDev ? 'Generate' : 'Sign in'),
           h('button', { type: 'button', class: 'btn small ghost', onclick: () => editIdentity(item.entry) }, 'Edit'),
@@ -334,6 +340,10 @@ document.addEventListener('click', async (e) => {
 
     return h('section', { class: 'quick' },
       h('div', { class: 'section-title' }, isDev ? 'Saved identities' : 'Quick sign in'),
+      subject && !isDev
+        ? h('p', { class: 'notice warn small' }, 'This request is for the subject ', h('code', {}, subject),
+            '. Only signing in with that NameID (pre-filled below) gets an assertion; any other identity gets an UnknownPrincipal error.')
+        : null,
       cards.length
         ? h('div', { class: 'quick-list' }, cards)
         : h('p', { class: 'muted small' }, 'Identities you save (bottom of the page) show up here for one-click reuse.'));
@@ -646,6 +656,8 @@ document.addEventListener('click', async (e) => {
           chip(json.signed.response ? 'response signed' : 'response unsigned', json.signed.response ? 'ok' : 'muted'),
           chip(json.signed.assertion ? 'assertion signed' : 'assertion unsigned', json.signed.assertion ? 'ok' : 'muted'),
           json.encrypted ? chip('encrypted', 'ok') : null,
+          json.name_id_encrypted ? chip('NameID encrypted', 'ok') : null,
+          json.attributes_encrypted ? chip('attributes encrypted', 'ok') : null,
           ...(req.tamper || []).map((t) => chip(t, 'bad'))),
         h('dl', { class: 'kv' },
           h('dt', {}, 'ACS URL'), h('dd', {}, h('code', {}, json.acs_url)),

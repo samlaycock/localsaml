@@ -800,6 +800,8 @@ pub async fn page_handler(State(state): State<AppState>, tenant: Tenant, headers
     sp_ids.extend(state.service_providers().into_iter().map(|s| s.entity_id));
     let cert = state.keys.current_info();
     let tri = [("", "Template default"), ("true", "Yes"), ("false", "No")];
+    // NameID and attribute encryption are per service provider (encrypt_name_id, encrypt_attributes).
+    let sp_tri = [("", "SP default"), ("true", "Yes"), ("false", "No")];
     let tampers: String = Tamper::ALL
         .iter()
         .map(|t| {
@@ -828,8 +830,8 @@ pub async fn page_handler(State(state): State<AppState>, tenant: Tenant, headers
     <label>Sign assertion<select id="dev-sign-assertion">{tri}</select></label>
     <label>Signature algorithm<select id="dev-alg">{algs}</select></label>
     <label>Encrypt assertion<select id="dev-encrypt">{encs}</select></label>
-    <label>Encrypt NameID<select id="dev-encrypt-name-id">{tri}</select></label>
-    <label>Encrypt attributes<select id="dev-encrypt-attributes">{tri}</select></label>
+    <label>Encrypt NameID<select id="dev-encrypt-name-id">{sp_tri}</select></label>
+    <label>Encrypt attributes<select id="dev-encrypt-attributes">{sp_tri}</select></label>
     <div class="checks tampers"><span class="muted small">Defects:</span>{tampers}</div>
   </div>
   <datalist id="dev-sps">{sp_options}</datalist>
@@ -898,6 +900,7 @@ pub async fn page_handler(State(state): State<AppState>, tenant: Tenant, headers
         test_sp = esc(&test_sp),
         lifetime = state.config.assertion_ttl.unwrap_or(preset.assertion_lifetime),
         tri = options(&tri, ""),
+        sp_tri = options(&sp_tri, ""),
         algs = options(
             &[("rsa-sha256", "RSA-SHA256"), ("rsa-sha512", "RSA-SHA512"), ("rsa-sha1", "RSA-SHA1")],
             state.config.signature_algorithm.name()
