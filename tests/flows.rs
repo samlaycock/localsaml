@@ -299,6 +299,15 @@ async fn metadata_for_root_and_templates() {
             .collect()
     };
 
+    // Every template issuer's home page, at the URL the home page links to.
+    for preset in localsaml::presets::all() {
+        let r = get(&app, &format!("/p/{}/", preset.id)).await;
+        assert_eq!(r.status, StatusCode::OK, "/p/{}/", preset.id);
+        assert_eq!(r.title(), "Home · localsaml", "/p/{}/", preset.id);
+    }
+    let home = get(&app, "/").await;
+    assert!(home.body.contains(r#"href="/p/okta/""#));
+
     let root = md(&get(&app, "/metadata").await.body);
     assert_eq!(root.get_attr("entityID"), Some("http://localhost:9401/metadata"));
     assert_eq!(

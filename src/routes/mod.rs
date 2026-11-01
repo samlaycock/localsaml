@@ -54,6 +54,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(issuer_routes())
         .nest("/p/{preset}", issuer_routes().merge(providers::routes()))
+        // A nested "/" only matches "/p/<template>"; links to an issuer's home end with a slash.
+        .route("/p/{preset}/", get(pages::index))
         .route("/assets/app.css", get(pages::css))
         .route("/assets/app.js", get(pages::js))
         .route("/health", get(|| async { "ok" }))

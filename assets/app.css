@@ -171,6 +171,7 @@ textarea { resize: vertical; min-height: 36px; }
 .endpoints { width: 100%; border-collapse: collapse; }
 .endpoints td { padding: 7px 0; border-bottom: 1px solid var(--border); }
 .endpoints td:first-child { color: var(--muted); width: 240px; }
+.endpoints code { overflow-wrap: anywhere; }
 .tenants { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
 .tenant {
   display: grid; gap: 2px; padding: 12px 14px; border-radius: 10px; text-decoration: none; color: var(--text);
@@ -252,6 +253,7 @@ textarea { resize: vertical; min-height: 36px; }
 .req-toolbar #req-sp { width: 220px; }
 .req-toolbar .check { display: flex; align-items: center; gap: 6px; font-size: 13px; }
 .req-spacer { flex: 1; }
+#lo-requests { overflow-x: auto; }
 .req-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .req-table th { text-align: left; font-size: 12px; font-weight: 600; color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--border); }
 .req-table td { padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; overflow-wrap: anywhere; }
@@ -331,4 +333,11 @@ pre.code.wrap { white-space: pre-wrap; word-break: break-all; max-height: 220px;
   .topbar { flex-wrap: wrap; gap: 6px 16px; padding: 10px 16px; }
   .topbar nav { margin-left: 0; width: 100%; gap: 14px; overflow-x: auto; }
   .topbar nav a { white-space: nowrap; }
+  /* Endpoint tables stack (name above URL); list rows wrap their buttons and chips. */
+  .endpoints tr { display: block; padding: 7px 0; border-bottom: 1px solid var(--border); }
+  .endpoints td { display: block; padding: 1px 0; border-bottom: 0; }
+  .endpoints td:first-child { width: auto; }
+  .fault-list li { flex-wrap: wrap; }
+  .fault-list li > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+  .row-actions { flex-wrap: wrap; }
 }

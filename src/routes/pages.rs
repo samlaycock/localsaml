@@ -28,11 +28,13 @@ pub async fn index(State(state): State<AppState>, tenant: Tenant) -> Response {
     let mut endpoints = vec![
         ("Metadata", tenant.metadata_url()),
         ("Entity ID", tenant.entity_id.clone()),
-        ("SSO (Redirect and POST bindings)", tenant.sso_url()),
+        ("SSO (Redirect and POST bindings; SOAP for ECP)", tenant.sso_url()),
     ];
     if let Some(slo) = tenant.slo_url() {
-        endpoints.push(("Single logout (Redirect and POST bindings)", slo));
+        endpoints.push(("Single logout (Redirect, POST and SOAP bindings)", slo));
     }
+    endpoints.push(("Artifact resolution (SOAP)", u("/artifact")));
+    endpoints.push(("Attribute queries (SOAP)", u("/attribute")));
     endpoints.push(("IdP-initiated SSO (non-standard)", format!("{}?sp=<entity ID>", u("/sso/initiate"))));
     endpoints.push(("Signing certificate (PEM)", u("/certificate.pem")));
     endpoints.push(("Response API (non-standard)", u("/dev/api/response")));
@@ -70,11 +72,16 @@ pub async fn index(State(state): State<AppState>, tenant: Tenant) -> Response {
 
     let cert = state.keys.current_info();
     let dev = esc(&u("/dev/api/response"));
+    let accepted = if state.config.lenient {
+        "Lenient mode: any service provider is accepted, with the ACS URL from its AuthnRequest."
+    } else {
+        "It answers the service providers it knows: declared in <code>localsaml.toml</code>, registered on the assertion generator page, or serving their metadata at their entity ID. (The SAML specification requires an identity provider to verify ACS URLs; <code>--lenient</code> accepts any.)"
+    };
     let body = format!(
         r#"<section class="card hero">
   <div class="eyebrow">Local SAML identity provider</div>
   <h1>Entity ID <span class="accent">{entity}</span></h1>
-  <p class="muted">Point your service provider at the metadata URL <code>{metadata}</code>. Any service provider is accepted unless declared in <code>localsaml.toml</code>, with the ACS URL from its AuthnRequest. Signing in shows an attribute editor instead of a password prompt.</p>
+  <p class="muted">Point your service provider at the metadata URL <code>{metadata}</code>. {accepted} Signing in shows an attribute editor instead of a password prompt.</p>
   <div class="actions"><a class="btn primary" href="{prefix}/sp">Try a login</a>
   <a class="btn ghost" href="{prefix}/dev">Open assertion generator</a></div>
 </section>
@@ -89,7 +96,8 @@ pub async fn index(State(state): State<AppState>, tenant: Tenant) -> Response {
 </section>
 <section class="card">
   <h2>Quick start</h2>
-  <pre class="code">curl -s '{dev}?sp=http://localhost:3000/saml/metadata&amp;acs_url=http://localhost:3000/saml/acs&amp;email=me@example.com' | jq .
+  <pre class="code"># For a service provider localsaml knows (declared, registered or discovered):
+curl -s '{dev}?sp=http://localhost:3000/saml/metadata&amp;email=me@example.com' | jq .
 curl -s -X POST {dev} -H 'content-type: application/json' \
   -d '{{"preset":"okta","sp":"http://localhost:3000/saml/metadata","attributes":{{"groups":["admins"]}}}}'</pre>
 </section>
