@@ -267,6 +267,11 @@ impl ServiceProvider {
             || self.acs_urls.iter().chain(&self.acs_artifact_urls).chain(&self.acs_ecp_urls).any(|a| a == url)
     }
 
+    /// Is `url` an ACS URL registered for this SP (not just allowed for want of any)?
+    pub fn registers_acs(&self, url: &str) -> bool {
+        self.acs_urls.iter().chain(&self.acs_artifact_urls).chain(&self.acs_ecp_urls).any(|a| a == url)
+    }
+
     /// The key that checks this SP's signed messages (RSA or DSA).
     pub fn signing_key(&self) -> Option<Result<PublicKey, String>> {
         self.certificate.as_ref().map(|c| parse_cert(c).and_then(|der| cert_verifying_key(&der)))

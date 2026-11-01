@@ -1,9 +1,10 @@
 # Tests expected to fail in strict mode (./run.sh), one per line: name<TAB>category<TAB>reason.
 # Categories: kit = the kit expects something the spec doesn't require or that no IdP can do;
 # spec = localsaml deviates from the specification.
-# LENIENT=1 ./run.sh (HTTP error pages allowed) passes the first three.
-Profiles 4.1.4.1: Empty POST AuthnRequest Test	kit	An AuthnRequest with no ID, Version or Issuer has no service provider to send an error Response to, so localsaml shows an error page. The kit only accepts that in lenient mode; it also wants HTTP 200 (Bindings 3.5.6), and localsaml answers 400. Strictly, Bindings 3.4.6/3.5.6 say SAML failures MUST NOT use HTTP error codes, but with no SAML exchange to answer within, a 200 fails the kit in both modes (it then looks for a SAML message), while 400 passes lenient mode.
+# The kit's lenient mode (LENIENT=1 ./run.sh) only accepts error pages with an HTTP error code,
+# which Bindings 3.4.6/3.5.6 forbid, so it fails the same tests.
+Profiles 4.1.4.1: Empty POST AuthnRequest Test	kit	An AuthnRequest with no ID, Version or Issuer has no service provider or ACS to send an error Response to, so localsaml shows an error page, with HTTP 200 because Bindings 3.5.6 says SAML failures MUST NOT use HTTP error codes. The kit wants either a SAML error Response (impossible without an ACS) or, in lenient mode, an HTTP error code (forbidden).
 Profiles 4.1.4.1: Empty Redirect AuthnRequest Test	kit	As above, for the Redirect binding (Bindings 3.4.6).
-Bindings 3.4.3: Redirect Incomplete AuthnRequest In URL Query Test	kit	A truncated SAMLRequest can't be decoded, so there's no service provider to answer; localsaml shows an error page with HTTP 400.
+Bindings 3.4.3: Redirect Incomplete AuthnRequest In URL Query Test	kit	A truncated SAMLRequest can't be decoded, so there's no service provider or ACS to answer; localsaml shows an error page with HTTP 200 (Bindings 3.4.6), which the kit doesn't accept.
 Bindings 3.5.3: POST AuthnRequest With Relay State Greater Than 80 Bytes Test	kit	Bindings 3.5.3 says RelayState MUST NOT exceed 80 bytes, a rule for the sender. The kit expects the IdP to reject it with a Requester error; localsaml accepts it and returns it unchanged, as most IdPs do.
 Bindings 3.4.3: Redirect AuthnRequest With Relay State Greater Than 80 Bytes Test	kit	As above, for the Redirect binding (Bindings 3.4.3).

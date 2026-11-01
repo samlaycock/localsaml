@@ -5,7 +5,7 @@
 ```sh
 ./run.sh                 # build localsaml and run every test (needs Docker and a Rust toolchain)
 BINARY=../../target/release/localsaml ./run.sh
-LENIENT=1 ./run.sh       # the kit's -l mode: error pages may use HTTP 4xx/5xx
+LENIENT=1 ./run.sh       # the kit's -l mode: error pages may use HTTP 4xx/5xx (the bindings forbid that)
 ```
 
 A run takes about 15 seconds once localsaml is built (the kit runs under amd64 emulation on Apple silicon). `run.sh` exits non-zero if a test fails that isn't listed in [`expected-failures.tsv`](expected-failures.tsv). It also lists expected failures that passed, so the list can be kept up to date. Everything it produces is in `.work/`: `results.log` (every test with its real result and reason), `localsaml.log` and the kit's section report in `out/report.txt`.
@@ -28,15 +28,14 @@ A run takes about 15 seconds once localsaml is built (the kit runs under amd64 e
 
 | Mode | Passed | Failed |
 |---|---|---|
-| strict (`./run.sh`) | 21 | 7 (all expected) |
-| lenient (`LENIENT=1 ./run.sh`) | 24 | 4 |
+| strict (`./run.sh`) | 23 | 5 (all expected) |
+| lenient (`LENIENT=1 ./run.sh`) | 23 | 5 |
 
-All of SSO over both bindings, with and without RelayState and ACS URLs, passes, and so do the Destination checks (a request whose `Destination` isn't where it was received gets a `Requester` error). So does single logout from one service provider and from two (propagation, RelayState, and an SP that fails to log out). The expected failures, with reasons, are in [`expected-failures.tsv`](expected-failures.tsv):
+All of SSO over both bindings, with and without RelayState and ACS URLs, passes, and so do the Destination checks (a request whose `Destination` isn't where it was received gets a `Requester` error) and the `Subject` checks (an AuthnRequest naming a subject the user didn't sign in as gets an error Response, Profiles 4.1.4.1). So does single logout from one service provider and from two (propagation, RelayState, and an SP that fails to log out). The expected failures, with reasons, are in [`expected-failures.tsv`](expected-failures.tsv):
 
 - **The kit expects what no IdP can do, or what the spec asks of the sender (5 tests).**
-  - It wants a SAML error Response to an AuthnRequest that's empty or can't be decoded, so has no service provider to send it to. localsaml shows an error page with HTTP 400. Strictly, the bindings say SAML failures shouldn't use HTTP error codes; localsaml keeps 400 so scripts can tell an error page from a login page. Lenient mode accepts it.
+  - It wants a SAML error Response to an AuthnRequest that's empty or can't be decoded, so has no service provider or ACS to send it to. localsaml shows an error page, with HTTP 200 because Bindings 3.4.6/3.5.6 say SAML failures MUST NOT use HTTP error codes (the `x-localsaml-error` header tells scripts it's an error). The kit's lenient mode only accepts such a page with an HTTP error code, so it fails these in both modes.
   - It wants RelayState over 80 bytes rejected; that limit is a rule for the sender. localsaml accepts it and warns on the login page.
-- **localsaml behaves this way by design (2 tests).** An AuthnRequest naming an unknown `Subject` gets an assertion about that subject, which Profiles 4.1.4.1 allows. The kit only accepts an error, but every subject can sign in to localsaml.
 
 ### DSA signatures
 

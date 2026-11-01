@@ -111,8 +111,11 @@ pub fn error_page(tenant: &Tenant, status: StatusCode, title: &str, detail: &str
 /// and 3.5.6 discourage HTTP error codes, but there's no SAML exchange left to stay inside, and
 /// conformance tools and service providers alike treat a 4xx as the refusal. The title is also
 /// in the `x-localsaml-error` header, for scripts.
+/// A SAML message that can't be answered with a SAML error Response. HTTP 200: the bindings
+/// forbid HTTP error codes for SAML failures (Bindings 3.4.6, 3.5.6); the `x-localsaml-error`
+/// header names the problem for tools.
 pub fn saml_error_page(tenant: &Tenant, title: &str, detail: &str) -> Response {
-    let mut resp = error_page(tenant, StatusCode::BAD_REQUEST, title, detail);
+    let mut resp = error_page(tenant, StatusCode::OK, title, detail);
     if let Ok(v) =
         axum::http::HeaderValue::from_str(&title.replace(|c: char| !c.is_ascii() || c.is_ascii_control(), "?"))
     {

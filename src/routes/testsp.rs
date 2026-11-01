@@ -717,7 +717,7 @@ pub async fn acs(
     } else {
         return crate::html::error_page(
             &tenant,
-            StatusCode::BAD_REQUEST,
+            StatusCode::OK,
             "No SAMLResponse",
             "Post a SAMLResponse here (HTTP-POST binding), or send a SAMLart (HTTP-Artifact binding).",
         );
@@ -826,7 +826,7 @@ pub async fn slo(State(state): State<AppState>, tenant: Tenant, RawQuery(q): Raw
     if let Some(param) = dsig::duplicate_param(&query) {
         return crate::html::error_page(
             &tenant,
-            StatusCode::BAD_REQUEST,
+            StatusCode::OK,
             "Duplicate parameter",
             &format!("{param} appears more than once in the query string."),
         );
@@ -843,7 +843,7 @@ pub async fn slo(State(state): State<AppState>, tenant: Tenant, RawQuery(q): Raw
     let clear = cookie(&session_cookie_name(&tenant), "", 0);
     let (message, root) = match parsed {
         Ok(m) => m,
-        Err(e) => return crate::html::error_page(&tenant, StatusCode::BAD_REQUEST, "Invalid logout message", &e),
+        Err(e) => return crate::html::error_page(&tenant, StatusCode::OK, "Invalid logout message", &e),
     };
     let verified = |id: &str| {
         let keys = state.keys.public_keys();
@@ -875,7 +875,7 @@ pub async fn slo(State(state): State<AppState>, tenant: Tenant, RawQuery(q): Raw
             let Some(slo) = tenant.slo_url() else {
                 return crate::html::error_page(
                     &tenant,
-                    StatusCode::BAD_REQUEST,
+                    StatusCode::OK,
                     "No SLO endpoint",
                     "The identity provider has no SLO endpoint to answer.",
                 );
@@ -909,7 +909,7 @@ pub async fn slo(State(state): State<AppState>, tenant: Tenant, RawQuery(q): Raw
         }
         Message::AuthnRequest(_) | Message::ArtifactResolve(_) | Message::AttributeQuery(_) => crate::html::error_page(
             &tenant,
-            StatusCode::BAD_REQUEST,
+            StatusCode::OK,
             &format!("Unexpected {}", message.kind()),
             "This is the test SP's logout endpoint.",
         ),

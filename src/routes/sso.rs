@@ -343,18 +343,18 @@ async fn authn_request(
         Err(e) => return bad("Unknown service provider", &e),
     };
     let signature = check_signature(&sp, root, &req.id, arrival.query_signature.as_ref());
-    if let SigCheck::Invalid(e) = &signature {
-        return bad("Invalid AuthnRequest signature", e);
-    }
-    if matches!(signature, SigCheck::Unsigned) && sp.want_authn_requests_signed {
-        return bad(
-            "Unsigned AuthnRequest",
-            &format!(
+    // A refused request is answered once its ACS is known (below).
+    let refusal = match &signature {
+        SigCheck::Invalid(e) => Some(("Invalid AuthnRequest signature".to_string(), e.clone())),
+        SigCheck::Unsigned if sp.want_authn_requests_signed => Some((
+            "Unsigned AuthnRequest".to_string(),
+            format!(
                 "{} requires signed AuthnRequests (AuthnRequestsSigned in its metadata, or want_authn_requests_signed).",
                 sp.label()
             ),
-        );
-    }
+        )),
+        _ => None,
+    };
 
     // The request's ProtocolBinding, else the binding of the ACS it names, else the SP's default.
     let requested_binding = match req.protocol_binding.as_deref() {
@@ -479,6 +479,21 @@ async fn authn_request(
         tampers: vec![],
         request_xml: Some(root.to_pretty()),
     };
+    // Refusing to answer: a RequestDenied Response if the ACS is one registered for the SP
+    // (Bindings 3.4.6, 3.5.6); otherwise there's nowhere trustworthy to send one.
+    if let Some((title, detail)) = refusal {
+        if !sp.registers_acs(&pending.acs_url) {
+            return bad(&title, &detail);
+        }
+        return respond_status(
+            state,
+            tenant,
+            preset,
+            &sp,
+            &pending,
+            Status::parse("RequestDenied", Some(format!("{title}: {detail}"))).unwrap(),
+        );
+    }
     if req.version != "2.0" {
         let status =
             Status::parse("RequestVersionTooHigh", Some(format!("unsupported SAML version '{}'", req.version)));

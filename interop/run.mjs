@@ -872,9 +872,14 @@ async function runHelperStack(stack, helper, issuer, keys) {
       } else {
         res = await fetch(`${req.url.replace('RelayState=rs-1', 'RelayState=rs-2')}&dev_user=alice`, { redirect: 'manual' });
       }
-      const html = await res.text();
-      assert(res.status === 400 && /^Invalid AuthnRequest signature/.test(errorText(html)), `expected "Invalid AuthnRequest signature", got ${res.status} "${errorText(html)}"`);
-      return errorText(html).slice(0, 100);
+      // Refused with a RequestDenied error Response at the SP's registered ACS (Bindings 3.4.6).
+      const posted = await postedMessage(res);
+      assert(posted.action === sp.acs, `posted to ${posted.action}, expected ${sp.acs}`);
+      const xml = decodeB64(posted.SAMLResponse || '');
+      assert(/status:RequestDenied/.test(xml) && !/Assertion/.test(xml), `expected a RequestDenied Response without an assertion, got ${xml.slice(0, 300)}`);
+      const message = (xml.match(/StatusMessage>([^<]*)/) || [])[1] || '';
+      assert(/^Invalid AuthnRequest signature/.test(message), `StatusMessage "${message}"`);
+      return message.slice(0, 100);
     });
   }
 

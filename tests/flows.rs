@@ -431,23 +431,34 @@ async fn declared_service_providers_are_enforced() {
     let r = get(&app, &redirect("/sso", "SAMLRequest", &xml, None, Some(sp_key()))).await;
     assert_eq!(
         (r.status, r.title().as_str()),
-        (StatusCode::BAD_REQUEST, "Unregistered AssertionConsumerServiceURL · localsaml")
+        (StatusCode::OK, "Unregistered AssertionConsumerServiceURL · localsaml")
     );
 
     // Unsigned, but the SP wants signed requests.
     let xml = authn_request("_a2", "http://declared.test/sp", None, "", "");
     let r = get(&app, &redirect("/sso", "SAMLRequest", &xml, None, None)).await;
-    assert_eq!((r.status, r.title().as_str()), (StatusCode::BAD_REQUEST, "Unsigned AuthnRequest · localsaml"));
-    assert_eq!(r.headers["x-localsaml-error"], "Unsigned AuthnRequest");
+    // The ACS (the declared default) can be trusted, so the refusal is a RequestDenied Response
+    // (Bindings 3.4.6).
+    let p = posted(&r);
+    assert_eq!(p.status().short(), "RequestDenied");
+    assert!(p.status().message.unwrap().starts_with("Unsigned AuthnRequest"));
 
     // Signed by the wrong key (the IdP's, not the SP's certificate).
     let xml = authn_request("_a3", "http://cert.test/sp", None, "", "");
     let uri = state.keys.with_current(|k| redirect("/sso", "SAMLRequest", &xml, None, Some(k)));
     let r = get(&app, &uri).await;
-    assert_eq!((r.status, r.title().as_str()), (StatusCode::BAD_REQUEST, "Invalid AuthnRequest signature · localsaml"));
+    assert_eq!(posted(&r).status().short(), "RequestDenied");
     let signed = state.keys.with_current(|k| signed_xml(&xml, "_a3", k));
     let r = post_form(&app, "/sso", &[("SAMLRequest", &b64_std(&signed))], &mut Jar::default()).await;
-    assert_eq!(r.title(), "Invalid AuthnRequest signature · localsaml");
+    assert!(posted(&r).status().message.unwrap().starts_with("Invalid AuthnRequest signature"));
+    // An unregistered ACS gets no Response, even to refuse: an error page (HTTP 200).
+    let xml_evil = authn_request("_a4", "http://cert.test/sp", Some("http://evil.test/acs"), "", "");
+    let uri = state.keys.with_current(|k| redirect("/sso", "SAMLRequest", &xml_evil, None, Some(k)));
+    let r = get(&app, &uri).await;
+    assert_eq!(
+        (r.status, r.headers["x-localsaml-error"].to_str().unwrap()),
+        (StatusCode::OK, "Unregistered AssertionConsumerServiceURL")
+    );
 
     // With no ACS in the request, the declared default is used.
     let r = get(&app, &redirect("/sso", "SAMLRequest", &xml, None, Some(sp_key()))).await;
@@ -456,7 +467,7 @@ async fn declared_service_providers_are_enforced() {
     // Strict mode: unknown service providers are refused.
     let (app, _) = app_with(Config { strict_service_providers: true, ..Default::default() });
     let r = get(&app, &redirect("/sso", "SAMLRequest", &simple_request("_s1"), None, None)).await;
-    assert_eq!((r.status, r.title().as_str()), (StatusCode::BAD_REQUEST, "Unknown service provider · localsaml"));
+    assert_eq!((r.status, r.title().as_str()), (StatusCode::OK, "Unknown service provider · localsaml"));
 }
 
 #[tokio::test]
@@ -600,9 +611,9 @@ async fn dev_parameters_sign_in_immediately() {
     );
 
     let r = get(&app, &format!("{base}&dev_user=nobody")).await;
-    assert_eq!((r.status, r.title().as_str()), (StatusCode::BAD_REQUEST, "Unknown dev_user · localsaml"));
+    assert_eq!((r.status, r.title().as_str()), (StatusCode::OK, "Unknown dev_user · localsaml"));
     let r = get(&app, &format!("{base}&dev_tamper=nope")).await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.headers["x-localsaml-error"], "Invalid dev_tamper");
 }
 
 #[tokio::test]
@@ -661,7 +672,7 @@ async fn idp_initiated_logins() {
     // Strict mode refuses unknown SPs even with an ACS URL.
     let (app, _) = app_with(Config { strict_service_providers: true, ..Default::default() });
     let r = get(&app, "/sso/initiate?sp=http%3A%2F%2Fnew.test%2Fsp&acs=http%3A%2F%2Fnew.test%2Facs").await;
-    assert_eq!((r.status, r.title().as_str()), (StatusCode::BAD_REQUEST, "Unknown service provider · localsaml"));
+    assert_eq!((r.status, r.title().as_str()), (StatusCode::OK, "Unknown service provider · localsaml"));
 }
 
 // ---------------------------------------------------------------------------
@@ -779,7 +790,7 @@ async fn logout_without_a_session_and_idp_initiated_logout() {
         &redirect("/p/google/slo", "SAMLRequest", &logout_request("_g1", "http://a.test/sp", "jane"), None, None),
     )
     .await;
-    assert_eq!((r.status, r.title().as_str()), (StatusCode::BAD_REQUEST, "Single logout isn't supported · localsaml"));
+    assert_eq!((r.status, r.title().as_str()), (StatusCode::OK, "Single logout isn't supported · localsaml"));
 }
 
 // ---------------------------------------------------------------------------
@@ -988,7 +999,8 @@ async fn inspector_records_decoded_messages_and_errors() {
     assert!(login["outcome"].as_str().unwrap().starts_with("Response → "), "{}", login["outcome"]);
     let refused = entries.iter().find(|e| e["sp"] == SP).expect("the refused request");
     assert_eq!(refused["error"], "Unknown service provider");
-    assert_eq!(refused["status"], 400);
+    // HTTP 200: the bindings forbid HTTP error codes for SAML failures (Bindings 3.4.6).
+    assert_eq!(refused["status"], 200);
 
     let errors = get(&app, "/dev/api/requests?errors=true").await.json();
     assert!(
@@ -1066,7 +1078,7 @@ async fn hostile_messages_are_refused_not_fatal() {
     // Deeply nested XML is refused (it used to overflow the stack), and the server keeps going.
     let deep = format!("{}{}", "<a>".repeat(50_000), "</a>".repeat(50_000));
     let r = get(&app, &redirect("/sso", "SAMLRequest", &deep, None, None)).await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.status, StatusCode::OK);
     assert!(r.body.contains("nested"), "{}", r.body);
     assert_eq!(get(&app, "/health").await.status, StatusCode::OK);
 
@@ -1074,15 +1086,15 @@ async fn hostile_messages_are_refused_not_fatal() {
     let signed = redirect("/sso", "SAMLRequest", &simple_request("_dup1"), None, Some(sp_key()));
     let extra = redirect("", "SAMLRequest", &simple_request("_evil"), None, None);
     let r = get(&app, &format!("{signed}&{}", &extra[1..])).await;
-    assert_eq!((r.status, r.title()), (StatusCode::BAD_REQUEST, "Duplicate parameter · localsaml".to_string()));
+    assert_eq!((r.status, r.title()), (StatusCode::OK, "Duplicate parameter · localsaml".to_string()));
 
     // Script URLs are never posted or redirected to.
     let xml = authn_request("_js", SP, Some("javascript:alert(1)//"), "", "");
     let r = get(&app, &redirect("/sso", "SAMLRequest", &xml, None, None)).await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.headers.contains_key("x-localsaml-error"));
     assert!(!r.body.contains(r#"action="javascript"#));
     let r = get(&app, &format!("/sso/initiate?sp={}&acs={}", enc(SP), enc("javascript:alert(1)"))).await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(r.headers.contains_key("x-localsaml-error"));
     let r = post_json(&app, "/dev/api/response", json!({ "acs_url": "javascript:alert(1)" })).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
 
@@ -1159,7 +1171,7 @@ async fn requests_are_held_to_the_spec() {
     let page =
         get_jar(&app, &redirect("/p/okta/sso", "SAMLRequest", &simple_request("_t1"), None, None), &mut jar).await;
     let r = approve(&app, "", &page, "okta", json!({}), &mut jar).await;
-    assert_eq!((r.status, r.title()), (StatusCode::BAD_REQUEST, "Wrong identity provider · localsaml".to_string()));
+    assert_eq!((r.status, r.title()), (StatusCode::OK, "Wrong identity provider · localsaml".to_string()));
 
     // The mint API's NameID follows the given attributes when the defaults are dropped.
     let minted = post_json(
@@ -1506,7 +1518,7 @@ async fn artifact_binding() {
     assert!(resolve(&app, &state, SP, "AAQAAA==").await.1.is_none());
     let (request, _) = saml::artifact_resolve(SP, "x", &artifact, wall_clock());
     let r = get(&app, &redirect("/sso", "SAMLRequest", &request.to_xml(), None, None)).await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.headers["x-localsaml-error"], "ArtifactResolve over the wrong binding");
 
     // An SP whose only (or default) ACS is HTTP-Artifact gets artifacts for IdP-initiated logins.
     let r = get_jar(&app, "/sso/initiate?sp=http%3A%2F%2Fart.test%2Fsp&dev_attributes=%7B%7D", &mut jar).await;
@@ -1877,10 +1889,13 @@ async fn ecp_logins() {
     );
     let r = ecp(&app, &hoisted, Some("alice")).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    // A tampered one doesn't, and the fault says why.
-    let r = ecp(&app, &hoisted.replace("http://ecp.test/ecp\"", "http://ecp.test/ecp?x\""), Some("alice")).await;
-    assert_eq!(r.status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(r.body.contains("Invalid AuthnRequest signature: "), "{}", r.body);
+    // A tampered one doesn't: a RequestDenied Response, saying why (Bindings 3.4.6).
+    let tampered = hoisted.replacen("<samlp:AuthnRequest ", r#"<samlp:AuthnRequest ProviderName="x" "#, 1);
+    let r = ecp(&app, &tampered, Some("alice")).await;
+    let (_, response) = localsaml::soap::unwrap(&r.body).unwrap();
+    let status = Status::from_element(response.find(P, "Status"));
+    assert_eq!(status.short(), "RequestDenied");
+    assert!(status.message.unwrap().starts_with("Invalid AuthnRequest signature: "));
 
     // The Basic scheme is case-insensitive (RFC 7617).
     let lower = Request::builder()
