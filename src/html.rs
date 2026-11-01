@@ -131,12 +131,25 @@ pub fn message_page(tenant: &Tenant, title: &str, detail: &str) -> Response {
 }
 
 /// The HTTP-POST binding: a page that posts a SAML message to the service provider.
-pub fn saml_post(action: &str, param: &str, message_b64: &str, relay_state: Option<&str>) -> Html<String> {
+/// Keep proxies and the browser from caching a SAML message (Bindings 3.4.5.1, 3.5.5.1, 3.6.5.1).
+pub fn no_cache(mut resp: Response) -> Response {
+    let headers = resp.headers_mut();
+    headers.insert(axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-cache, no-store"));
+    headers.insert(axum::http::header::PRAGMA, axum::http::HeaderValue::from_static("no-cache"));
+    resp
+}
+
+/// The HTTP-Redirect binding (or an artifact): a redirect carrying a SAML message, not cached.
+pub fn saml_redirect(url: &str) -> Response {
+    no_cache(axum::response::Redirect::to(url).into_response())
+}
+
+pub fn saml_post(action: &str, param: &str, message_b64: &str, relay_state: Option<&str>) -> Response {
     let relay = relay_state
         .filter(|r| !r.is_empty())
         .map(|r| format!(r#"<input type="hidden" name="RelayState" value="{}">"#, esc(r)))
         .unwrap_or_default();
-    Html(format!(
+    no_cache(Html(format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><title>Posting to the service provider · localsaml</title>
 <style>body{{font:14px system-ui,sans-serif;color:#64748b;display:grid;place-items:center;height:90vh}}</style></head>
 <body onload="document.forms[0].submit()"><form method="POST" action="{action}"><input type="hidden" name="{param}" value="{message}">{relay}
@@ -146,6 +159,7 @@ pub fn saml_post(action: &str, param: &str, message_b64: &str, relay_state: Opti
         message = esc(message_b64),
         kind = if param == "SAMLResponse" { "response" } else { "request" },
     ))
+    .into_response())
 }
 
 /// Render indented XML for a page, with a copy button.

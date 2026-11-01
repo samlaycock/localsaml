@@ -32,6 +32,38 @@ pub mod authn {
     pub const KERBEROS: &str = "urn:oasis:names:tc:SAML:2.0:ac:classes:Kerberos";
     pub const MFA: &str = "http://schemas.microsoft.com/claims/multipleauthn";
     pub const ALL: &[&str] = &[PASSWORD_PROTECTED, PASSWORD, UNSPECIFIED, X509, KERBEROS, MFA];
+
+    /// localsaml's own strength order (Core 3.3.2.2.1 leaves it to the responder), weakest first.
+    pub const BY_STRENGTH: &[&str] = &[PASSWORD, PASSWORD_PROTECTED, KERBEROS, X509, MFA];
+
+    /// The authentication context class to claim for a `RequestedAuthnContext` (Core 3.3.2.2.1),
+    /// or why none can be.
+    pub fn satisfy(classes: &[String], decls: &[String], comparison: Option<&str>) -> Result<Option<String>, String> {
+        if !decls.is_empty() {
+            return Err("authentication context declarations (AuthnContextDeclRef) aren't supported".into());
+        }
+        let Some(first) = classes.first() else { return Ok(None) };
+        let rank = |c: &String| BY_STRENGTH.iter().position(|s| s == c);
+        let strongest = classes.iter().filter_map(rank).max();
+        match comparison.unwrap_or("exact") {
+            // localsaml can authenticate with any class, so the most preferred one is an exact match,
+            // and at least as strong as itself.
+            "exact" | "minimum" => Ok(Some(first.clone())),
+            // As strong as possible without exceeding one of them: the strongest one it can rank.
+            "maximum" => Ok(Some(strongest.map(|i| BY_STRENGTH[i].to_string()).unwrap_or_else(|| first.clone()))),
+            // Stronger than every one of them.
+            "better" => match strongest {
+                Some(i) if classes.iter().all(|c| rank(c).is_some()) && i + 1 < BY_STRENGTH.len() => {
+                    Ok(Some(BY_STRENGTH[i + 1].to_string()))
+                }
+                _ => Err(format!(
+                    "no authentication context class localsaml knows is stronger than {}",
+                    classes.join(", ")
+                )),
+            },
+            other => Err(format!("unknown Comparison '{other}'")),
+        }
+    }
 }
 
 pub mod attrname {
@@ -1026,6 +1058,21 @@ fn build() -> Vec<Preset> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn requested_authn_contexts_are_satisfied_per_comparison() {
+        use authn::*;
+        let v = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(satisfy(&[], &[], None), Ok(None));
+        assert_eq!(satisfy(&v(&["urn:custom", PASSWORD]), &[], None), Ok(Some("urn:custom".into())));
+        assert_eq!(satisfy(&v(&[PASSWORD_PROTECTED]), &[], Some("minimum")), Ok(Some(PASSWORD_PROTECTED.into())));
+        assert_eq!(satisfy(&v(&[PASSWORD, X509]), &[], Some("maximum")), Ok(Some(X509.into())));
+        assert_eq!(satisfy(&v(&[PASSWORD, PASSWORD_PROTECTED]), &[], Some("better")), Ok(Some(KERBEROS.into())));
+        assert!(satisfy(&v(&[MFA]), &[], Some("better")).is_err());
+        assert!(satisfy(&v(&["urn:custom"]), &[], Some("better")).is_err());
+        assert!(satisfy(&[], &v(&["urn:decl"]), None).is_err());
+        assert!(satisfy(&v(&[PASSWORD]), &[], Some("sideways")).is_err());
+    }
+
     use super::*;
 
     #[test]

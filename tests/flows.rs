@@ -368,6 +368,9 @@ async fn redirect_binding_login_signed_by_the_test_sp() {
     let p = posted(&resp);
     assert_eq!(p.action, acs);
     assert_eq!(p.relay.as_deref(), Some("/home"));
+    // Not cached (Bindings 3.5.5.1).
+    assert_eq!(resp.headers.get(header::CACHE_CONTROL).unwrap(), "no-cache, no-store");
+    assert_eq!(resp.headers.get(header::PRAGMA).unwrap(), "no-cache");
     assert!(p.status().is_success());
     assert_eq!(p.doc.get_attr("InResponseTo"), Some("_req1"));
     assert_eq!(p.doc.get_attr("Destination"), Some(acs.as_str()));
@@ -1129,7 +1132,8 @@ async fn requests_are_held_to_the_spec() {
     let xml = authn_request("_dst2", SP, Some(ACS), &format!(r#" Destination="{BASE}/sso/""#), "");
     assert!(posted(&get(&app, &quick(&xml)).await).status().is_success());
 
-    // A Subject in the request is who the assertion is about, whatever the form said.
+    // A Subject in the request: signing in as someone else gets UnknownPrincipal and no
+    // assertion (Profiles 4.1.4.1); signing in as that subject works.
     let mut jar = Jar::default();
     let subject = format!(
         r#"<saml:Subject><saml:NameID Format="{}">bob@example.com</saml:NameID></saml:Subject>"#,
@@ -1137,7 +1141,15 @@ async fn requests_are_held_to_the_spec() {
     );
     let xml = authn_request("_sub", SP, Some(ACS), "", &subject);
     let page = get_jar(&app, &redirect("/sso", "SAMLRequest", &xml, None, None), &mut jar).await;
+    assert!(page.body.contains(r#""subject":{"format":"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress","nameId":"bob@example.com"}"#), "{}", page.body);
     let identity = json!({ "name_id": "someone-else", "name_id_format": nameid::UNSPECIFIED, "attributes": {} });
+    let r = approve(&app, "", &page, "generic", identity, &mut jar).await;
+    let p = posted(&r);
+    assert_eq!(p.status().short(), "UnknownPrincipal");
+    assert!(p.doc.find(A, "Assertion").is_none());
+    let xml = authn_request("_sub2", SP, Some(ACS), "", &subject);
+    let page = get_jar(&app, &redirect("/sso", "SAMLRequest", &xml, None, None), &mut jar).await;
+    let identity = json!({ "name_id": "bob@example.com", "name_id_format": nameid::EMAIL, "attributes": {} });
     let r = approve(&app, "", &page, "generic", identity, &mut jar).await;
     assert_eq!(posted(&r).name_id(), ("bob@example.com".to_string(), nameid::EMAIL.to_string()));
     // The HTTP-POST binding form's method is literally POST (Bindings 3.5.4).
@@ -1625,6 +1637,8 @@ async fn encrypted_name_ids() {
 async fn query(app: &Router, query: Element) -> Element {
     let r = post_body(app, Method::POST, "/attribute", "text/xml", &localsaml::soap::envelope(query)).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    // Not cached (Bindings 3.2.3.2).
+    assert_eq!(r.headers.get(header::CACHE_CONTROL).unwrap(), "no-cache, no-store, must-revalidate, private");
     let (_, response) = localsaml::soap::unwrap(&r.body).unwrap();
     assert!(response.is(P, "Response"), "{}", r.body);
     response
@@ -1665,6 +1679,8 @@ async fn attribute_queries() {
     let response = query(&app, q).await;
     assert_eq!(response.get_attr("InResponseTo"), Some(id.as_str()));
     assert!(response.get_attr("Destination").is_none());
+    // The Response is signed (Profiles 6.4.2), as well as the assertion.
+    verify(&state, &response, response.get_attr("ID").unwrap());
     assert!(Status::from_element(response.find(P, "Status")).is_success());
     let assertion = response.find(A, "Assertion").unwrap();
     verify(&state, &response, assertion.get_attr("ID").unwrap());
@@ -1889,4 +1905,42 @@ async fn ecp_logins() {
     let r = ecp(&app, &request("_e5", "http://ecp.test/ecp", scoping), Some("alice")).await;
     let (_, response) = localsaml::soap::unwrap(&r.body).unwrap();
     assert_eq!(Status::from_element(response.find(P, "Status")).short(), "NoSupportedIDP");
+}
+
+#[tokio::test]
+async fn requested_authn_context_comparisons() {
+    let (app, _) = app();
+    let context = |comparison: &str, refs: &str| {
+        format!(r#"<samlp:RequestedAuthnContext Comparison="{comparison}">{refs}</samlp:RequestedAuthnContext>"#)
+    };
+    let class = |c: &str| format!("<saml:AuthnContextClassRef>{c}</saml:AuthnContextClassRef>");
+    let login = |xml: String| {
+        let app = app.clone();
+        async move {
+            posted(
+                &get(&app, &format!("{}&dev_attributes=%7B%7D", redirect("/sso", "SAMLRequest", &xml, None, None)))
+                    .await,
+            )
+        }
+    };
+    let claimed = |p: &Posted| {
+        p.assertion().path(&[(A, "AuthnStatement"), (A, "AuthnContext"), (A, "AuthnContextClassRef")]).unwrap().value()
+    };
+    // "better": stronger than every class asked for.
+    let p = login(authn_request(
+        "_ac1",
+        SP,
+        Some(ACS),
+        "",
+        &context("better", &class(localsaml::presets::authn::PASSWORD_PROTECTED)),
+    ))
+    .await;
+    assert_eq!(claimed(&p), localsaml::presets::authn::KERBEROS);
+    // Nothing is stronger than MFA, and declarations aren't supported: NoAuthnContext.
+    let p = login(authn_request("_ac2", SP, Some(ACS), "", &context("better", &class(localsaml::presets::authn::MFA))))
+        .await;
+    assert_eq!(p.status().short(), "NoAuthnContext");
+    let decl = "<saml:AuthnContextDeclRef>urn:decl</saml:AuthnContextDeclRef>";
+    let p = login(authn_request("_ac3", SP, Some(ACS), "", &context("exact", decl))).await;
+    assert_eq!(p.status().short(), "NoAuthnContext");
 }

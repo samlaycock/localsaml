@@ -196,6 +196,8 @@ pub struct AuthnRequest {
     pub sp_name_qualifier: Option<String>,
     pub requested_authn_contexts: Vec<String>,
     pub authn_context_comparison: Option<String>,
+    /// `RequestedAuthnContext/AuthnContextDeclRef`s (declarations, which localsaml can't satisfy).
+    pub requested_authn_decls: Vec<String>,
     /// `Subject/NameID`: who the SP expects to sign in, like a login hint.
     pub subject: Option<String>,
     pub subject_format: Option<String>,
@@ -341,6 +343,9 @@ pub fn parse_element(root: &Element) -> Result<Message, String> {
                     .map(|r| r.find_all(NS_ASSERTION, "AuthnContextClassRef").map(Element::value).collect())
                     .unwrap_or_default(),
                 authn_context_comparison: requested.and_then(|r| opt(r, "Comparison")),
+                requested_authn_decls: requested
+                    .map(|r| r.find_all(NS_ASSERTION, "AuthnContextDeclRef").map(Element::value).collect())
+                    .unwrap_or_default(),
                 subject: root
                     .path(&[(NS_ASSERTION, "Subject"), (NS_ASSERTION, "NameID")])
                     .map(Element::value)

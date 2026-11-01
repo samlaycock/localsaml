@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
@@ -446,6 +446,11 @@ async fn authn_request(
         );
     }
 
+    let authn_context = crate::presets::authn::satisfy(
+        &req.requested_authn_contexts,
+        &req.requested_authn_decls,
+        req.authn_context_comparison.as_deref(),
+    );
     let pending = Pending {
         id: uuid::Uuid::new_v4().to_string(),
         created: state.now(),
@@ -463,6 +468,7 @@ async fn authn_request(
         encrypt_name_id: req.name_id_format.as_deref() == Some(nameid::ENCRYPTED),
         sp_name_qualifier: req.sp_name_qualifier.clone(),
         requested_authn_contexts: req.requested_authn_contexts.clone(),
+        authn_context: authn_context.clone().ok().flatten(),
         login_hint: req.subject.clone().or_else(|| non_empty(&arrival.params, "login_hint")),
         subject: req.subject.clone(),
         subject_format: req.subject_format.clone(),
@@ -511,6 +517,10 @@ async fn authn_request(
             &pending,
             Status::parse("NoSupportedIDP", Some(message)).unwrap(),
         );
+    }
+    // A RequestedAuthnContext localsaml can't satisfy (Core 3.3.2.2.1).
+    if let Err(e) = authn_context {
+        return respond_status(state, tenant, preset, &sp, &pending, Status::parse("NoAuthnContext", Some(e)).unwrap());
     }
     // An encrypted NameID needs the SP's encryption certificate (Core 3.4.1.1).
     if pending.encrypt_name_id
@@ -852,15 +862,28 @@ pub fn complete(
             },
         ),
     };
-    // An AuthnRequest naming a Subject gets an assertion about that subject (Profiles 4.1.4.1).
-    if let Some(subject) = &pending.subject {
-        identity.name_id = subject.clone();
-        if let Some(format) = &pending.subject_format {
-            identity.name_id_format = format.clone();
-        }
-    }
     session.identity = identity.clone();
     finish_name_id_for(&mut identity, preset, &pending.sp, &session.session_index);
+    // An AuthnRequest naming a Subject only gets an assertion if the user signed in as that
+    // subject; otherwise an error and no assertion (Profiles 4.1.4.1).
+    if let Some(subject) = &pending.subject {
+        let format_matches =
+            pending.subject_format.as_ref().is_none_or(|f| f == nameid::UNSPECIFIED || *f == identity.name_id_format);
+        if identity.name_id != *subject || !format_matches {
+            let message = format!(
+                "the request is for '{subject}', but the user signed in as '{}' ({})",
+                identity.name_id, identity.name_id_format
+            );
+            return respond_status(
+                state,
+                tenant,
+                preset,
+                sp,
+                pending,
+                Status::parse("UnknownPrincipal", Some(message)).unwrap(),
+            );
+        }
+    }
     session.participants.retain(|p| p.entity_id != pending.sp);
     // Templates differ in what they use as the SessionIndex; logout sends each SP back its own.
     let assertion_id = saml::new_assertion_id(&preset.style);
@@ -894,8 +917,11 @@ pub fn complete(
                     Err(e) => return saml_error_page(tenant, "Can't send the Response", &e),
                 }
             }
-            let authn_context =
-                pending.requested_authn_contexts.first().cloned().unwrap_or_else(|| preset.authn_context.to_string());
+            let authn_context = pending
+                .authn_context
+                .clone()
+                .or_else(|| pending.requested_authn_contexts.first().cloned())
+                .unwrap_or_else(|| preset.authn_context.to_string());
             let spec = ResponseSpec {
                 preset,
                 issuer: tenant.entity_id.clone(),
@@ -984,8 +1010,7 @@ fn deliver(
             .ns_attr(crate::soap::NS_SOAP, "soap11", "actor", "http://schemas.xmlsoap.org/soap/actor/next")
             .attr("AssertionConsumerServiceURL", &pending.acs_url);
         let body = crate::soap::envelope_with_header(Some(header), response);
-        let resp = ([(header::CONTENT_TYPE, "text/xml; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], body)
-            .into_response();
+        let resp = (crate::soap::RESPONSE_HEADERS, body).into_response();
         (resp, "paos")
     } else if pending.response_binding == "artifact" {
         let artifact = store_artifact(state, tenant, &pending.sp, xml);
@@ -1012,7 +1037,7 @@ fn deliver(
                 &pretty,
             )
         } else {
-            Redirect::to(url.as_str()).into_response()
+            crate::html::saml_redirect(url.as_str())
         };
         (resp, "artifact")
     } else {
@@ -1165,6 +1190,7 @@ async fn start_idp_initiated(
         encrypt_name_id: false,
         sp_name_qualifier: None,
         requested_authn_contexts: vec![],
+        authn_context: None,
         login_hint: non_empty(params, "login_hint"),
         subject: None,
         subject_format: None,
@@ -1273,6 +1299,9 @@ fn render_login(
     if let Some(r) = &pending.relay_state {
         details.push(kv("RelayState", &code(r)));
     }
+    if let Some(s) = &pending.subject {
+        details.push(kv("Subject", &code(s)));
+    }
     if let Some(h) = &pending.login_hint {
         details.push(kv("Login hint", &code(h)));
     }
@@ -1338,6 +1367,7 @@ fn render_login(
             previous.as_ref(),
             json!({
                 "loginHint": pending.login_hint,
+                "subject": pending.subject.as_ref().map(|s| json!({ "nameId": s, "format": pending.subject_format })),
                 "requestedNameIdFormat": pending.name_id_format,
             }),
         )),

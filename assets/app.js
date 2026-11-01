@@ -78,6 +78,7 @@ document.addEventListener('click', async (e) => {
     EMAIL: 'urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress',
     PERSISTENT: 'urn:oasis:names:tc:SAML:2.0:nameid-format:persistent',
     TRANSIENT: 'urn:oasis:names:tc:SAML:2.0:nameid-format:transient',
+    UNSPECIFIED: 'urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified',
   };
   const short = (uri) => (uri || '').split(':').pop();
 
@@ -475,6 +476,12 @@ document.addEventListener('click', async (e) => {
   if (prev && byId[prev.preset] && !isDev) load(prev.preset, prev);
   else load(data.defaultPreset, null);
   applyLoginHint(data.loginHint);
+  // An AuthnRequest that names a Subject only succeeds if you sign in as it (Profiles 4.1.4.1).
+  if (data.subject) {
+    state.nameId = data.subject.nameId;
+    state.nameIdAuto = false;
+    if (data.subject.format && data.subject.format !== NS.UNSPECIFIED) state.nameIdFormat = data.subject.format;
+  }
   if (data.tenantPreset) state.step = 1;
   render();
   mountSaveBar();

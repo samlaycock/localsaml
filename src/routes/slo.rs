@@ -6,7 +6,7 @@
 
 use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Response};
 
 use crate::faults::{self, Endpoint};
 use crate::html::{esc, page, saml_error_page, saml_post};
@@ -54,7 +54,7 @@ fn send(
         let url = state
             .keys
             .with_current(|key| saml::redirect_url(location, param, &message.to_xml(), relay_state, Some((key, alg))));
-        Redirect::to(&url).into_response()
+        crate::html::saml_redirect(&url)
     };
     let binding = if sp.slo_post() { "post" } else { "redirect" };
     SamlNote::sent(&sp.entity_id, &kind, binding, location, message.to_pretty(), status).attach(&mut resp);

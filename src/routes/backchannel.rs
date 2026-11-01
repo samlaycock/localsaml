@@ -205,9 +205,10 @@ async fn attribute_query(state: &AppState, tenant: &Tenant, envelope: &Element, 
         assertion_id: None,
         auth_time: now,
         now,
-        sign_response: d.sign_response,
-        // An unsigned answer over plain HTTP would be worthless: sign the assertion at least.
-        sign_assertion: d.sign_assertion || !d.sign_response,
+        // The responder SHOULD sign the <Response> (Profiles 6.4.2); the assertion follows the
+        // template.
+        sign_response: true,
+        sign_assertion: d.sign_assertion,
         sig_alg: d.sig_alg,
         encrypt: d.encrypt,
         encrypt_name_id: d.encrypt_name_id,

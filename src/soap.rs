@@ -56,10 +56,16 @@ pub fn unwrap(xml: &str) -> Result<(Element, Element), String> {
     Ok((root, message))
 }
 
+/// A SOAP response's headers: XML, not cached (Bindings 3.2.3.2).
+pub const RESPONSE_HEADERS: [(header::HeaderName, &str); 3] = [
+    (header::CONTENT_TYPE, "text/xml; charset=utf-8"),
+    (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate, private"),
+    (header::PRAGMA, "no-cache"),
+];
+
 /// A SOAP response carrying `message`.
 pub fn reply(message: Element) -> Response {
-    ([(header::CONTENT_TYPE, "text/xml; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], envelope(message))
-        .into_response()
+    (RESPONSE_HEADERS, envelope(message)).into_response()
 }
 
 /// A SOAP fault (HTTP 500, as SOAP 1.1 requires). `client` blames the sender's message.
@@ -68,9 +74,7 @@ pub fn fault(client: bool, reason: &str) -> Response {
     let mut fault = Element::new(NS_SOAP, "soap11", "Fault");
     fault.children.push(Node::Element(Element::new("", "", "faultcode").text(code)));
     fault.children.push(Node::Element(Element::new("", "", "faultstring").text(reason)));
-    let mut resp =
-        (StatusCode::INTERNAL_SERVER_ERROR, [(header::CONTENT_TYPE, "text/xml; charset=utf-8")], envelope(fault))
-            .into_response();
+    let mut resp = (StatusCode::INTERNAL_SERVER_ERROR, RESPONSE_HEADERS, envelope(fault)).into_response();
     crate::inspector::ErrorNote::attach(&mut resp, "SOAP fault", reason);
     resp
 }

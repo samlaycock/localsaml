@@ -206,7 +206,7 @@ pub async fn login(State(state): State<AppState>, tenant: Tenant, RawQuery(q): R
         let url = state.keys.with_current(|k| {
             saml::redirect_url(&sso, "SAMLRequest", &req.to_xml(), relay.as_deref(), flag("sign").then_some((k, alg)))
         });
-        Redirect::to(&url).into_response()
+        crate::html::saml_redirect(&url)
     };
     set_cookie(&mut resp, &cookie(&request_cookie_name(&tenant), &id, 3600));
     resp
@@ -816,7 +816,7 @@ pub async fn logout(State(state): State<AppState>, tenant: Tenant, headers: Head
             Some((k, state.config.signature_algorithm)),
         )
     });
-    Redirect::to(&url).into_response()
+    crate::html::saml_redirect(&url)
 }
 
 /// The test SP's SLO endpoint: LogoutResponses to its own logouts, and LogoutRequests from the
@@ -903,7 +903,7 @@ pub async fn slo(State(state): State<AppState>, tenant: Tenant, RawQuery(q): Raw
                     Some((k, state.config.signature_algorithm)),
                 )
             });
-            let mut resp = Redirect::to(&url).into_response();
+            let mut resp = crate::html::saml_redirect(&url);
             set_cookie(&mut resp, &clear);
             resp
         }

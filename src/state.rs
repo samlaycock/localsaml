@@ -207,6 +207,9 @@ pub struct Pending {
     pub encrypt_name_id: bool,
     pub sp_name_qualifier: Option<String>,
     pub requested_authn_contexts: Vec<String>,
+    /// The class to claim, chosen from the RequestedAuthnContext (Core 3.3.2.2.1).
+    #[serde(default)]
+    pub authn_context: Option<String>,
     pub login_hint: Option<String>,
     /// The AuthnRequest's `Subject/NameID` (and its format): the assertion must be about it.
     #[serde(default)]

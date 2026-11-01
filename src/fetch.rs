@@ -45,6 +45,9 @@ pub async fn post_xml(url: &str, xml: &str, timeout: Duration) -> Result<(u16, S
         .timeout(timeout)
         .header(reqwest::header::CONTENT_TYPE, "text/xml; charset=utf-8")
         .header("SOAPAction", "http://www.oasis-open.org/committees/security")
+        // Bindings 3.2.3.2: requesters shouldn't let proxies cache SAML messages either.
+        .header(reqwest::header::CACHE_CONTROL, "no-cache, no-store")
+        .header(reqwest::header::PRAGMA, "no-cache")
         .body(xml.to_string())
         .send()
         .await
