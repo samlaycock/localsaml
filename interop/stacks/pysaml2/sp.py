@@ -125,7 +125,9 @@ def run(c):
     if op == "attribute_query":
         # A signed AttributeQuery in a SOAP envelope, for the harness to POST to the AttributeService.
         destination = sp.metadata.attribute_service(idp, BINDING_SOAP)[0]["location"]
-        attributes = {n: None for n in c.get("attributes") or []}
+        # {name: [values]}. pysaml2 always sends an AttributeValue, so asking for an attribute
+        # without values would ask for the empty value (Core 3.3.2.3); the checks name values.
+        attributes = c.get("attributes") or {}
         req_id, request = sp.create_attribute_query(
             destination, name_id=NameID(text=c["name_id"], format=c.get("name_id_format")),
             attribute=attributes or None, sign=True, sign_alg=SIG_RSA_SHA256, digest_alg=DIGEST_SHA256,

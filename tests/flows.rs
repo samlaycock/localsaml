@@ -1696,6 +1696,17 @@ async fn attribute_queries() {
     assert_eq!(attr_values(&assertion, "groups"), [groups[0].clone()]);
     assert_eq!(groups.len(), 3);
 
+    // An empty AttributeValue asks for the empty value (Core 3.3.2.3), which nobody has.
+    let (mut q, _) = saml::attribute_query("http://aq.test/sp", "x", &name_id, &format, &["email"], wall_clock());
+    q.elements_mut()
+        .find(|e| e.get_attr("Name") == Some("email"))
+        .unwrap()
+        .children
+        .push(localsaml::xml::Node::Element(Element::new(A, "saml", "AttributeValue")));
+    q.declare_namespaces();
+    let assertion = query(&app, q).await.find(A, "Assertion").unwrap().clone();
+    assert!(assertion.find(A, "AttributeStatement").is_none(), "{}", assertion.to_pretty());
+
     // A declared user without a session.
     let (q, _) = saml::attribute_query("http://aq.test/sp", "x", "alice@acme.dev", nameid::EMAIL, &[], wall_clock());
     let assertion = query(&app, q).await.find(A, "Assertion").unwrap().clone();

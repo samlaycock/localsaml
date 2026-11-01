@@ -412,12 +412,8 @@ pub fn parse_element(root: &Element) -> Result<Message, String> {
                     .filter_map(|a| {
                         Some(RequestedAttribute {
                             name: opt(a, "Name")?,
-                            // An empty AttributeValue asks for any value (pysaml2 sends one).
-                            values: a
-                                .find_all(NS_ASSERTION, "AttributeValue")
-                                .map(Element::text_content)
-                                .filter(|v| !v.is_empty())
-                                .collect(),
+                            // Values constrain what's returned (Core 3.3.2.3), an empty one included.
+                            values: a.find_all(NS_ASSERTION, "AttributeValue").map(Element::text_content).collect(),
                         })
                     })
                     .collect(),

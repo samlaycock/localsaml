@@ -1016,16 +1016,20 @@ async function runHelperStack(stack, helper, issuer, keys) {
       return helper.call(base(sp, { op: 'parse_attribute_response', id: q.id, saml_response: Buffer.from(response).toString('base64') }));
     };
     await check(name, stack, 'AttributeQuery (SOAP) for a declared user', async () => {
-      const r = await attributeQuery([]);
+      const r = await attributeQuery({});
       assert(r.name_id === 'alice@example.com', `NameID ${r.name_id}`);
       assert(first(r.attributes.department) === 'QA', `department ${JSON.stringify(r.attributes.department)}`);
       assert((r.attributes.interopRoles || []).join() === 'admin,auditor', `interopRoles ${JSON.stringify(r.attributes.interopRoles)}`);
       return `${Object.keys(r.attributes).length} attributes`;
     });
-    await check(name, stack, 'AttributeQuery (SOAP) for named attributes', async () => {
-      const r = await attributeQuery(['department']);
-      assert(Object.keys(r.attributes).join() === 'department', `attributes ${Object.keys(r.attributes)}`);
-      return 'department only';
+    await check(name, stack, 'AttributeQuery (SOAP) for named attributes and values', async () => {
+      // Core 3.3.2.3: named attributes only, and only the values asked about.
+      const r = await attributeQuery({ department: ['QA'], interopRoles: ['auditor'] });
+      assert(Object.keys(r.attributes).sort().join() === 'department,interopRoles', `attributes ${Object.keys(r.attributes)}`);
+      assert(r.attributes.interopRoles.join() === 'auditor', `interopRoles ${JSON.stringify(r.attributes.interopRoles)}`);
+      const none = await attributeQuery({ department: ['Sales'] });
+      assert(Object.keys(none.attributes).length === 0, `asked for department=Sales, got ${JSON.stringify(none.attributes)}`);
+      return 'department=QA, interopRoles=auditor; department=Sales gets nothing';
     });
   }
   if (stack === 'pysaml2') await check(name, stack, 'encrypted NameID (EncryptedID) decrypted', async () => {
