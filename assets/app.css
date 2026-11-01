@@ -259,6 +259,7 @@ textarea { resize: vertical; min-height: 36px; }
 .req-table td { padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; overflow-wrap: anywhere; }
 .req-table .chip { margin: 0; }
 .req-row { cursor: pointer; }
+.req-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .req-row:hover td, .req-row.open td { background: color-mix(in srgb, var(--accent) 6%, transparent); }
 .req-row.failed td:first-child { box-shadow: inset 3px 0 var(--danger); }
 .req-error { color: var(--danger); font-weight: 600; }
@@ -341,3 +342,7 @@ pre.code.wrap { white-space: pre-wrap; word-break: break-all; max-height: 220px;
   .fault-list li > span:first-child { min-width: 0; overflow-wrap: anywhere; }
   .row-actions { flex-wrap: wrap; }
 }
+
+/* Invalid input in the editor */
+.invalid, .invalid:focus { border-color: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 18%, transparent); }
+.field-error { display: block; color: var(--danger); font-size: 12px; margin-top: 4px; }

@@ -235,7 +235,7 @@ document.addEventListener('click', async (e) => {
     { id: 'subject', label: 'Subject & custom' },
     ...(isDev ? [{ id: 'options', label: 'Response options' }] : []),
   ];
-  let previewEl, errorEl, nameIdInput, nameIdTag;
+  let previewEl, errorEl, nameIdInput, nameIdTag, customInput, customError;
 
   function refresh() {
     const { identity, errors } = build();
@@ -243,6 +243,14 @@ document.addEventListener('click', async (e) => {
     if (errorEl) {
       errorEl.textContent = errors.join(' · ');
       errorEl.hidden = !errors.length;
+    }
+    // Custom attribute errors also show at the field, which can be far above the summary.
+    if (customInput) {
+      const own = errors.filter((e) => e.startsWith('Custom attributes:')).map((e) => e.replace('Custom attributes: ', ''));
+      customInput.classList.toggle('invalid', own.length > 0);
+      customInput.setAttribute('aria-invalid', own.length ? 'true' : 'false');
+      customError.textContent = own.join(' · ');
+      customError.hidden = !own.length;
     }
     if (nameIdInput && state.nameIdAuto) {
       nameIdInput.value = identity.name_id;
@@ -329,10 +337,10 @@ document.addEventListener('click', async (e) => {
               ? h('span', { class: 'quick-tag warn', title: `Its NameID is ${item.entry.identity.name_id}` }, 'not the requested subject')
               : null)),
         h('div', { class: 'quick-actions' },
-          h('button', { type: 'button', class: 'btn small primary', onclick: () => useIdentity(item.entry) }, isDev ? 'Generate' : 'Sign in'),
-          h('button', { type: 'button', class: 'btn small ghost', onclick: () => editIdentity(item.entry) }, 'Edit'),
+          h('button', { type: 'button', class: 'btn small primary', 'aria-label': `${isDev ? 'Generate' : 'Sign in'}: ${item.label} (${who})`, onclick: () => useIdentity(item.entry) }, isDev ? 'Generate' : 'Sign in'),
+          h('button', { type: 'button', class: 'btn small ghost', 'aria-label': `Edit: ${item.label} (${who})`, onclick: () => editIdentity(item.entry) }, 'Edit'),
           item.kind === 'saved'
-            ? h('button', { type: 'button', class: 'btn small ghost icon', title: 'Delete', onclick: () => {
+            ? h('button', { type: 'button', class: 'btn small ghost icon', title: 'Delete', 'aria-label': `Delete ${item.label}`, onclick: () => {
                 const list = saved(); list.splice(item.index, 1); storeSaved(list); render();
               } }, '×')
             : null));
@@ -416,6 +424,8 @@ document.addEventListener('click', async (e) => {
     nameIdTag = h('span', { class: 'auto-tag' });
     const custom = h('textarea', { rows: 6, spellcheck: false, placeholder: '{\n  "department": "Engineering",\n  "memberOf": ["admins", "developers"],\n  "firstName": null\n}', oninput: (e) => { state.custom = e.target.value; refresh(); } });
     custom.value = state.custom;
+    customInput = custom;
+    customError = h('small', { class: 'field-error', hidden: true });
     previewEl = h('pre', { class: 'code xml preview' });
     const requested = data.requestedNameIdFormat
       ? h('small', { class: 'help' }, `The service provider asked for ${short(data.requestedNameIdFormat)}.`) : null;
@@ -425,7 +435,7 @@ document.addEventListener('click', async (e) => {
         h('label', { class: 'field' }, h('span', { class: 'field-label' }, 'NameID format'), select, requested),
         h('label', { class: 'field' }, h('span', { class: 'field-label' }, 'NameID'), h('div', { class: 'name-id-row' }, nameIdInput), nameIdTag)),
       h('div', { class: 'customs' },
-        h('label', { class: 'field wide' }, h('span', { class: 'field-label' }, 'Custom attributes', h('small', { class: 'muted' }, 'JSON: strings or lists of strings; null removes one')), custom)),
+        h('label', { class: 'field wide' }, h('span', { class: 'field-label' }, 'Custom attributes', h('small', { class: 'muted' }, 'JSON: strings or lists of strings; null removes one')), custom, customError)),
       h('div', { class: 'section-title' }, 'Preview ', h('small', { class: 'muted' }, '(the Issuer, Conditions, AuthnStatement and signatures are added by the server)')),
       previewEl,
     ];
@@ -459,7 +469,7 @@ document.addEventListener('click', async (e) => {
   /** "Save identity" sits next to the page's Sign in / Generate button, so it's visible at every step. */
   function mountSaveBar() {
     const actions = (form || root.parentElement).querySelector('.actions');
-    const name = h('input', { id: 'lo-save-name', class: 'save-name', placeholder: 'Name', oninput: (e) => (e.target.dataset.touched = '1') });
+    const name = h('input', { id: 'lo-save-name', class: 'save-name', placeholder: 'Name', 'aria-label': 'Name for the saved identity', oninput: (e) => (e.target.dataset.touched = '1') });
     const btn = h('button', { type: 'button', class: 'btn ghost', onclick: () => {
       const label = name.value.trim() || describe({ preset: state.preset, ...build().identity });
       if (saveCurrent(label)) { btn.textContent = 'Saved ✓'; setTimeout(() => (btn.textContent = 'Save identity'), 1400); render(); }
@@ -550,15 +560,25 @@ document.addEventListener('click', async (e) => {
 
     // Faults.
     $('dev-fault-always').addEventListener('change', (e) => { $('dev-fault-count').disabled = e.target.checked; });
+    // Show only the fields that apply to the chosen endpoint; hidden ones aren't sent.
+    const applies = (el) => el.closest('label').dataset.for?.split(' ').includes($('dev-fault-endpoint').value) ?? true;
+    const showFaultFields = () => document.querySelectorAll('.faults-form [data-for]').forEach((label) => {
+      label.hidden = !applies(label);
+    });
+    $('dev-fault-endpoint').addEventListener('change', showFaultFields);
+    showFaultFields();
     $('dev-fault-add').addEventListener('click', () => {
       const body = { endpoint: $('dev-fault-endpoint').value };
-      const status = $('dev-fault-status').value.trim();
-      const tamper = $('dev-fault-tamper').value;
-      const sp = $('dev-fault-sp').value.trim();
+      const value = (id) => (applies($(id)) ? $(id).value.trim() : '');
+      const status = value('dev-fault-status');
+      const tamper = value('dev-fault-tamper');
+      const sp = value('dev-fault-sp');
+      const http = Number(value('dev-fault-http')) || 0;
       const delay = Number($('dev-fault-delay').value) || 0;
       if (status) body.status = status;
       if (tamper) body.tamper = [tamper];
       if (sp) body.sp = sp;
+      if (http) body.http_status = http;
       if (delay) body.delay_ms = delay;
       if ($('dev-fault-always').checked) body.always = true;
       else body.count = Math.max(1, Number($('dev-fault-count').value) || 1);
@@ -731,7 +751,11 @@ document.addEventListener('click', async (e) => {
     };
     // Sent messages are already in the outcome; list the received ones.
     const kinds = e.messages.filter((m) => m.direction === 'received').map((m) => `← ${m.kind}`).join(' ');
-    const tr = h('tr', { class: `req-row${bad ? ' failed' : ''}${expanded.has(e.id) ? ' open' : ''}`, onclick: toggle },
+    const tr = h('tr', {
+      class: `req-row${bad ? ' failed' : ''}${expanded.has(e.id) ? ' open' : ''}`, onclick: toggle,
+      tabindex: '0', 'aria-expanded': String(expanded.has(e.id)), 'data-id': String(e.id),
+      onkeydown: (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(ev); } },
+    },
       h('td', { class: 'mono' }, time(e.at)),
       h('td', {}, e.method),
       h('td', { class: 'mono' }, e.outgoing ? h('span', { class: 'req-issuer', title: 'Sent by localsaml' }, '→ out') : null,
@@ -754,7 +778,10 @@ document.addEventListener('click', async (e) => {
       return;
     }
     const head = ['Time', 'Method', 'Endpoint', 'Service provider', 'Outcome', 'Status', 'ms'].map((t) => h('th', {}, t));
+    // Keep keyboard focus on the same row across re-renders.
+    const focused = root.contains(document.activeElement) ? document.activeElement.dataset.id : null;
     root.replaceChildren(h('table', { class: 'req-table' }, h('thead', {}, h('tr', {}, head)), h('tbody', {}, rows.flatMap(row))));
+    if (focused) root.querySelector(`tr[data-id="${focused}"]`)?.focus();
   }
 
   async function poll() {

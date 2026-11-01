@@ -690,6 +690,19 @@ async fn idp_initiated_logins() {
     let p = posted(&r);
     assert_eq!(p.doc.find(A, "Issuer").unwrap().value(), "http://www.okta.com/exk1fcia6d6EMsf331d8");
 
+    // The vendors' own parameter names: Shibboleth's providerId, shire and target, PingFederate's
+    // PartnerSpId and TargetResource.
+    let shib = "/p/shibboleth/idp/profile/SAML2/Unsolicited/SSO?providerId=http%3A%2F%2Fknown.test%2Fsp";
+    let p = posted(
+        &get(&app, &format!("{shib}&shire=http%3A%2F%2Fknown.test%2Facs&target=%2Fcourse&dev_attributes=%7B%7D")).await,
+    );
+    assert_eq!((p.action.as_str(), p.relay.as_deref()), ("http://known.test/acs", Some("/course")));
+    let r = get(&app, &format!("{shib}&shire=http%3A%2F%2Fevil.test%2Facs&dev_attributes=%7B%7D")).await;
+    assert_eq!(r.title(), "Unregistered ACS URL · localsaml");
+    let ping = "/p/pingfederate/idp/startSSO.ping?PartnerSpId=http%3A%2F%2Fknown.test%2Fsp";
+    let p = posted(&get(&app, &format!("{ping}&TargetResource=%2Freports&dev_attributes=%7B%7D")).await);
+    assert_eq!(p.relay.as_deref(), Some("/reports"));
+
     // Strict mode refuses unknown SPs even with an ACS URL.
     let (app, _) = app_with(Config::default());
     let r = get(&app, "/sso/initiate?sp=http%3A%2F%2Fnew.test%2Fsp&acs=http%3A%2F%2Fnew.test%2Facs").await;

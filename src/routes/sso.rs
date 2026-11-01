@@ -1274,7 +1274,11 @@ async fn start_idp_initiated(
         },
     };
     let binding = non_empty(params, "binding").filter(|b| b == "post" || b == "artifact");
-    let acs_url = match non_empty(params, "acs")
+    // `shire` and `target` are Shibboleth's names for the ACS URL and RelayState, `TargetResource`
+    // PingFederate's for the RelayState.
+    let explicit_acs = non_empty(params, "acs").or_else(|| non_empty(params, "shire"));
+    let acs_url = match explicit_acs
+        .clone()
         .or_else(|| sp.default_acs(binding.as_deref().unwrap_or(sp.default_binding())).cloned())
     {
         Some(a) if !crate::util::is_web_url(&a) => {
@@ -1288,6 +1292,7 @@ async fn start_idp_initiated(
     };
     let relay_state = non_empty(params, "RelayState")
         .or_else(|| non_empty(params, "TargetResource"))
+        .or_else(|| non_empty(params, "target"))
         .or(sp.default_relay_state.clone());
     if let Some(r) = relay_state.as_ref().filter(|r| r.len() > 80 && !state.config.lenient) {
         return bad(
@@ -1295,7 +1300,7 @@ async fn start_idp_initiated(
             &format!("RelayState is {} bytes; the bindings allow at most 80 (Bindings 3.5.3).", r.len()),
         );
     }
-    let response_binding = if non_empty(params, "acs").is_some() {
+    let response_binding = if explicit_acs.is_some() {
         binding.or_else(|| sp.acs_binding(&acs_url).map(String::from))
     } else {
         sp.acs_binding(&acs_url).map(String::from).or(binding)
@@ -1339,10 +1344,15 @@ fn pick_sp_page(state: &AppState, tenant: &Tenant) -> Response {
         .iter()
         .filter(|sp| !sp.acs_urls.is_empty())
         .map(|sp| {
+            let label = sp.label();
+            let entity_id = if label == sp.entity_id {
+                String::new()
+            } else {
+                format!(r#"<br><small class="muted"><code>{}</code></small>"#, esc(&sp.entity_id))
+            };
             format!(
-                r#"<li><span><b>{}</b><br><small class="muted"><code>{}</code></small></span><a class="btn small" href="{}?sp={}">Sign in</a></li>"#,
-                esc(&sp.label()),
-                esc(&sp.entity_id),
+                r#"<li><span><b>{}</b>{entity_id}</span><a class="btn small" href="{}?sp={}">Sign in</a></li>"#,
+                esc(&label),
                 esc(&tenant.path("/sso/initiate")),
                 esc(&crate::dsig::urlencode(&sp.entity_id)),
             )

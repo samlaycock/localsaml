@@ -771,10 +771,14 @@ fn sp_list(state: &AppState, tenant: &Tenant) -> String {
             } else {
                 format!(r#"<span class="chip muted">{}</span>"#, esc(&sp.source))
             };
+            // An SP without a name is labelled by its entity ID; don't repeat it.
+            let label = sp.label();
+            if label != sp.entity_id {
+                facts.insert(0, format!("<code>{}</code>", esc(&sp.entity_id)));
+            }
             format!(
-                r#"<li><span><b>{}</b><br><small class="muted"><code>{}</code> · {}</small></span>{remove}</li>"#,
-                esc(&sp.label()),
-                esc(&sp.entity_id),
+                r#"<li><span><b>{}</b><br><small class="muted">{}</small></span>{remove}</li>"#,
+                esc(&label),
                 facts.join(" · ")
             )
         })
@@ -875,9 +879,10 @@ pub async fn page_handler(State(state): State<AppState>, tenant: Tenant, headers
   {fault_list}
   <div class="opts faults-form">
     <label>Endpoint<select id="dev-fault-endpoint"><option value="sso">sso</option><option value="slo">slo</option><option value="metadata">metadata</option></select></label>
-    <label>SAML status<input id="dev-fault-status" list="dev-fault-statuses" placeholder="e.g. AuthnFailed"></label>
-    <label>Defect<select id="dev-fault-tamper"><option value="">none</option>{tamper_options}</select></label>
-    <label>Service provider <small>optional</small><input id="dev-fault-sp" list="dev-sps" placeholder="any"></label>
+    <label data-for="sso slo">SAML status<input id="dev-fault-status" list="dev-fault-statuses" placeholder="e.g. AuthnFailed"></label>
+    <label data-for="sso">Defect<select id="dev-fault-tamper"><option value="">none</option>{tamper_options}</select></label>
+    <label data-for="sso slo">Service provider<input id="dev-fault-sp" list="dev-sps" placeholder="any"></label>
+    <label data-for="metadata" hidden>HTTP status<input id="dev-fault-http" type="number" min="400" max="599" placeholder="503"></label>
     <label>Delay (ms)<input id="dev-fault-delay" type="number" min="0" max="{max_delay}" value="0"></label>
     <label>Times<input id="dev-fault-count" type="number" min="1" value="1"></label>
     <div class="checks"><label class="check"><input type="checkbox" id="dev-fault-always"> Until removed</label></div>

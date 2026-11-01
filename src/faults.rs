@@ -128,6 +128,9 @@ impl Fault {
                 if status.is_some() || !req.tamper.is_empty() {
                     return Err("metadata faults take http_status (and delay_ms), not a SAML status or tamper".into());
                 }
+                if req.sp.as_deref().is_some_and(|s| !s.is_empty()) {
+                    return Err("metadata requests don't come from a service provider; drop sp".into());
+                }
                 if let Some(s) = http_status
                     && !(400..=599).contains(&s)
                 {
@@ -336,6 +339,7 @@ mod tests {
         assert!(f.status.is_none());
         assert!(fault(json!({ "endpoint": "sso", "status": "Bogus" })).is_err());
         assert!(fault(json!({ "endpoint": "metadata", "status": "Responder" })).is_err());
+        assert!(fault(json!({ "endpoint": "metadata", "sp": "http://app.test/sp" })).is_err());
         assert!(fault(json!({ "endpoint": "slo", "tamper": ["expired"] })).is_err());
         assert!(fault(json!({ "endpoint": "sso", "status": "AuthnFailed", "tamper": ["expired"] })).is_err());
         assert!(fault(json!({ "endpoint": "sso", "delay_ms": 60_000 })).is_err());
