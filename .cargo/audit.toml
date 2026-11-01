@@ -1,0 +1,9 @@
+# cargo audit settings (`cargo audit`, and the Audit job in CI).
+
+[advisories]
+ignore = [
+    # rsa: the Marvin attack (timing side channels in RSA decryption, no fixed version). localsaml
+    # only decrypts with its own key (EncryptedIDs sent to it), and that key is deliberately not a
+    # secret: it's a development tool whose README says never to trust it with real data.
+    "RUSTSEC-2023-0071",
+]

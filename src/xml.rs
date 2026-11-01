@@ -579,6 +579,17 @@ pub fn pretty(xml: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn many_attributes_parse_in_linear_time() {
+        // A start tag with thousands of attributes used to take quadratic time (RUSTSEC-2026-0194,
+        // quick-xml before 0.41): a cheap denial of service from any SAML message.
+        let attrs: String = (0..20_000).map(|i| format!(" a{i}=\"v\"")).collect();
+        let started = std::time::Instant::now();
+        let el = parse(&format!("<x{attrs}/>")).unwrap();
+        assert_eq!(el.attrs.len(), 20_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+    }
+
     const A: &str = "urn:a";
     const B: &str = "urn:b";
 

@@ -28,6 +28,17 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  audit:
+    name: Audit (RustSec advisories)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Ignored advisories, with reasons, are in .cargo/audit.toml.
+      - run: cargo audit
+
   interop:
     name: Interop (node-saml, samlify, pysaml2, crewjam/saml, Shibboleth SP)
     runs-on: ubuntu-24.04
@@ -90,7 +101,7 @@ jobs:
           BINARY: ${{ github.workspace }}/target/debug/localsaml
 
   docker:
-    name: Docker build (no push)
+    name: Docker build and smoke test (no push)
     # Only release pull requests: the image is only published from them.
     if: github.ref_name == 'changeset-release/main' || github.head_ref == 'changeset-release/main'
     runs-on: ubuntu-24.04
@@ -102,8 +113,12 @@ jobs:
           context: .
           platforms: linux/amd64
           push: false
+          load: true
+          tags: localsaml:smoke
           cache-from: type=gha,scope=linux/amd64
           cache-to: type=gha,mode=max,scope=linux/amd64
+      # Start it the way the README shows (a mounted config) and check it answers.
+      - run: scripts/docker-smoke.sh localsaml:smoke
 
   changeset:
     name: Changeset present
