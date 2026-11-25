@@ -4,7 +4,7 @@
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       apache2=2.4.68-1~deb12u1 \
+       apache2=2.4.71-1~deb12u1 \
        libapache2-mod-shib=3.4.1+dfsg-2+deb12u1 \
        shibboleth-sp-utils=3.4.1+dfsg-2+deb12u1 \
     && rm -rf /var/lib/apt/lists/*
