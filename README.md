@@ -128,6 +128,7 @@ To make localsaml look like a specific identity provider, use that template's is
 | Service providers (non-standard) | `/dev/api/service-providers` (GET/POST/DELETE) |
 | Templates (non-standard) | `/dev/api/presets` |
 | Declared users (non-standard) | `/dev/api/users` |
+| Identity provider details for the web UI (non-standard) | `/dev/api/info`, and the test SP's at `/dev/api/test-sp` |
 | Certificate and key rotation (non-standard) | `/dev/api/certificate`, `POST /dev/api/rotate-keys` |
 | Clock offset (non-standard) | `/dev/api/clock` (GET/POST) |
 | Sessions (non-standard) | `/dev/api/sessions` (GET), `/dev/api/sessions/{sid}` (DELETE) |

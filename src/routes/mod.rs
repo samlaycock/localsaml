@@ -7,6 +7,7 @@ pub mod slo;
 pub mod sso;
 pub mod testsp;
 
+use axum::extract::Path;
 use axum::routing::{any, delete, get, post};
 use axum::{Router, middleware};
 use tower_http::cors::CorsLayer;
@@ -36,6 +37,8 @@ fn issuer_routes() -> Router<AppState> {
         .route("/sp/metadata", get(testsp::metadata))
         .route("/dev", get(dev::page_handler))
         .route("/dev/api/response", get(dev::api_response_get).post(dev::api_response_post))
+        .route("/dev/api/info", get(dev::api_info))
+        .route("/dev/api/test-sp", get(testsp::api))
         .route("/dev/api/presets", get(dev::api_presets))
         .route("/dev/api/users", get(dev::api_users))
         .route("/dev/api/service-providers", get(dev::api_sps).post(dev::api_sps_add).delete(dev::api_sps_remove))
@@ -56,8 +59,11 @@ pub fn router(state: AppState) -> Router {
         .nest("/p/{preset}", issuer_routes().merge(providers::routes()))
         // A nested "/" only matches "/p/<template>"; links to an issuer's home end with a slash.
         .route("/p/{preset}/", get(pages::index))
-        .route("/assets/app.css", get(pages::css))
-        .route("/assets/app.js", get(pages::js))
+        .route(
+            "/assets/{*path}",
+            get(|Path(path): Path<String>| async move { crate::html::asset(&format!("assets/{path}")) }),
+        )
+        .route("/favicon.svg", get(|| async { crate::html::asset("favicon.svg") }))
         .route("/health", get(|| async { "ok" }))
         .layer(middleware::from_fn_with_state(state.clone(), crate::faults::apply))
         .layer(middleware::from_fn_with_state(state.clone(), crate::inspector::record))

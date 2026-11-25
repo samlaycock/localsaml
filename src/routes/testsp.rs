@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::dsig::{self, NS_DS, QuerySignature};
-use crate::html::{esc, page, saml_post, xml_block};
+use crate::html::{app_page, card, esc, saml_post, shell, xml_block};
 use crate::presets::{authn, nameid};
 use crate::routes::sso::{cookie_value, set_cookie};
 use crate::saml::{
@@ -81,74 +81,30 @@ fn sp_session(tenant: &Tenant, headers: &HeaderMap) -> Option<SpSession> {
     serde_json::from_slice(&b64_decode(&raw)?).ok()
 }
 
-fn options<'a>(items: impl IntoIterator<Item = &'a str>, selected: &str) -> String {
-    items
-        .into_iter()
-        .map(|v| {
-            // urn:…:emailAddress → emailAddress; http://…/multipleauthn → multipleauthn
-            let label = if v.starts_with("urn:") { v.rsplit(':').next() } else { v.rsplit('/').next() }.unwrap_or(v);
-            let sel = if v == selected { " selected" } else { "" };
-            format!(r#"<option value="{}"{sel}>{}</option>"#, esc(v), esc(if v.is_empty() { "(none)" } else { label }))
-        })
-        .collect()
+/// The test SP's page: the app shows it, with its state from [`api`].
+pub async fn home(tenant: Tenant) -> Response {
+    app_page(&tenant, "Test SP")
 }
 
-pub async fn home(tenant: Tenant, headers: HeaderMap) -> Response {
-    let session = sp_session(&tenant, &headers);
-    let signed_in = match &session {
-        Some(s) => format!(
-            r#"<section class="card"><div class="eyebrow">Signed in</div><h2>As <span class="accent">{}</span></h2>
-<p class="muted">NameID format <code>{}</code>{}</p>
-<div class="actions"><form method="post" action="{}"><button class="btn" type="submit">Sign out (SP-initiated logout)</button></form><form method="post" action="{}"><button class="btn ghost" type="submit">Query attributes (AttributeQuery)</button></form></div></section>"#,
-            esc(&s.name_id),
-            esc(&s.format),
-            s.session_index.as_ref().map(|i| format!(", SessionIndex <code>{}</code>", esc(i))).unwrap_or_default(),
-            esc(&tenant.path("/sp/logout")),
-            esc(&tenant.path("/sp/attributes")),
-        ),
-        None => String::new(),
-    };
-    let body = format!(
-        r#"<section class="card hero">
-  <div class="eyebrow">Built-in service provider</div>
-  <h1>Test SP for <span class="accent">{entity}</span></h1>
-  <p class="muted">Try logins without an app. This service provider validates the Response the way a strict one would (signatures, decryption, audience, recipient, timestamps against real time, InResponseTo, replays) and shows what it found. Its entity ID is <code>{sp}</code>; its <a href="{metadata}">metadata</a> declares the ACS <code>{acs}</code>.</p>
-</section>
-{signed_in}
-<form class="card" method="get" action="{login}">
-  <h2>SP-initiated login</h2>
-  <div class="opts">
-    <label>Binding<select name="binding"><option value="redirect">HTTP-Redirect</option><option value="post">HTTP-POST</option></select></label>
-    <label>Response binding<select name="response_binding"><option value="post">HTTP-POST</option><option value="artifact">HTTP-Artifact</option></select></label>
-    <label>NameIDPolicy format<select name="name_id_format">{formats}</select></label>
-    <label>Requested AuthnContext<select name="authn_context">{contexts}</select></label>
-    <label>RelayState<input name="RelayState" value="/welcome"></label>
-    <div class="checks">
-      <label class="check"><input type="checkbox" name="sign" value="1" checked> Sign the request</label>
-      <label class="check"><input type="checkbox" name="force_authn" value="1"> ForceAuthn</label>
-      <label class="check"><input type="checkbox" name="is_passive" value="1"> IsPassive</label>
-      <label class="check"><input type="checkbox" name="encrypt_name_id" value="1"> Encrypted NameID</label>
-    </div>
-  </div>
-  <div class="actions">
-    <button class="btn primary" type="submit">Start login</button>
-    <a class="btn ghost" href="{initiate}">IdP-initiated login instead</a>
-  </div>
-</form>"#,
-        entity = esc(&tenant.entity_id),
-        sp = esc(&entity_id(&tenant)),
-        metadata = esc(&tenant.path("/sp/metadata")),
-        acs = esc(&tenant.url("/sp/acs")),
-        login = esc(&tenant.path("/sp/login")),
-        formats = options(std::iter::once("").chain(nameid::ALL.iter().copied()), ""),
-        contexts = options(std::iter::once("").chain(authn::ALL.iter().copied()), ""),
-        initiate = esc(&format!(
+/// Non-standard: the test SP's settings and its session in this browser, for its page.
+pub async fn api(tenant: Tenant, headers: HeaderMap) -> Response {
+    let body = serde_json::json!({
+        "entity_id": entity_id(&tenant),
+        "metadata": tenant.path("/sp/metadata"),
+        "acs": tenant.url("/sp/acs"),
+        "login": tenant.path("/sp/login"),
+        "logout": tenant.path("/sp/logout"),
+        "attributes": tenant.path("/sp/attributes"),
+        "initiate": format!(
             "{}?sp={}&RelayState=%2Fwelcome",
             tenant.path("/sso/initiate"),
             dsig::urlencode(&entity_id(&tenant))
-        )),
-    );
-    page(&tenant, "Test SP", &body).into_response()
+        ),
+        "name_id_formats": nameid::ALL,
+        "authn_contexts": authn::ALL,
+        "session": sp_session(&tenant, &headers),
+    });
+    ([(axum::http::header::CACHE_CONTROL, "no-store")], axum::Json(body)).into_response()
 }
 
 /// Build an AuthnRequest and send it to the IdP's SSO URL (the one its metadata advertises).
@@ -243,25 +199,6 @@ impl Checks {
     }
     fn passed(&self) -> bool {
         !self.0.iter().any(|c| c.ok == Some(false))
-    }
-    fn html(&self) -> String {
-        let rows: String = self
-            .0
-            .iter()
-            .map(|c| {
-                let (mark, class) = match c.ok {
-                    Some(true) => ("✓", "ok"),
-                    Some(false) => ("✗", "bad"),
-                    None => ("·", "muted"),
-                };
-                format!(
-                    r#"<li class="check-{class}"><span class="mark">{mark}</span><b>{}</b> <span>{}</span></li>"#,
-                    esc(&c.label),
-                    esc(&c.detail)
-                )
-            })
-            .collect();
-        format!(r#"<ul class="checks-list">{rows}</ul>"#)
     }
 }
 
@@ -567,11 +504,11 @@ pub async fn attributes(State(state): State<AppState>, tenant: Tenant, headers: 
         .checks
         .0
         .insert(0, Check { ok: None, label: "AttributeQuery".into(), detail: format!("{id}, sent over SOAP") });
-    let extra = xml_block("AttributeQuery", &sent);
     outcome_page(
         &tenant,
         &outcome,
-        &extra,
+        None,
+        Some(("AttributeQuery", &sent)),
         ["Test SP · attribute query answered", "Test SP · attribute query rejected"],
         ["Attributes from the attribute authority", "The answer didn't pass validation"],
         ["Test SP: attributes", "Test SP: attribute query rejected"],
@@ -638,57 +575,55 @@ async fn resolve_artifact(state: &AppState, tenant: &Tenant, artifact: &str) -> 
 
 /// The test SP's verdict on a Response: checks, NameID, attributes and the XML. The pairs are
 /// (accepted, rejected) texts.
+/// The test SP's verdict on a Response: its checks, the NameID and attributes it found, and the
+/// messages. `sent`: a message the test SP sent first (its AttributeQuery), as (title, XML).
 fn outcome_page(
     tenant: &Tenant,
     outcome: &Outcome,
-    extra: &str,
+    relay_state: Option<&str>,
+    sent: Option<(&str, &str)>,
     verdicts: [&str; 2],
     titles: [&str; 2],
     page_titles: [&str; 2],
 ) -> Response {
     let passed = outcome.checks.passed();
     let pick = |pair: [&str; 2]| if passed { pair[0] } else { pair[1] }.to_string();
-    let attrs: String = outcome
-        .attributes
+    let view = serde_json::json!({
+        "kind": "sp-outcome",
+        "passed": passed,
+        "verdict": pick(verdicts),
+        "title": pick(titles),
+        "nameId": outcome.name_id.as_ref().map(|(v, f, _)| serde_json::json!({ "value": v, "format": f })),
+        "relayState": relay_state,
+        "sent": sent.map(|(title, xml)| serde_json::json!({ "title": title, "xml": xml })),
+        "checks": outcome.checks.0.iter().map(|c| serde_json::json!({ "ok": c.ok, "label": c.label, "detail": c.detail })).collect::<Vec<_>>(),
+        "attributes": outcome.attributes.iter().map(|(name, friendly, values)| serde_json::json!({ "name": name, "friendlyName": friendly, "values": values })).collect::<Vec<_>>(),
+        "responseXml": outcome.response_xml,
+        "assertionXml": outcome.assertion_xml,
+        "home": tenant.path("/sp"),
+    });
+    let checks: String = outcome
+        .checks
+        .0
         .iter()
-        .map(|(name, friendly, values)| {
-            format!(
-                "<tr><td><code>{}</code>{}</td><td>{}</td></tr>",
-                esc(name),
-                friendly.as_ref().map(|f| format!(" <small class=\"muted\">{}</small>", esc(f))).unwrap_or_default(),
-                values.iter().map(|v| format!("<code>{}</code>", esc(v))).collect::<Vec<_>>().join(" ")
-            )
+        .map(|c| {
+            let mark = match c.ok {
+                Some(true) => "✓",
+                Some(false) => "✗",
+                None => "·",
+            };
+            format!("<li>{mark} <b>{}</b> <span>{}</span></li>", esc(&c.label), esc(&c.detail))
         })
         .collect();
-    let who = outcome
-        .name_id
-        .as_ref()
-        .map(|(v, f, _)| format!("<code>{}</code> <small class=\"muted\">{}</small>", esc(v), esc(f)))
-        .unwrap_or_else(|| "–".into());
-    let body = format!(
-        r#"<section class="card">
-  <div class="eyebrow {eyebrow}">{verdict}</div>
-  <h1>{title}</h1>
-  <p>NameID {who}</p>{extra}
-  {checks}
-  <div class="actions"><a class="btn" href="{again}">Back to the test SP</a></div>
-</section>
-<section class="card"><h2>Attributes</h2>{attr_table}</section>
-<section class="card"><h2>Response</h2>{xml}{assertion}</section>"#,
-        eyebrow = if passed { "" } else { "error" },
-        verdict = esc(&pick(verdicts)),
-        title = esc(&pick(titles)),
-        checks = outcome.checks.html(),
-        again = esc(&tenant.path("/sp")),
-        attr_table = if attrs.is_empty() {
-            r#"<p class="muted">No attributes.</p>"#.to_string()
-        } else {
-            format!(r#"<table class="endpoints">{attrs}</table>"#)
-        },
-        xml = xml_block("SAML Response", &outcome.response_xml),
-        assertion = outcome.assertion_xml.as_ref().map(|a| xml_block("Decrypted assertion", a)).unwrap_or_default(),
-    );
-    let mut resp = page(tenant, &pick(page_titles), &body).into_response();
+    let who = outcome.name_id.as_ref().map(|(v, f, _)| format!("{v} ({f})")).unwrap_or_else(|| "–".into());
+    let fallback = card(&format!(
+        r#"<div style="color:var(--muted-foreground);font-size:.75rem;font-weight:500">{}</div><h1>{}</h1><p>NameID {}</p><ul>{checks}</ul>{}"#,
+        esc(&pick(verdicts)),
+        esc(&pick(titles)),
+        esc(&who),
+        xml_block("SAML Response", &outcome.response_xml),
+    ));
+    let mut resp = shell(tenant, StatusCode::OK, &pick(page_titles), view, &fallback);
     if !passed {
         let failed: Vec<String> = outcome
             .checks
@@ -745,15 +680,12 @@ pub async fn acs(
     if passed && let Some(id) = &outcome.assertion_id {
         seen().lock().unwrap().insert(id.clone());
     }
-    let relay = form
-        .get("RelayState")
-        .filter(|r| !r.is_empty())
-        .map(|r| format!(r#"<p class="muted">RelayState <code>{}</code></p>"#, esc(r)))
-        .unwrap_or_default();
+    let relay = form.get("RelayState").filter(|r| !r.is_empty()).map(String::as_str);
     let mut resp = outcome_page(
         &tenant,
         &outcome,
-        &relay,
+        relay,
+        None,
         ["Test SP · login accepted", "Test SP · login rejected"],
         ["Signed in", "The Response didn't pass validation"],
         ["Test SP: signed in", "Test SP: rejected"],

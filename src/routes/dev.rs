@@ -12,10 +12,10 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::html::{data_script, esc, page};
+use crate::html::app_page;
 use crate::keys::SigAlg;
 use crate::presets::{self, Preset};
-use crate::routes::sso::{current_session, delivery, editor_data, finish_name_id_for};
+use crate::routes::sso::{delivery, finish_name_id_for};
 use crate::saml::{self, ResponseSpec, Status, Tamper};
 use crate::sp::{ServiceProvider, from_metadata};
 use crate::state::{AppState, Session};
@@ -566,28 +566,9 @@ pub async fn api_requests_clear(State(state): State<AppState>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+/// The request inspector's page.
 pub async fn requests_page(tenant: Tenant) -> Response {
-    let api = tenant.url("/dev/api/requests");
-    let body = format!(
-        r#"<section class="card">
-  <div class="eyebrow">Request inspector</div>
-  <h1>Requests</h1>
-  <p class="muted">The last {capacity} requests to every issuer, newest first. Click one to see its parameters, the SAML messages it carried (decoded and indented) and, if it failed, why. Tests can read the same list from <code>GET {api}</code>.</p>
-  <div class="req-toolbar">
-    <input id="req-sp" placeholder="Filter by service provider" aria-label="Filter by service provider">
-    <label class="check"><input type="checkbox" id="req-errors"> Errors only</label>
-    <label class="check"><input type="checkbox" id="req-all"> Show metadata, dev tools and the test SP</label>
-    <span class="req-spacer"></span>
-    <button class="btn small" id="req-pause" type="button">Pause</button>
-    <button class="btn small ghost" id="req-clear" type="button">Clear</button>
-  </div>
-  <div id="lo-requests" data-api="{api}" data-issuer="{issuer}"></div>
-</section>"#,
-        capacity = crate::inspector::CAPACITY,
-        api = esc(&api),
-        issuer = esc(&tenant.metadata_url()),
-    );
-    (StatusCode::OK, page(&tenant, "Requests", &body)).into_response()
+    app_page(&tenant, "Requests")
 }
 
 // ---------------------------------------------------------------------------
@@ -595,7 +576,18 @@ pub async fn requests_page(tenant: Tenant) -> Response {
 // ---------------------------------------------------------------------------
 
 pub async fn api_faults(State(state): State<AppState>) -> Response {
-    (no_store(), Json(state.faults.list())).into_response()
+    let faults: Vec<Value> = state
+        .faults
+        .list()
+        .iter()
+        .map(|f| {
+            let mut v = json!(f);
+            // What it does, in a few words, for people reading the list.
+            v["summary"] = json!(f.summary());
+            v
+        })
+        .collect();
+    (no_store(), Json(faults)).into_response()
 }
 
 pub async fn api_faults_add(State(state): State<AppState>, Json(req): Json<crate::faults::FaultRequest>) -> Response {
@@ -675,304 +667,79 @@ const FAULT_STATUSES: &[&str] = &[
     "PartialLogout",
 ];
 
-fn session_list(state: &AppState, tenant: &Tenant) -> String {
-    let sessions = state.store.entries::<Session>(Table::Sessions);
-    if sessions.is_empty() {
-        return r#"<p class="muted small">No active sessions.</p>"#.into();
+/// Non-standard: what the web UI shows about this identity provider: its endpoints, the other
+/// issuers, its certificate, the clock and the armed faults (for the warning banners), and the
+/// assertion generator's choices.
+pub async fn api_info(State(state): State<AppState>, tenant: Tenant) -> Response {
+    let u = |p: &str| tenant.url(p);
+    let mut endpoints = vec![
+        ("Metadata", tenant.metadata_url()),
+        ("Entity ID", tenant.entity_id.clone()),
+        ("SSO (Redirect and POST bindings; SOAP for ECP)", tenant.sso_url()),
+    ];
+    if let Some(slo) = tenant.slo_url() {
+        endpoints.push(("Single logout (Redirect, POST and SOAP bindings)", slo));
     }
-    let items: String = sessions
-        .iter()
-        .map(|(sid, s, _)| {
-            let sps = if s.participants.is_empty() {
-                "no service providers".to_string()
-            } else {
-                s.participants.iter().map(|p| format!("<code>{}</code>", esc(&p.entity_id))).collect::<Vec<_>>().join(", ")
-            };
-            let logout = format!(
-                "{}?sid={}&return_to={}",
-                tenant.path("/slo/initiate"),
-                crate::dsig::urlencode(sid),
-                crate::dsig::urlencode(&format!("{}#sessions", tenant.path("/dev")))
-            );
-            format!(
-                r#"<li><span><b>{who}</b> · {preset} · {sps}<br><small class="muted">SessionIndex <code>{index}</code> · {issuer}</small></span><span class="row-actions"><a class="btn small" href="{logout}">Single logout</a><button class="btn small ghost" type="button" data-session="{sid}" title="End it now: SPs with a SOAP SingleLogoutService are logged out back-channel, others aren't told">End (back-channel)</button></span></li>"#,
-                who = esc(&s.identity.describe()),
-                preset = esc(&s.identity.preset),
-                index = esc(&s.session_index),
-                issuer = esc(&s.issuer),
-                logout = esc(&logout),
-                sid = esc(sid),
-            )
-        })
-        .collect();
-    format!(r#"<ul class="fault-list session-list">{items}</ul>"#)
-}
-
-fn fault_list(faults: &[crate::faults::Fault]) -> String {
-    if faults.is_empty() {
-        return r#"<p class="muted small">No faults armed.</p>"#.into();
+    endpoints.push(("Artifact resolution (SOAP)", u("/artifact")));
+    endpoints.push(("Attribute queries (SOAP)", u("/attribute")));
+    endpoints.push(("IdP-initiated SSO (non-standard)", format!("{}?sp=<entity ID>", u("/sso/initiate"))));
+    endpoints.push(("Signing certificate (PEM)", u("/certificate.pem")));
+    endpoints.push(("Response API (non-standard)", u("/dev/api/response")));
+    if let Some(p) = tenant.preset {
+        for e in &p.endpoints {
+            endpoints.push((e.label, u(e.path)));
+        }
+        if tenant.sso_url() != u("/sso") {
+            endpoints.push(("SSO (generic path)", u("/sso")));
+        }
     }
-    let items: String = faults
-        .iter()
-        .map(|f| {
-            let endpoint = serde_json::to_value(f.endpoint).ok().map(|v| crate::util::value_to_string(&v)).unwrap_or_default();
-            let mut what = vec![format!("<b>{}</b>", esc(&f.summary()))];
-            for (label, value) in [("SP", &f.sp), ("issuer", &f.issuer)] {
-                if let Some(v) = value {
-                    what.push(format!("{label} <code>{}</code>", esc(v)));
-                }
-            }
-            let left = match f.remaining {
-                Some(1) => "next request".to_string(),
-                Some(n) => format!("next {n} requests"),
-                None => "until removed".to_string(),
-            };
-            format!(
-                r#"<li><span><code>{endpoint}</code> → {what} · {left}</span><button class="btn small ghost" type="button" data-fault="{id}">Remove</button></li>"#,
-                what = what.join(" · "),
-                id = f.id,
-            )
-        })
-        .collect();
-    format!(r#"<ul class="fault-list">{items}</ul>"#)
-}
-
-fn sp_list(state: &AppState, tenant: &Tenant) -> String {
-    let mut all = vec![crate::routes::testsp::service_provider(state, tenant)];
-    all.extend(state.service_providers());
-    let items: String = all
-        .iter()
-        .map(|sp| {
-            let mut facts = vec![format!(
-                "ACS {}",
-                if sp.acs_urls.is_empty() {
-                    "<em>from requests</em>".to_string()
-                } else {
-                    sp.acs_urls.iter().map(|a| format!("<code>{}</code>", esc(a))).collect::<Vec<_>>().join(", ")
-                }
-            )];
-            if let Some(slo) = &sp.slo_url {
-                facts.push(format!("SLO <code>{}</code>", esc(slo)));
-            }
-            if sp.certificate.is_some() {
-                facts.push("certificate".into());
-            }
-            if sp.metadata_pending {
-                facts.push(format!(
-                    "<span class=\"chip warn\">metadata not loaded yet: {}</span>",
-                    esc(sp.metadata_url.as_deref().unwrap_or(""))
-                ));
-            }
-            let remove = if sp.source == "api" {
-                format!(
-                    r#"<button class="btn small ghost" type="button" data-sp="{}">Remove</button>"#,
-                    esc(&sp.entity_id)
-                )
-            } else {
-                format!(r#"<span class="chip muted">{}</span>"#, esc(&sp.source))
-            };
-            // An SP without a name is labelled by its entity ID; don't repeat it.
-            let label = sp.label();
-            if label != sp.entity_id {
-                facts.insert(0, format!("<code>{}</code>", esc(&sp.entity_id)));
-            }
-            format!(
-                r#"<li><span><b>{}</b><br><small class="muted">{}</small></span>{remove}</li>"#,
-                esc(&label),
-                facts.join(" · ")
-            )
-        })
-        .collect();
-    format!(r#"<ul class="fault-list">{items}</ul>"#)
-}
-
-fn options(items: &[(&str, &str)], selected: &str) -> String {
-    items
-        .iter()
-        .map(|(v, label)| {
-            format!(r#"<option value="{v}"{}>{label}</option>"#, if *v == selected { " selected" } else { "" })
-        })
-        .collect()
-}
-
-pub async fn page_handler(State(state): State<AppState>, tenant: Tenant, headers: HeaderMap) -> Response {
+    let root = Tenant::new(&state.config.base_url, None, &state.config);
+    let mut issuers = vec![json!({
+        "id": null,
+        "name": "Root issuer",
+        "description": "template chosen at login",
+        "entity_id": root.entity_id,
+        "prefix": root.prefix,
+    })];
+    for p in presets::all() {
+        let t = Tenant::new(&state.config.base_url, Some(p), &state.config);
+        issuers.push(json!({
+            "id": p.id,
+            "name": p.name,
+            "description": p.description,
+            "color": p.color,
+            "entity_id": t.entity_id,
+            "prefix": t.prefix,
+        }));
+    }
     let preset: &'static Preset = tenant.default_preset(&state.config);
-    let previous = current_session(&state, &tenant, &headers).map(|(_, s)| s);
-    let api = tenant.url("/dev/api/response");
-    let test_sp = crate::routes::testsp::entity_id(&tenant);
-    let mut sp_ids = vec![test_sp.clone()];
-    sp_ids.extend(state.service_providers().into_iter().map(|s| s.entity_id));
-    let cert = state.keys.current_info();
-    let tri = [("", "Template default"), ("true", "Yes"), ("false", "No")];
-    // NameID and attribute encryption are per service provider (encrypt_name_id, encrypt_attributes).
-    let sp_tri = [("", "SP default"), ("true", "Yes"), ("false", "No")];
-    let tampers: String = Tamper::ALL
-        .iter()
-        .map(|t| {
-            format!(
-                r#"<label class="check" title="{}"><input type="checkbox" class="dev-tamper" value="{}"> {}</label>"#,
-                esc(t.describe()),
-                t.name(),
-                t.name()
-            )
-        })
-        .collect();
-    let body = format!(
-        r#"<div class="layout dev">
-<section class="card editor-card">
-  <div class="eyebrow">Assertion generator</div>
-  <h1>Mint SAML responses as <span class="accent">{entity}</span></h1>
-  <p class="muted">Build a signed Response without a browser login, then post it to your ACS from here or paste it into a test. Scripts and tests can use the same thing via <code>POST {api}</code>.</p>
-  <div class="opts" id="dev-options">
-    <label>Service provider<input id="dev-sp" list="dev-sps" value="{test_sp}"></label>
-    <label>ACS URL<input id="dev-acs" placeholder="the SP's default ACS"></label>
-    <label>Audience<input id="dev-audience" placeholder="the SP's entity ID"></label>
-    <label>InResponseTo<input id="dev-irt" placeholder="none: unsolicited"></label>
-    <label>RelayState<input id="dev-relay" placeholder="optional"></label>
-    <label>Lifetime (s)<input id="dev-ttl" type="number" placeholder="{lifetime}"></label>
-    <label>Sign response<select id="dev-sign-response">{tri}</select></label>
-    <label>Sign assertion<select id="dev-sign-assertion">{tri}</select></label>
-    <label>Signature algorithm<select id="dev-alg">{algs}</select></label>
-    <label>Encrypt assertion<select id="dev-encrypt">{encs}</select></label>
-    <label>Encrypt NameID<select id="dev-encrypt-name-id">{sp_tri}</select></label>
-    <label>Encrypt attributes<select id="dev-encrypt-attributes">{sp_tri}</select></label>
-    <div class="checks tampers"><span class="muted small">Defects:</span>{tampers}</div>
-  </div>
-  <datalist id="dev-sps">{sp_options}</datalist>
-  <div id="lo-editor"></div>
-  <div class="actions"><button class="btn primary" id="dev-generate" type="button">Generate response</button></div>
-</section>
-<section class="card result" id="dev-result" hidden></section>
-<section class="card" id="sps">
-  <div class="eyebrow">Service providers</div>
-  <p class="muted">localsaml answers the service providers listed here, and ones whose metadata it can fetch from their entity ID{lenient_note}. Declare one in <code>localsaml.toml</code>, or register it here from its metadata, so its ACS URLs can be verified, its signatures checked, assertions encrypted for it and it can be logged out. Scripts can use <code>POST {sps_api}</code>.</p>
-  {sp_list}
-  <div class="opts sp-form">
-    <label class="wide">Metadata URL or XML<textarea id="dev-sp-metadata" rows="3" placeholder="http://localhost:3000/saml/metadata, or paste &lt;EntityDescriptor …&gt;"></textarea></label>
-  </div>
-  <div class="actions"><button class="btn" id="dev-sp-add" type="button">Register service provider</button></div>
-</section>
-<section class="card" id="certificate">
-  <div class="eyebrow">Signing certificate</div>
-  <dl class="kv">
-    <dt>Subject</dt><dd><code>{subject}</code></dd>
-    <dt>Valid</dt><dd>{not_before} to {not_after}</dd>
-    <dt>SHA-1 fingerprint</dt><dd><code id="dev-sha1">{sha1}</code></dd>
-    <dt>SHA-256 fingerprint</dt><dd><code id="dev-sha256">{sha256}</code></dd>
-  </dl>
-  <p class="muted">Rotating creates a new key and certificate. The previous {kept} stay in the <a href="{metadata}">metadata</a>, so service providers that refresh it keep trusting responses; ones configured with a pinned certificate or fingerprint stop. Scripts can use <code>POST {rotate}</code>.</p>
-  <div class="actions"><a class="btn ghost" href="{pem}" download="localsaml.pem">Download certificate (PEM)</a><button class="btn" id="dev-rotate" type="button">Rotate signing key</button></div>
-</section>
-<section class="card" id="clock">
-  <div class="eyebrow">Clock</div>
-  <p class="muted">{clock_status} Shift it to issue assertions that look expired or not yet valid to your app (whose clock is real), or to expire localsaml's sessions without waiting. Scripts can use <code>POST {clock_api}</code>.</p>
-  <div class="actions clock-actions">
-    <input id="dev-clock-amount" value="10m" aria-label="Duration, e.g. 15m, 2h, 31d">
-    <button class="btn" id="dev-clock-advance" type="button">Move forward</button>
-    <button class="btn" id="dev-clock-back" type="button">Move back</button>
-    <button class="btn ghost" id="dev-clock-reset" type="button"{reset_disabled}>Reset to real time</button>
-  </div>
-</section>
-<section class="card" id="faults">
-  <div class="eyebrow">Faults</div>
-  <p class="muted">Make the next logins fail with a SAML error status, carry a deliberately defective Response, or respond slowly; or make metadata unavailable. Errors go back to the service provider like real ones. Scripts can use <code>POST {faults_api}</code>.</p>
-  {fault_list}
-  <div class="opts faults-form">
-    <label>Endpoint<select id="dev-fault-endpoint"><option value="sso">sso</option><option value="slo">slo</option><option value="metadata">metadata</option></select></label>
-    <label data-for="sso slo">SAML status<input id="dev-fault-status" list="dev-fault-statuses" placeholder="e.g. AuthnFailed"></label>
-    <label data-for="sso">Defect<select id="dev-fault-tamper"><option value="">none</option>{tamper_options}</select></label>
-    <label data-for="sso slo">Service provider<input id="dev-fault-sp" list="dev-sps" placeholder="any"></label>
-    <label data-for="metadata" hidden>HTTP status<input id="dev-fault-http" type="number" min="400" max="599" placeholder="503"></label>
-    <label>Delay (ms)<input id="dev-fault-delay" type="number" min="0" max="{max_delay}" value="0"></label>
-    <label>Times<input id="dev-fault-count" type="number" min="1" value="1"></label>
-    <div class="checks"><label class="check"><input type="checkbox" id="dev-fault-always"> Until removed</label></div>
-  </div>
-  <datalist id="dev-fault-statuses">{status_options}</datalist>
-  <div class="actions">
-    <button class="btn" id="dev-fault-add" type="button">Arm fault</button>
-    <button class="btn ghost" id="dev-fault-clear" type="button"{clear_disabled}>Remove all</button>
-  </div>
-</section>
-<section class="card" id="sessions">
-  <div class="eyebrow">Sessions</div>
-  <p class="muted">Browser sessions on every issuer. <b>Single logout</b> ends one in this browser and sends a LogoutRequest to each service provider that used it, one after another. <b>End (back-channel)</b> ends it as if the user logged out elsewhere: service providers with a SOAP SingleLogoutService get a LogoutRequest back-channel, the others aren't told. Scripts can use <code>GET {sessions_api}</code>.</p>
-  {session_list}
-</section>
-</div>
-{data}"#,
-        entity = esc(&tenant.entity_id),
-        api = esc(&api),
-        test_sp = esc(&test_sp),
-        lifetime = state.config.assertion_ttl.unwrap_or(preset.assertion_lifetime),
-        tri = options(&tri, ""),
-        sp_tri = options(&sp_tri, ""),
-        algs = options(
-            &[("rsa-sha256", "RSA-SHA256"), ("rsa-sha512", "RSA-SHA512"), ("rsa-sha1", "RSA-SHA1")],
-            state.config.signature_algorithm.name()
-        ),
-        encs = options(
-            &[
-                ("", "SP default"),
-                ("none", "No"),
-                ("aes256-gcm", "AES-256-GCM"),
-                ("aes128-gcm", "AES-128-GCM"),
-                ("aes256-cbc", "AES-256-CBC"),
-                ("aes128-cbc", "AES-128-CBC")
-            ],
-            ""
-        ),
-        tampers = tampers,
-        sp_options = sp_ids.iter().map(|s| format!(r#"<option value="{}">"#, esc(s))).collect::<String>(),
-        sps_api = esc(&tenant.url("/dev/api/service-providers")),
-        lenient_note = if state.config.lenient {
-            " (and, in lenient mode, any other, with the ACS URL from its AuthnRequest)"
-        } else {
-            ""
-        },
-        sp_list = sp_list(&state, &tenant),
-        subject = esc(&cert.subject),
-        not_before = esc(&cert.not_before),
-        not_after = esc(&cert.not_after),
-        sha1 = esc(&cert.sha1_fingerprint),
-        sha256 = esc(&cert.sha256_fingerprint),
-        kept = crate::keys::RETIRED_KEYS_KEPT,
-        metadata = esc(&tenant.path("/metadata")),
-        rotate = esc(&tenant.url("/dev/api/rotate-keys")),
-        pem = esc(&tenant.path("/certificate.pem")),
-        clock_status = match state.clock().offset() {
-            0 => "The clock runs on real time.".to_string(),
-            o => format!(
-                "The clock is <b>{}</b> {} real time.",
-                crate::util::format_duration(o),
-                if o > 0 { "ahead of" } else { "behind" }
-            ),
-        },
-        clock_api = esc(&tenant.url("/dev/api/clock")),
-        reset_disabled = if state.clock().offset() == 0 { " disabled" } else { "" },
-        faults_api = esc(&tenant.url("/dev/api/faults")),
-        fault_list = fault_list(&state.faults.list()),
-        tamper_options =
-            Tamper::ALL.iter().map(|t| format!(r#"<option value="{0}">{0}</option>"#, t.name())).collect::<String>(),
-        status_options = FAULT_STATUSES.iter().map(|s| format!(r#"<option value="{s}">"#)).collect::<String>(),
-        max_delay = crate::faults::MAX_DELAY_MS,
-        clear_disabled = if state.faults.is_empty() { " disabled" } else { "" },
-        sessions_api = esc(&tenant.url("/dev/api/sessions")),
-        session_list = session_list(&state, &tenant),
-        data = data_script(&editor_data(
-            &state,
-            &tenant,
-            "dev",
-            preset,
-            previous.as_ref(),
-            json!({
-                "api": api,
-                "rotateApi": tenant.url("/dev/api/rotate-keys"),
-                "clockApi": tenant.url("/dev/api/clock"),
-                "faultsApi": tenant.url("/dev/api/faults"),
-                "sessionsApi": tenant.url("/dev/api/sessions"),
-                "spsApi": tenant.url("/dev/api/service-providers"),
-            }),
-        )),
-    );
-    (StatusCode::OK, page(&tenant, "Assertion generator", &body)).into_response()
+    let body = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "entity_id": tenant.entity_id,
+        "prefix": tenant.prefix,
+        "metadata_url": tenant.metadata_url(),
+        "preset": tenant.preset.map(|p| json!({ "id": p.id, "name": p.name, "color": p.color })),
+        "default_preset": preset.id,
+        "lenient": state.config.lenient,
+        "clock": clock_json(&state),
+        "faults_armed": state.faults.list().len(),
+        "certificate": state.keys.current_info(),
+        "retired_keys_kept": crate::keys::RETIRED_KEYS_KEPT,
+        "endpoints": endpoints.iter().map(|(label, url)| json!({ "label": label, "url": url })).collect::<Vec<_>>(),
+        "issuers": issuers,
+        "test_sp": crate::routes::testsp::entity_id(&tenant),
+        "name_id_formats": crate::presets::nameid::ALL,
+        "assertion_lifetime": state.config.assertion_ttl.unwrap_or(preset.assertion_lifetime),
+        "signature_algorithm": state.config.signature_algorithm.name(),
+        "fault_statuses": FAULT_STATUSES,
+        "tampers": Tamper::ALL.iter().map(|t| json!({ "name": t.name(), "description": t.describe() })).collect::<Vec<_>>(),
+        "max_fault_delay_ms": crate::faults::MAX_DELAY_MS,
+        "requests_capacity": crate::inspector::CAPACITY,
+    });
+    (no_store(), Json(body)).into_response()
+}
+
+/// The assertion generator's page.
+pub async fn page_handler(tenant: Tenant) -> Response {
+    app_page(&tenant, "Assertion generator")
 }

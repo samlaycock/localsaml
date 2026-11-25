@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use crate::dsig::{self, QuerySignature};
 use crate::faults::{self, Endpoint};
-use crate::html::{data_script, error_page, esc, page, saml_error_page, saml_post, xml_block};
+use crate::html::{BUTTON, PRIMARY_BUTTON, card, error_page, esc, saml_error_page, saml_post, shell, xml_block};
 use crate::inspector::SamlNote;
 use crate::presets::{self, Identity, Preset, SessionIndexStyle, nameid};
 use crate::saml::{self, AuthnRequest, Message, ResponseSpec, Status, Tamper};
@@ -1145,20 +1145,12 @@ fn deliver(
             url.query_pairs_mut().append_pair("RelayState", r);
         }
         let resp = if review {
-            let send = format!(
-                r#"<a class="btn primary" href="{}">Send the artifact to the service provider</a>"#,
-                esc(url.as_str())
-            );
-            let detail = format!(
-                r#"<details><summary>Artifact</summary><pre class="code wrap">{}</pre></details>"#,
-                esc(&artifact)
-            );
             review_page(
                 tenant,
                 pending,
                 "redirected (with an artifact the service provider resolves over SOAP) to",
-                &send,
-                &detail,
+                Send::Link(url.to_string()),
+                ("Artifact", &artifact),
                 &pretty,
             )
         } else {
@@ -1168,21 +1160,11 @@ fn deliver(
     } else {
         let encoded = b64_std(xml);
         let resp = if review {
-            let relay = pending
-                .relay_state
-                .as_ref()
-                .map(|r| format!(r#"<input type="hidden" name="RelayState" value="{}">"#, esc(r)))
-                .unwrap_or_default();
-            let send = format!(
-                r#"<form method="POST" action="{acs}" class="actions"><input type="hidden" name="SAMLResponse" value="{encoded}">{relay}<button class="btn primary" type="submit">Send to the service provider</button></form>"#,
-                acs = esc(&pending.acs_url),
-                encoded = esc(&encoded),
-            );
-            let detail = format!(
-                r#"<details><summary>Base64 SAMLResponse</summary><pre class="code wrap">{}</pre></details>"#,
-                esc(&encoded)
-            );
-            review_page(tenant, pending, "posted to", &send, &detail, &pretty)
+            let mut fields = vec![("SAMLResponse".to_string(), encoded.clone())];
+            if let Some(r) = &pending.relay_state {
+                fields.push(("RelayState".to_string(), r.clone()));
+            }
+            review_page(tenant, pending, "posted to", Send::Post(fields), ("Base64 SAMLResponse", &encoded), &pretty)
         } else {
             saml_post(&pending.acs_url, "SAMLResponse", &encoded, pending.relay_state.as_deref()).into_response()
         };
@@ -1192,21 +1174,63 @@ fn deliver(
     resp
 }
 
-fn review_page(tenant: &Tenant, pending: &Pending, how: &str, send: &str, detail: &str, pretty: &str) -> Response {
-    let body = format!(
-        r#"<section class="card">
-  <div class="eyebrow">Review</div>
-  <h1>Response for <span class="accent">{sp}</span></h1>
-  <p class="muted">This is what will be {how} <code>{acs}</code>. Nothing has been sent yet.</p>
-  {send}
-  {xml}
-  {detail}
-</section>"#,
-        sp = esc(pending.sp_name.as_deref().unwrap_or(&pending.sp)),
-        acs = esc(&pending.acs_url),
-        xml = xml_block("SAML Response", pretty),
-    );
-    page(tenant, "Review response", &body).into_response()
+/// How a reviewed Response is sent: a form posted to the ACS, or a link carrying an artifact.
+enum Send {
+    Post(Vec<(String, String)>),
+    Link(String),
+}
+
+/// The Response, before it's sent (the login form's "Review the response before sending it").
+fn review_page(
+    tenant: &Tenant,
+    pending: &Pending,
+    how: &str,
+    send: Send,
+    detail: (&str, &str),
+    pretty: &str,
+) -> Response {
+    let sp = pending.sp_name.as_deref().unwrap_or(&pending.sp);
+    let (send_json, send_html) = match &send {
+        Send::Post(fields) => {
+            let inputs: String = fields
+                .iter()
+                .map(|(k, v)| format!(r#"<input type="hidden" name="{}" value="{}">"#, esc(k), esc(v)))
+                .collect();
+            (
+                json!({
+                    "kind": "post",
+                    "action": pending.acs_url,
+                    "fields": fields.iter().cloned().collect::<HashMap<_, _>>(),
+                }),
+                format!(
+                    r#"<form method="POST" action="{}">{inputs}<button type="submit" {PRIMARY_BUTTON}>Send to the service provider</button></form>"#,
+                    esc(&pending.acs_url)
+                ),
+            )
+        }
+        Send::Link(url) => (
+            json!({ "kind": "link", "url": url }),
+            format!(r#"<p><a href="{}" {PRIMARY_BUTTON}>Send the artifact to the service provider</a></p>"#, esc(url)),
+        ),
+    };
+    let view = json!({
+        "kind": "review",
+        "sp": sp,
+        "acs": pending.acs_url,
+        "how": how,
+        "send": send_json,
+        "xml": pretty,
+        "detail": { "label": detail.0, "value": detail.1 },
+    });
+    let fallback = card(&format!(
+        r#"<div style="color:var(--muted-foreground);font-size:.75rem;font-weight:500">Review</div><h1>Response for {}</h1><p>This is what will be {} {}. Nothing has been sent yet.</p>{send_html}{}{}"#,
+        esc(sp),
+        esc(how),
+        esc(&pending.acs_url),
+        xml_block("SAML Response", pretty),
+        xml_block(detail.0, detail.1),
+    ));
+    shell(tenant, StatusCode::OK, "Review response", view, &fallback)
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,30 +1364,32 @@ async fn start_idp_initiated(
 fn pick_sp_page(state: &AppState, tenant: &Tenant) -> Response {
     let mut sps = state.service_providers();
     sps.insert(0, crate::routes::testsp::service_provider(state, tenant));
-    let items: String = sps
+    let sps: Vec<Value> = sps
         .iter()
         .filter(|sp| !sp.acs_urls.is_empty())
         .map(|sp| {
-            let label = sp.label();
-            let entity_id = if label == sp.entity_id {
-                String::new()
-            } else {
-                format!(r#"<br><small class="muted"><code>{}</code></small>"#, esc(&sp.entity_id))
-            };
+            json!({
+                "label": sp.label(),
+                "entity_id": sp.entity_id,
+                "href": format!("{}?sp={}", tenant.path("/sso/initiate"), crate::dsig::urlencode(&sp.entity_id)),
+            })
+        })
+        .collect();
+    let text = |v: &Value, k: &str| esc(v[k].as_str().unwrap_or_default());
+    let items: String = sps
+        .iter()
+        .map(|sp| {
             format!(
-                r#"<li><span><b>{}</b>{entity_id}</span><a class="btn small" href="{}?sp={}">Sign in</a></li>"#,
-                esc(&label),
-                esc(&tenant.path("/sso/initiate")),
-                esc(&crate::dsig::urlencode(&sp.entity_id)),
+                r#"<li><a href="{}">{}</a> <code>{}</code></li>"#,
+                text(sp, "href"),
+                text(sp, "label"),
+                text(sp, "entity_id")
             )
         })
         .collect();
-    let body = format!(
-        r#"<section class="card narrow"><div class="eyebrow">IdP-initiated login</div><h1>Sign in to…</h1>
-<p class="muted">Sends an unsolicited Response (no AuthnRequest) to the service provider's default ACS URL. Link here with <code>?sp=&lt;entity ID&gt;</code> and optionally <code>RelayState</code>.</p>
-<ul class="fault-list">{items}</ul></section>"#
-    );
-    page(tenant, "IdP-initiated login", &body).into_response()
+    let detail = "Sends an unsolicited Response (no AuthnRequest) to the service provider's default ACS URL. Link here with ?sp=<entity ID> and optionally RelayState.";
+    let fallback = crate::html::titled_card("IdP-initiated login", "Sign in to…", detail, &format!("<ul>{items}</ul>"));
+    shell(tenant, StatusCode::OK, "IdP-initiated login", json!({ "kind": "pick-sp", "sps": sps }), &fallback)
 }
 
 // ---------------------------------------------------------------------------
@@ -1396,14 +1422,6 @@ pub fn editor_data(
     data
 }
 
-fn kv(label: &str, value: &str) -> String {
-    format!("<dt>{}</dt><dd>{}</dd>", esc(label), value)
-}
-
-fn code(v: &str) -> String {
-    format!("<code>{}</code>", esc(v))
-}
-
 fn render_login(
     state: &AppState,
     tenant: &Tenant,
@@ -1411,93 +1429,54 @@ fn render_login(
     preset: &'static Preset,
     previous: Option<Session>,
 ) -> Response {
-    let chip = |text: &str, class: &str| format!(r#"<span class="chip {class}">{}</span>"#, esc(text));
-    let mut chips = vec![chip(if pending.binding == "idp-initiated" { "IdP-initiated" } else { &pending.binding }, "")];
+    let mut chips = vec![json!({
+        "label": if pending.binding == "idp-initiated" { "IdP-initiated" } else { &pending.binding },
+        "tone": "",
+    })];
     if pending.force_authn {
-        chips.push(chip("ForceAuthn", "warn"));
+        chips.push(json!({ "label": "ForceAuthn", "tone": "warn" }));
     }
     if pending.signature.contains("verified") && !pending.signature.contains("not verified") {
-        chips.push(chip("signed", "ok"));
+        chips.push(json!({ "label": "signed", "tone": "ok" }));
     }
+    // Code-like values are shown in a monospace font.
     let mut details = vec![
-        kv("Service provider", &code(&pending.sp)),
-        kv("ACS URL", &code(&pending.acs_url)),
-        kv("Binding", &code(&pending.binding)),
-        kv("Signature", &esc(&pending.signature)),
+        json!({ "label": "Service provider", "value": pending.sp, "code": true }),
+        json!({ "label": "ACS URL", "value": pending.acs_url, "code": true }),
+        json!({ "label": "Binding", "value": pending.binding, "code": true }),
+        json!({ "label": "Signature", "value": pending.signature, "code": false }),
     ];
-    if let Some(id) = &pending.request_id {
-        details.push(kv("Request ID", &code(id)));
-    }
-    if let Some(f) = &pending.name_id_format {
-        details.push(kv("NameIDPolicy", &code(f)));
-    }
-    if !pending.requested_authn_contexts.is_empty() {
-        details.push(kv("AuthnContext", &code(&pending.requested_authn_contexts.join(" "))));
-    }
-    if let Some(r) = &pending.relay_state {
-        details.push(kv("RelayState", &code(r)));
-    }
-    if let Some(s) = &pending.subject {
-        details.push(kv("Subject", &code(s)));
-    }
-    if let Some(h) = &pending.login_hint {
-        details.push(kv("Login hint", &code(h)));
+    let contexts = pending.requested_authn_contexts.join(" ");
+    for (label, value) in [
+        ("Request ID", pending.request_id.as_ref()),
+        ("NameIDPolicy", pending.name_id_format.as_ref()),
+        ("AuthnContext", Some(&contexts).filter(|c| !c.is_empty())),
+        ("RelayState", pending.relay_state.as_ref()),
+        ("Subject", pending.subject.as_ref()),
+        ("Login hint", pending.login_hint.as_ref()),
+    ] {
+        if let Some(v) = value {
+            details.push(json!({ "label": label, "value": v, "code": true }));
+        }
     }
     if !pending.tampers.is_empty() {
-        details.push(kv(
-            "Faults",
-            &esc(&pending
-                .tampers
-                .iter()
-                .map(|t| format!("{} ({})", t.name(), t.describe()))
-                .collect::<Vec<_>>()
-                .join(", ")),
-        ));
+        let faults = pending.tampers.iter().map(|t| format!("{} ({})", t.name(), t.describe())).collect::<Vec<_>>();
+        details.push(json!({ "label": "Faults", "value": faults.join(", "), "code": false }));
     }
-    details.push(kv("Issuer", &code(&tenant.entity_id)));
-    let warnings: String =
-        pending.warnings.iter().map(|w| format!(r#"<p class="notice warn small">{}</p>"#, esc(w))).collect();
-    let request_xml = pending
-        .request_xml
-        .as_ref()
-        .map(|x| {
-            format!(
-                "<details class=\"request-details\"><summary>AuthnRequest XML</summary>{}</details>",
-                xml_block("AuthnRequest", x)
-            )
-        })
-        .unwrap_or_default();
+    details.push(json!({ "label": "Issuer", "value": tenant.entity_id, "code": true }));
 
     let title = pending.sp_name.as_deref().unwrap_or(&pending.sp);
-    let body = format!(
-        r#"<div class="layout">
-<aside class="card request">
-  <div class="eyebrow">Authentication request</div>
-  <h1>Sign in to <span class="accent">{title}</span></h1>
-  <div class="chips">{chips}</div>
-  {warnings}
-  <details class="request-details"><summary>Request details</summary><dl class="kv">{details}</dl></details>
-  {request_xml}
-</aside>
-<form class="card editor-card" method="post" action="{action}" id="lo-form">
-  <input type="hidden" name="req" value="{req_id}">
-  <input type="hidden" name="preset">
-  <input type="hidden" name="identity">
-  <div id="lo-editor"></div>
-  <div class="actions">
-    <button class="btn primary" type="submit" name="action" value="approve">Sign in</button>
-    <button class="btn ghost" type="submit" name="action" value="deny">Deny</button>
-    <label class="check review-toggle"><input type="checkbox" name="review" value="1" id="lo-review"> Review the response before sending it</label>
-  </div>
-</form>
-</div>
-{data}"#,
-        title = esc(title),
-        chips = chips.join(""),
-        details = details.join(""),
-        action = tenant.path("/login"),
-        req_id = esc(&pending.id),
-        data = data_script(&editor_data(
+    let action = tenant.path("/login");
+    let view = json!({
+        "kind": "login",
+        "action": action,
+        "req": pending.id,
+        "sp": title,
+        "chips": chips,
+        "details": details,
+        "warnings": pending.warnings,
+        "requestXml": pending.request_xml,
+        "editor": editor_data(
             state,
             tenant,
             "login",
@@ -1508,9 +1487,27 @@ fn render_login(
                 "subject": pending.subject.as_ref().map(|s| json!({ "nameId": s, "format": pending.subject_format })),
                 "requestedNameIdFormat": pending.name_id_format,
             }),
-        )),
+        ),
+    });
+    // Without JavaScript (and for the interop harness and the conformance kit, which post it
+    // unchanged), signing in uses the template's default identity.
+    let form = format!(
+        r#"<form method="post" action="{action}" id="lo-form"><input type="hidden" name="req" value="{req_id}"><input type="hidden" name="preset"><input type="hidden" name="identity">
+<p style="display:flex;gap:.5rem;align-items:center;flex-wrap:wrap"><button type="submit" name="action" value="approve" {PRIMARY_BUTTON}>Sign in</button> <button type="submit" name="action" value="deny" {BUTTON}>Deny</button>
+<label><input type="checkbox" name="review" value="1"> Review the response before sending it</label></p></form>"#,
+        action = esc(&action),
+        req_id = esc(&pending.id),
     );
-    page(tenant, "Sign in", &body).into_response()
+    let fallback = crate::html::titled_card(
+        "Authentication request",
+        &format!("Sign in to {title}"),
+        &format!(
+            "Service provider {} · ACS {}. Signing in uses the template's default identity; the attribute editor needs JavaScript.",
+            pending.sp, pending.acs_url
+        ),
+        &form,
+    );
+    shell(tenant, StatusCode::OK, "Sign in", view, &fallback)
 }
 
 /// Parse the wizard's hidden fields into an identity.

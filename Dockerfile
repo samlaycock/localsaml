@@ -4,7 +4,8 @@ FROM rust:1.99-trixie AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src src
-COPY assets assets
+# The web UI, prebuilt (ui/dist is committed): building the image needs no Node.
+COPY ui/dist ui/dist
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked --bin localsaml \

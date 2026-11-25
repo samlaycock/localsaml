@@ -1,0 +1,21 @@
+/*
+ * localsaml's accent colour: the only product-specific styling. Everything else comes from the
+ * stock shadcn theme in index.css, which stays as `shadcn init` wrote it.
+ */
+:root {
+  --primary: oklch(0.511 0.096 186.391); /* teal-700 */
+  --primary-foreground: oklch(0.985 0 0);
+  --ring: oklch(0.511 0.096 186.391);
+  --chart-1: oklch(0.511 0.096 186.391);
+  --sidebar-primary: oklch(0.511 0.096 186.391);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+}
+
+.dark {
+  --primary: oklch(0.777 0.152 181.912); /* teal-400 */
+  --primary-foreground: oklch(0.205 0 0);
+  --ring: oklch(0.777 0.152 181.912);
+  --chart-1: oklch(0.777 0.152 181.912);
+  --sidebar-primary: oklch(0.777 0.152 181.912);
+  --sidebar-primary-foreground: oklch(0.205 0 0);
+}

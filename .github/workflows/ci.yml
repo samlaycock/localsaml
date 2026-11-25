@@ -28,6 +28,35 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  ui:
+    name: Web UI
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v5
+      # Installs Vite+ (the version in ui/package.json), Node.js, Bun (pinned in ui/package.json)
+      # and the dependencies.
+      - uses: voidzero-dev/setup-vp@v1.22.0
+        with:
+          working-directory: ui
+          node-version: "24"
+          cache: true
+          run-install: |
+            - args: ['--frozen-lockfile']
+      # Formatting (Oxfmt), lint (Oxlint) and type checks.
+      - run: vp check
+      - run: vp build
+      # ui/dist is committed so the binary builds without Node, so it must match the source.
+      - name: Check the committed build is current
+        run: |
+          if [ -n "$(git status --porcelain -- dist)" ]; then
+            git status --short -- dist
+            echo "::error::ui/dist is out of date. Run 'bun run build' in ui/ and commit the result."
+            exit 1
+          fi
+
   audit:
     name: Audit (RustSec advisories)
     runs-on: ubuntu-24.04
