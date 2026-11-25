@@ -9,7 +9,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::faults::{self, Endpoint};
-use crate::html::{esc, page, saml_error_page, saml_post};
+use crate::html::{BUTTON, esc, saml_error_page, saml_post, shell, titled_card};
 use crate::inspector::{Message, SamlNote};
 use crate::presets::{Preset, Style};
 use crate::routes::sso::{
@@ -268,30 +268,26 @@ async fn finish(state: &AppState, tenant: &Tenant, logout: Logout) -> Response {
     let rows: String = logout
         .results
         .iter()
-        .map(|(sp, outcome)| {
-            let class = if outcome == "logged out" { "ok" } else { "muted" };
-            format!(
-                r#"<li><span><code>{}</code></span><span class="chip {class}">{}</span></li>"#,
-                esc(sp),
-                esc(outcome)
-            )
-        })
+        .map(|(sp, outcome)| format!("<li><code>{}</code>: {}</li>", esc(sp), esc(outcome)))
         .collect();
     let list = if rows.is_empty() {
-        r#"<p class="muted">No other service providers were signed in.</p>"#.to_string()
+        "<p>No other service providers were signed in.</p>".to_string()
     } else {
-        format!(r#"<ul class="fault-list">{rows}</ul>"#)
+        format!("<ul>{rows}</ul>")
     };
     let back = logout
         .return_to
         .as_ref()
-        .map(|r| format!(r#"<div class="actions"><a class="btn" href="{}">Continue</a></div>"#, esc(r)))
+        .map(|r| format!(r#"<p><a href="{}" {BUTTON}>Continue</a></p>"#, esc(r)))
         .unwrap_or_default();
-    let body = format!(
-        r#"<section class="card narrow"><div class="eyebrow">Single logout</div><h1>Signed out <span class="accent">{}</span></h1>{list}{back}</section>"#,
-        esc(&logout.who)
-    );
-    page(tenant, "Signed out", &body).into_response()
+    let view = serde_json::json!({
+        "kind": "signed-out",
+        "who": logout.who,
+        "results": logout.results.iter().map(|(sp, outcome)| serde_json::json!({ "sp": sp, "outcome": outcome })).collect::<Vec<_>>(),
+        "returnTo": logout.return_to,
+    });
+    let fallback = titled_card("Single logout", &format!("Signed out {}", logout.who), "", &format!("{list}{back}"));
+    shell(tenant, axum::http::StatusCode::OK, "Signed out", view, &fallback)
 }
 
 /// A LogoutResponse from a service provider we asked to log out.

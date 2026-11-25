@@ -241,6 +241,13 @@ impl Posted {
     }
 }
 
+/// The protocol page a response describes for the web UI (`<script id="lo-page">`).
+fn view(resp: &Resp) -> Value {
+    let start = resp.body.find(r#"id="lo-page">"#).expect("page data") + 13;
+    let end = start + resp.body[start..].find("</script>").unwrap();
+    serde_json::from_str::<Value>(&resp.body[start..end]).unwrap()["view"].clone()
+}
+
 fn attr_values(assertion: &Element, name: &str) -> Vec<String> {
     assertion
         .find(A, "AttributeStatement")
@@ -305,8 +312,9 @@ async fn metadata_for_root_and_templates() {
         assert_eq!(r.status, StatusCode::OK, "/p/{}/", preset.id);
         assert_eq!(r.title(), "Home · localsaml", "/p/{}/", preset.id);
     }
-    let home = get(&app, "/").await;
-    assert!(home.body.contains(r#"href="/p/okta/""#));
+    // The overview links to each template issuer by its prefix.
+    let info = get(&app, "/dev/api/info").await.json();
+    assert!(info["issuers"].as_array().unwrap().iter().any(|i| i["prefix"] == "/p/okta"), "{info}");
 
     let root = md(&get(&app, "/metadata").await.body);
     assert_eq!(root.get_attr("entityID"), Some("http://localhost:9401/metadata"));
@@ -357,6 +365,44 @@ async fn metadata_for_root_and_templates() {
 // ---------------------------------------------------------------------------
 // SP-initiated SSO
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ui_pages_and_assets() {
+    let (app, _) = app();
+    // The dev tools are pages of the app, under every issuer, titled for their page.
+    for (uri, title) in [
+        ("/", "Home"),
+        ("/dev", "Assertion generator"),
+        ("/dev/requests", "Requests"),
+        ("/sp", "Test SP"),
+        ("/p/okta/dev", "Assertion generator"),
+    ] {
+        let page = get(&app, uri).await;
+        assert_eq!(page.status, StatusCode::OK, "{uri}");
+        assert_eq!(page.title(), format!("{title} · localsaml"), "{uri}");
+        assert!(view(&page).is_null(), "{uri}");
+    }
+    assert!(get(&app, "/p/okta/dev").await.body.contains(r#""prefix":"/p/okta""#));
+    let info = get(&app, "/p/okta/dev/api/info").await.json();
+    assert_eq!(info["preset"]["id"], "okta");
+    assert!(get(&app, "/dev/api/test-sp").await.json()["session"].is_null());
+
+    // The app's files: hashed assets never change, and a missing file is a 404.
+    let page = get(&app, "/dev").await.body;
+    let script = page.split(r#"src="/assets/"#).nth(1).and_then(|rest| rest.split('"').next()).expect("script tag");
+    let res = get(&app, &format!("/assets/{script}")).await;
+    assert_eq!(res.status, StatusCode::OK);
+    assert!(res.headers[header::CACHE_CONTROL].to_str().unwrap().contains("immutable"));
+    assert_eq!(get(&app, "/favicon.svg").await.status, StatusCode::OK);
+    assert_eq!(get(&app, "/assets/nope.js").await.status, StatusCode::NOT_FOUND);
+
+    // The protocol's pages work without JavaScript: the login page's plain HTML version is the
+    // form the interop harness and the conformance kit post unchanged.
+    let page = get(&app, &redirect("/sso", "SAMLRequest", &simple_request("_ui"), None, None)).await;
+    assert_eq!(view(&page)["kind"], "login");
+    assert!(page.body.contains(r#"action="/login" id="lo-form""#), "{}", page.body);
+    assert!(page.body.contains(r#"name="req" value=""#) && page.body.contains(r#"value="approve""#));
+}
 
 #[tokio::test]
 async fn redirect_binding_login_signed_by_the_test_sp() {
@@ -418,7 +464,9 @@ async fn unsigned_redirect_and_signed_post_bindings() {
 
     // Unsigned, from an SP nobody declared (lenient mode).
     let page = get_jar(&app, &redirect("/sso", "SAMLRequest", &simple_request("_u1"), None, None), &mut jar).await;
-    assert!(page.body.contains("<dd>unsigned</dd>"), "{}", page.body);
+    let details = view(&page)["details"].clone();
+    let signature = details.as_array().unwrap().iter().find(|d| d["label"] == "Signature").unwrap();
+    assert_eq!(signature["value"], "unsigned", "{}", page.body);
     let p = posted(&approve(&app, "", &page, "generic", json!({}), &mut jar).await);
     assert_eq!((p.action.as_str(), p.doc.get_attr("InResponseTo")), (ACS, Some("_u1")));
 
@@ -508,7 +556,8 @@ async fn service_providers_from_inline_metadata_in_the_config_file() {
     let mut jar = Jar::default();
     let xml = authn_request("_m1", "http://meta.test/sp", None, "", "");
     let page = get_jar(&app, &redirect("/sso", "SAMLRequest", &xml, None, None), &mut jar).await;
-    assert!(page.body.contains("Sign in to <span class=\"accent\">Meta</span>"), "{}", page.body);
+    assert_eq!(view(&page)["sp"], "Meta", "{}", page.body);
+    assert!(page.body.contains("Sign in to Meta"), "{}", page.body);
     assert_eq!(posted(&approve(&app, "", &page, "generic", json!({}), &mut jar).await).action, "http://meta.test/acs");
 }
 
@@ -1144,10 +1193,10 @@ async fn hostile_messages_are_refused_not_fatal() {
     let subject = r#"<saml:Subject><saml:NameID>&lt;/script&gt;&lt;!--&lt;script&gt;</saml:NameID></saml:Subject>"#;
     let xml = authn_request("_lh", SP, Some(ACS), "", subject);
     let r = get(&app, &redirect("/sso", "SAMLRequest", &xml, None, None)).await;
-    let start = r.body.find(r#"id="lo-data">"#).unwrap() + 13;
+    let start = r.body.find(r#"id="lo-page">"#).unwrap() + 13;
     let data = &r.body[start..start + r.body[start..].find("</script>").unwrap()];
     assert!(!data.contains('<'), "{data}");
-    assert_eq!(serde_json::from_str::<Value>(data).unwrap()["loginHint"], "</script><!--<script>");
+    assert_eq!(view(&r)["editor"]["loginHint"], "</script><!--<script>");
 }
 
 #[tokio::test]

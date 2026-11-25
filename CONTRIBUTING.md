@@ -4,7 +4,7 @@ Thanks for helping out. Bug reports, template fixes (an identity provider whose 
 
 ## Development
 
-You need a recent stable Rust toolchain. Node.js and Docker are needed for the interop and conformance tests, and Node.js for changesets.
+You need a recent stable Rust toolchain. Node.js and Docker are needed for the interop and conformance tests, and Node.js for changesets. The web UI needs Node.js (22.22+, 24.11+ or 26+) and [Bun](https://bun.com), its package manager.
 
 ```sh
 cargo run                        # serve on http://localhost:9401
@@ -14,9 +14,10 @@ cargo fmt
 docker build -t localsaml .      # the release image
 ```
 
-CI runs `cargo fmt --check`, clippy with `-D warnings`, `cargo test`, the interop tests and the SAML Conformance Test Kit on every pull request.
+CI runs `cargo fmt --check`, clippy with `-D warnings`, `cargo test`, the web UI's checks, the interop tests and the SAML Conformance Test Kit on every pull request.
 
-- The login and assertion generator pages share `assets/app.js` and `assets/app.css`. Both are compiled into the binary, so rebuild after changing them.
+- The web UI is a React app in `ui/`, built with stock shadcn/ui components. Its build output, `ui/dist`, is committed and compiled into the binary, so run `bun run check` and `bun run build` in `ui/` and commit `ui/dist` with any change to it. [`ui/README.md`](ui/README.md) covers working on it.
+- The login, review, sign-out and test SP pages are rendered by the app, but the server decides when to show them (`src/html.rs`) and sends a plain HTML version that works without JavaScript. The interop harness and the conformance kit post the login form from it (`<form … action="…" id="lo-form">` with its `req` field), so keep that form as it is.
 - Identity provider templates (attribute names, NameIDs, signing, XML style and endpoint paths) live in `src/presets.rs`. Their endpoint paths are mounted by `src/routes/providers.rs`.
 - XML signatures and canonicalization are in `src/xml.rs` and `src/dsig.rs`, and encryption is in `src/xmlenc.rs`. They only need to handle what SAML uses, but must agree byte for byte with other implementations, so change them carefully and run the interop tests.
 
